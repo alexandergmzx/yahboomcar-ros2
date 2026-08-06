@@ -45,6 +45,9 @@ import math
 
 import rclpy
 from rclpy.node import Node
+
+from yahboomcar_twin.single_instance import (assert_sole_publisher,
+                                             install_signal_handlers)
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
@@ -108,8 +111,16 @@ class JointStateBridge(Node):
         self.create_subscription(Int32, '/servo_s1', self._on_servo1, 10)
         self.create_subscription(Int32, '/servo_s2', self._on_servo2, 10)
 
-        self.pub = self.create_publisher(
-            JointState, self.get_parameter('joint_states_topic').value, 10)
+        topic = self.get_parameter('joint_states_topic').value
+        # Discovery needs ~1 s before the graph query is meaningful (measured).
+        # The check must come BEFORE we create our own publisher, or we count ourselves.
+        import time as _t
+        deadline = _t.time() + 1.5
+        while _t.time() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        assert_sole_publisher(self, topic)
+
+        self.pub = self.create_publisher(JointState, topic, 10)
 
         rate = self.get_parameter('publish_rate').value
         self.create_timer(1.0 / rate, self._tick)
@@ -193,7 +204,14 @@ class JointStateBridge(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = JointStateBridge()
+    try:
+        node = JointStateBridge()
+    except RuntimeError as e:
+        print(f'\nrefusing to start:\n{e}\n')
+        if rclpy.ok():
+            rclpy.shutdown()
+        return 1
+    install_signal_handlers(lambda: node.get_logger().info('shutting down'))
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
