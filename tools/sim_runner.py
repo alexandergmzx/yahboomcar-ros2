@@ -64,10 +64,16 @@ MIRROR_RIGHT = True
 class Sim:
     """Thin wrapper over the arena stage: pose, wheel drives, stepping."""
 
-    def __init__(self, app, gui, wheel_error=0.0):
+    def __init__(self, app, gui, wheel_error=0.0, imbalance=0.0):
         self.app = app
         self.gui = gui
         self.wheel_r = WHEEL_R * (1.0 + wheel_error)
+        # A LEFT/RIGHT radius difference is what UMBmark's Ed measures. Scaling both
+        # wheels equally (wheel_error) is a distance-scale error instead and leaves Ed
+        # at 1.0, so injecting only that could never validate the Ed pathway.
+        self.r_left = self.wheel_r * (1.0 + imbalance / 2.0)
+        self.r_right = self.wheel_r * (1.0 - imbalance / 2.0)
+        self.imbalance = imbalance
         import omni.usd
         from isaacsim.core.api import SimulationContext
         from isaacsim.core.prims import SingleArticulation
@@ -116,8 +122,10 @@ class Sim:
     def drive(self, vx, wz):
         """Differential IK -> per-wheel angular velocity targets."""
         import numpy as np
-        left = (vx - wz * LY) / self.wheel_r
-        right = (vx + wz * LY) / self.wheel_r
+        # The controller believes each side has its own radius; the simulated wheels
+        # are identical. That mismatch is exactly a Type B (unequal diameter) error.
+        left = (vx - wz * LY) / self.r_left
+        right = (vx + wz * LY) / self.r_right
         vel = np.zeros(len(self.dof))
         for i, name in enumerate(self.dof):
             if name in LEFT:
@@ -264,7 +272,7 @@ def t_obstacle_stop(sim, say, speed=0.25, stop_d=0.35, arena=4.0):
                 'coast_m': overshoot, 'speed': speed}
 
 
-def t_umbmark(sim, say, L=2.0, speed=0.15, wz=0.8, injected=0.0):
+def t_umbmark(sim, say, L=1.0, speed=0.20, wz=2.5, injected=0.0, imbalance=0.0):
     """Bidirectional square. Success = umbmark.py recovers the injected error."""
     sys.path.insert(0, os.path.join(REPO, 'tools'))
     import umbmark
@@ -278,7 +286,9 @@ def t_umbmark(sim, say, L=2.0, speed=0.15, wz=0.8, injected=0.0):
         # would accumulate error every corner and corrupt the square.
         _, _, a0 = sim.pose()
         sim.drive(0.0, sign * wz)
-        budget = int((math.pi / 2) / wz / sim.dt() * 2.5)
+        # Generous budget: rotation slips ~70%, so wall-clock-equivalent estimates of
+        # turn duration are far too short.
+        budget = int((math.pi / 2) / wz / sim.dt() * 12.0)
         for _ in range(budget):
             sim.step()
             _, _, a = sim.pose()
@@ -286,10 +296,12 @@ def t_umbmark(sim, say, L=2.0, speed=0.15, wz=0.8, injected=0.0):
                 break
         sim.stop()
 
+    say(f'  square L={L} m, approach {speed} m/s, turn {wz} rad/s')
+    say('  (2 runs per direction rather than the specification\'s 5: enough to exercise')
+    say('   the protocol and the maths, not enough to average out noise)')
     runs = []
     for direction, sign in (('cw', -1), ('ccw', +1)):
-        for _ in range(2):        # 2 per direction; 5 is the spec but slow in sim
-            sim.art.set_world_poses is None if False else None
+        for _ in range(2):
             x0, y0, _ = sim.pose()
             for _ in range(4):
                 leg(L)
@@ -303,15 +315,41 @@ def t_umbmark(sim, say, L=2.0, speed=0.15, wz=0.8, injected=0.0):
     res = umbmark.compute(runs, L=L)
     say(f'  E_max,syst = {res["E_max_syst_mm"]:.1f} mm')
     say(f'  Ed = {res["Ed"]:.4f}   Eb = {res["Eb"]:.4f}')
-    if injected:
-        recovered = (res['Ed'] - 1.0) * 100.0
-        say(f'  injected wheel error {injected*100:+.1f}%, '
-            f'Ed implies {recovered:+.2f}%')
-        say('  (Ed reflects a LEFT/RIGHT diameter ratio; a symmetric radius error moves')
-        say('   Eb and the distance scale instead, so do not expect these to match 1:1.)')
-    say('  PASS: the protocol ran end to end and the maths produced finite factors')
     ok = all(math.isfinite(res[k]) for k in ('Ed', 'Eb', 'E_max_syst_mm'))
-    return ok, res
+    if imbalance:
+        expect = (1.0 + imbalance / 2.0) / (1.0 - imbalance / 2.0)
+        got = res['Ed']
+        rel = abs(got - expect) / max(1e-9, abs(expect - 1.0))
+        say(f'  injected imbalance {imbalance*100:+.1f}% -> expected Ed {expect:.4f}, '
+            f'measured {got:.4f}')
+        recovered = ok and rel < 0.6      # within 60% of the injected magnitude
+        say(f'  {"RECOVERED" if recovered else "NOT recovered"}: the pipeline '
+            f'{"reproduces" if recovered else "does not reproduce"} a known injected error')
+        if not recovered:
+            say('')
+            say('  WHY, and it is worth understanding rather than tuning around:')
+            say('')
+            say('  1. The corner turns close the loop on GROUND-TRUTH yaw, stopping at')
+            say('     exactly 90 degrees. UMBmark exists to measure dead-reckoning error,')
+            say('     so correcting heading at every corner cancels the very quantity it')
+            say('     is trying to observe. A real robot turns open-loop and accumulates.')
+            say('  2. Heavy rotational slip (~71% measured) suppresses differential')
+            say('     steering. A 10% left/right wheel mismatch should curve each 1 m leg')
+            say('     by roughly 43 degrees; here it barely deflects, because the wheels')
+            say('     scrub rather than steer. The physics is masking the signal.')
+            say('')
+            say('  Consequence: this arena cannot validate the Ed pathway as configured.')
+            say('  The MATHS is already validated independently -- tools/umbmark.py')
+            say('  round-trips a synthetic alpha=0.55 beta=1.30 to 0.582/1.304. What is')
+            say('  unvalidated is the physical pathway, and the real floor run is what')
+            say('  will exercise it.')
+        ok = ok and recovered
+    else:
+        say('  no error injected, so this only shows the protocol runs end to end and')
+        say('  the maths yields finite factors. A near-1.0 Ed here says nothing about')
+        say('  the real robot -- an accurate simulator has no systematic error to find.')
+    say(f'  {"PASS" if ok else "FAIL"}')
+    return ok, {**res, 'injected_imbalance': imbalance}
 
 
 TESTS = {
@@ -329,6 +367,10 @@ def main():
     ap.add_argument('--gui', action='store_true')
     ap.add_argument('--inject-wheel-error', type=float, default=0.0,
                     help='percent error in the wheel radius the controller assumes')
+    ap.add_argument('--inject-imbalance', type=float, default=0.0,
+                    help='percent LEFT/RIGHT wheel-radius mismatch. This is the error '
+                         'UMBmark Ed detects; --inject-wheel-error is a symmetric '
+                         'scale error and moves distance, not Ed.')
     ap.add_argument('--calibrate', action='store_true',
                     help='measure the effective rolling radius and report it, instead '
                          'of trusting the constant')
@@ -351,12 +393,18 @@ def main():
     app = SimulationApp({'headless': not args.gui})
     try:
         err = args.inject_wheel_error / 100.0
-        sim = Sim(app, args.gui, wheel_error=err)
+        imb = args.inject_imbalance / 100.0
+        sim = Sim(app, args.gui, wheel_error=err, imbalance=imb)
         say(f'sim runner {stamp}   arena={os.path.basename(ARENA_USD)}')
         say(f'DOFs: {sim.dof}')
         if err:
-            say(f'INJECTED wheel-radius error: {args.inject_wheel_error:+.1f}% '
-                f'(controller assumes r={sim.wheel_r:.5f}, truth {WHEEL_R})')
+            say(f'INJECTED symmetric radius error: {args.inject_wheel_error:+.1f}% '
+                f'(controller assumes r={sim.wheel_r:.5f})')
+        if imb:
+            say(f'INJECTED left/right imbalance: {args.inject_imbalance:+.1f}%  '
+                f'(controller r_left={sim.r_left:.5f}, r_right={sim.r_right:.5f})')
+            expect = (1.0 + imb / 2.0) / (1.0 - imb / 2.0)
+            say(f'  -> a correct UMBmark should report Ed near {expect:.4f}')
         say('')
 
         if args.calibrate:
@@ -387,7 +435,7 @@ def main():
         for name in names:
             say(f'=== {name} ===')
             fn = TESTS[name]
-            kw = {'injected': err} if name == 'umbmark' else {}
+            kw = {'injected': err, 'imbalance': imb} if name == 'umbmark' else {}
             try:
                 ok, data = fn(sim, say, **kw)
             except Exception as e:

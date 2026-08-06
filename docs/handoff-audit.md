@@ -22,7 +22,9 @@ Check these first. They are ordered by how much rests on them.
 | 2b | Earlier "all tests failed" | ❌ **INVALID RUN** | Three runs (`003440`, `003546`, `003918`) received **zero** messages because `ROS_DOMAIN_ID` was unset and defaulted to 0 while the board is on 20. One of them still printed "odometry is probably open-loop" from no data. Those logs prove nothing about the robot. |
 | 2c | The robot physically moves, and odometry is accurate | ✅ **measured, independently** | `selftest-20260806-004826`, the first recording **with traction**: IMU yaw 0.719 rad/s against odometry 0.693 — the gyro is independent of the encoders, so this confirms the *body* moved, not just the wheels. Time-aligned over the turn: correlation **+0.977**, median IMU/odom ratio **0.928**. Every elevated run reads IMU yaw exactly 0.000, which is the correct contrast. Reproduce: `tools/check_body_moved.py`, `tools/check_odom_vs_imu.py`. |
 | 3 | The chassis is differential, not mecanum | ✅ measured | A commanded strafe produced *exactly* zero on every `/odom_raw` axis. Claim #1 now confirms the encoders are genuine, so this is a real firmware behaviour rather than an artefact. |
-| 4 | Isaac twin "articulates and tracks" | ⚠️ **PARTLY FALSE** | Joints did track. But the robot was **falling through the floor** the whole time and I never checked base pose. The verification was blind to the most obvious possible failure. |
+| 4 | Isaac twin "articulates and tracks" | ⚠️ **PARTLY FALSE, now fixed** | Joints did track, but the robot was **falling through the floor** and I never checked base pose. Two causes: ground authored as `UsdGeom.Plane` (visual only, no collider) and wheels imported with no collision geometry (`collision_from_visuals` defaults False; the URDF has no `<collision>`). Both fixed; the fall detector is **negative-tested** via `build_arena.py --break-floor`, which must exit 1. |
+| 4b | Sim arena drives and stops | ✅ measured | `drive-straight` 0.935 m for a commanded 1.0 with 1 mm lateral drift; `rotate` 51° with 71% slip; `obstacle-stop` halts 0.395 m from the wall with no measurable coast. Reproduce: `tools/sim_runner.py --test all`. |
+| 4c | Sim UMBmark validates the calibration pipeline | ❌ **NO — and this is the interesting one** | Injecting a 10% left/right wheel imbalance should give Ed≈1.1053; the run reports **1.0013**. Two reasons, both real: corner turns close the loop on ground-truth yaw and so cancel the dead-reckoning error UMBmark exists to measure, and ~71% rotational slip suppresses differential steering (a 10% mismatch should curve a 1 m leg ~43°; it barely deflects). **The arena cannot validate the Ed pathway as configured.** The maths is validated separately by synthetic round-trip; the physical pathway is not. |
 | 5 | Nav2 params fixed for Jazzy | ✅ measured | All eleven nodes reach `inactive` (configured). Activation was never reached — it needs a live robot. Do not read this as "navigation works". |
 | 6 | Workspace builds on Jazzy | ✅ measured | 13/13 packages, 37/37 launch files parse. Easy to re-run and the most solid result here. |
 
@@ -48,10 +50,18 @@ and was wrong:
 
 ## Known defects, open
 
-- **Isaac twin falls through the floor.** Ground was created with `UsdGeom.Plane`
-  (visual only, no collider) while the robot imports with `fix_base=False`. Not yet fixed.
-- **`tools/urdf_to_usd.py` targets the Isaac 6.0.1 importer API.** That install has been
-  deleted; 5.1.0 uses the older command-based API. The tool will fail until updated.
+- **Effective rolling radius in sim is 1.87x the geometric one** — 0.0458 m measured
+  against 0.0245 from both the STL and the imported mesh bbox. A driven wheel cannot
+  propel a body faster than pure rolling, so this points at an angular-unit or
+  contact-radius mismatch between `apply_action(joint_velocities=...)` and the PhysX
+  drive, not at real physics. The controller uses the measured value so commands match
+  reality; `sim_runner.py --calibrate` re-measures it. **Unexplained, and worth an
+  auditor's attention** — it may indicate a units bug that also distorts other results.
+- **Simulated masses are low**: 0.355 kg total against a real car nearer 1 kg, taken
+  from the URDF's inertial blocks. Affects contact forces and therefore slip.
+- **Rotation is strongly non-linear**: below roughly 1.2 rad/s of wheel speed the robot
+  does not turn at all (static friction is never broken); at 4 rad/s it turns 111° in 2 s.
+  Any test that commands slow rotation will silently do nothing.
 - **Stopping distance is unmeasured.** The safety governor limits commands; it cannot
   beat the robot's braking. Nobody should call it safe until that number exists.
 - **`yahboomcar_multi` is unverified** — needs two robots.
