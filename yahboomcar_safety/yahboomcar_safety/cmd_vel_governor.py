@@ -65,6 +65,7 @@ class CmdVelGovernor(Node):
         self.last_cmd = None
         self.req = (0.0, 0.0, 0.0)
         self._last_reason = None
+        self._warned_bypass = set()
 
         self.create_subscription(LaserScan, '/scan', self._on_scan,
                                  qos_profile_sensor_data)
@@ -100,13 +101,39 @@ class CmdVelGovernor(Node):
             return None
         return (self.get_clock().now() - stamp).nanoseconds * 1e-9
 
+    def _bypassing_nodes(self):
+        """Which nodes publish /cmd_vel besides us.
+
+        A count alone ("2 publishers are bypassing me") is not actionable at 2am with a
+        robot moving. Naming them turns it into "yahboom_keyboard is bypassing me".
+        """
+        me = (self.get_namespace().rstrip('/') + '/' + self.get_name()).replace('//', '/')
+        names = []
+        for name, ns in self.get_node_names_and_namespaces():
+            full = (ns.rstrip('/') + '/' + name).replace('//', '/')
+            if full == me:
+                continue
+            try:
+                for topic, _types in self.get_publisher_names_and_types_by_node(name, ns):
+                    if topic == '/cmd_vel':
+                        names.append(full)
+                        break
+            except Exception:
+                continue          # node vanished between listing and querying
+        return names
+
     def _check_bypass(self):
-        # count_publishers includes ours, so >1 means somebody else is on /cmd_vel.
-        others = self.count_publishers('/cmd_vel') - 1
-        if others > 0:
-            self.get_logger().warn(
-                f'{others} other publisher(s) on /cmd_vel are BYPASSING this governor. '
-                'They can drive the robot with no obstacle limiting.')
+        names = self._bypassing_nodes()
+        if not names:
+            self._warned_bypass = set()
+            return
+        current = set(names)
+        if current != getattr(self, '_warned_bypass', set()):
+            self.get_logger().error(
+                f'BYPASSED by {len(names)} publisher(s) on /cmd_vel: {", ".join(names)}. '
+                'These drive the robot with NO obstacle limiting. Remap them to '
+                '/cmd_vel_raw, or accept that they are unprotected.')
+            self._warned_bypass = current
 
     def _tick(self):
         vx, vy, wz = self.req

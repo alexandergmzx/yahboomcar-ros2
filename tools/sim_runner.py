@@ -363,7 +363,10 @@ TESTS = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--test', default='drive-straight',
-                    choices=list(TESTS) + ['all'])
+                    choices=list(TESTS) + ['all', 'demo'],
+                    help="'demo' runs the three passing motion tests in one launch, "
+                         "which is what you want with --gui; 'all' adds umbmark, which "
+                         "is long and fails by design")
     ap.add_argument('--gui', action='store_true')
     ap.add_argument('--inject-wheel-error', type=float, default=0.0,
                     help='percent error in the wheel radius the controller assumes')
@@ -430,7 +433,12 @@ def main():
                 f'-> ratio {(v/wa)/WHEEL_R_GEOMETRIC:.2f}x, still unexplained')
             say('')
 
-        names = list(TESTS) if args.test == 'all' else [args.test]
+        if args.test == 'all':
+            names = list(TESTS)
+        elif args.test == 'demo':
+            names = ['drive-straight', 'rotate', 'obstacle-stop']
+        else:
+            names = [args.test]
         all_ok = True
         for name in names:
             say(f'=== {name} ===')

@@ -20,6 +20,8 @@ odometry accuracy or to build a map.
 import sys
 import time
 
+import argparse
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -31,9 +33,14 @@ YAW = 0.8    # rad/s
 
 
 class Sequencer(Node):
-    def __init__(self):
+    def __init__(self, direct=False):
         super().__init__('twin_motion_sequence')
-        self.cmd = self.create_publisher(Twist, '/cmd_vel', 10)
+        # Through the governor by default; this drives real wheels.
+        topic = '/cmd_vel' if direct else '/cmd_vel_raw'
+        self.get_logger().info(
+            f'commanding on {topic}'
+            + ('  (DIRECT -- governor bypassed)' if direct else '  (via governor)'))
+        self.cmd = self.create_publisher(Twist, topic, 10)
         self.s1 = self.create_publisher(Int32, '/servo_s1', 10)
         self.s2 = self.create_publisher(Int32, '/servo_s2', 10)
         self.beep = self.create_publisher(UInt16, '/beep', 10)
@@ -61,8 +68,12 @@ class Sequencer(Node):
 
 
 def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--direct', action='store_true',
+                    help='bypass the safety governor (elevated bench use only)')
+    args = ap.parse_args()
     rclpy.init()
-    n = Sequencer()
+    n = Sequencer(direct=args.direct)
     try:
         n.get_logger().info('baseline idle')
         n.stop(3.0)

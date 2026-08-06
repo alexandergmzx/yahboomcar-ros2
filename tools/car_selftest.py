@@ -95,6 +95,9 @@ def main():
     ap.add_argument('--duration', type=float, default=8.0,
                     help='seconds to sample each topic set')
     ap.add_argument('--no-bag', action='store_true')
+    ap.add_argument('--direct', action='store_true',
+                    help='publish straight to /cmd_vel, bypassing the safety governor. '
+                         'Only for when no governor is running and the car is elevated.')
     ap.add_argument('--domain', type=int, default=20,
                     help='ROS_DOMAIN_ID the board is configured for (default 20). '
                          'Must match, or nothing is received and every check reads 0 Hz.')
@@ -138,6 +141,7 @@ def main():
 
     say(f'car self-test  {stamp}')
     say(f'ROS_DOMAIN_ID={os.environ.get("ROS_DOMAIN_ID")} (board must match)')
+    say(f'command topic: {"/cmd_vel (DIRECT, governor bypassed)" if args.direct else "/cmd_vel_raw (via governor)"}')
 
     # --- agent -------------------------------------------------------------
     names = agent_running()
@@ -194,7 +198,11 @@ def main():
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         say(f'recording -> {bag_path}')
 
-    cmd_pub = node.create_publisher(Twist, '/cmd_vel', 10)
+    # Drive through the governor by default. This tool commands real wheel motion, so
+    # it is exactly the path that should be limited by the lidar rather than exempt
+    # from it. --direct exists for the bench, where no governor may be running.
+    cmd_topic = '/cmd_vel' if args.direct else '/cmd_vel_raw'
+    cmd_pub = node.create_publisher(Twist, cmd_topic, 10)
     s1 = node.create_publisher(Int32, '/servo_s1', 10)
     s2 = node.create_publisher(Int32, '/servo_s2', 10)
 
