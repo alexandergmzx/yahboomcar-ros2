@@ -4,10 +4,10 @@ For a reviewer (human or LLM) checking this work. Written to help you find my er
 to defend the work. Where I am unsure, it says so; where I was wrong, it says that too.
 
 **One-line summary:** the ROS 2 Humble→Jazzy port is real and well tested; the Isaac Sim
-work was rushed, wasteful, and produced a false "working" claim; the load-bearing
-assumption that `/odom_raw` reflects physical wheel rotation is now **measured and
-confirmed**; and the radio link to the car is **degraded to roughly half its specified
-rates**, which the project has not yet explained.
+work was rushed, wasteful, and produced a false "working" claim; the robot **demonstrably
+drives, and its odometry agrees with an independent gyro to within ~8%**; and the radio
+link is **degraded to roughly half its specified rates**, which is still unexplained and
+undermines any timing-sensitive measurement.
 
 ---
 
@@ -20,7 +20,8 @@ Check these first. They are ordered by how much rests on them.
 | 1 | `/odom_raw` reflects real wheel rotation | ✅ **RESOLVED — measured** | Hand-spin test, `selftest-20260806-004042`: turning a wheel by hand with nothing commanded produced peak twist **1.5446** and pose change **0.221 m**. Encoders are real; odometry is **not** open-loop. UMBmark, cartographer and the twin rest on a sound foundation after all. |
 | 2 | "The motors move" | ✅ **RESOLVED — measured** | `selftest-20260806-004114`: commanded 0.12 → `/odom_raw` 0.127 forward, 0.131 back, yaw 0.693 for a commanded 0.6. Since claim #1 establishes the encoders are genuine, odometry responding to commands means the wheels physically turned. The inference is now sound; it was not before. |
 | 2b | Earlier "all tests failed" | ❌ **INVALID RUN** | Three runs (`003440`, `003546`, `003918`) received **zero** messages because `ROS_DOMAIN_ID` was unset and defaulted to 0 while the board is on 20. One of them still printed "odometry is probably open-loop" from no data. Those logs prove nothing about the robot. |
-| 3 | The chassis is differential, not mecanum | ✅ measured | A commanded strafe produced *exactly* zero on every `/odom_raw` axis. Strong, but note it shares dependency #1: if odometry is open-loop, this shows only that the firmware ignores `linear.y`, which still supports the conclusion. |
+| 2c | The robot physically moves, and odometry is accurate | ✅ **measured, independently** | `selftest-20260806-004826`, the first recording **with traction**: IMU yaw 0.719 rad/s against odometry 0.693 — the gyro is independent of the encoders, so this confirms the *body* moved, not just the wheels. Time-aligned over the turn: correlation **+0.977**, median IMU/odom ratio **0.928**. Every elevated run reads IMU yaw exactly 0.000, which is the correct contrast. Reproduce: `tools/check_body_moved.py`, `tools/check_odom_vs_imu.py`. |
+| 3 | The chassis is differential, not mecanum | ✅ measured | A commanded strafe produced *exactly* zero on every `/odom_raw` axis. Claim #1 now confirms the encoders are genuine, so this is a real firmware behaviour rather than an artefact. |
 | 4 | Isaac twin "articulates and tracks" | ⚠️ **PARTLY FALSE** | Joints did track. But the robot was **falling through the floor** the whole time and I never checked base pose. The verification was blind to the most obvious possible failure. |
 | 5 | Nav2 params fixed for Jazzy | ✅ measured | All eleven nodes reach `inactive` (configured). Activation was never reached — it needs a live robot. Do not read this as "navigation works". |
 | 6 | Workspace builds on Jazzy | ✅ measured | 13/13 packages, 37/37 launch files parse. Easy to re-run and the most solid result here. |
@@ -65,6 +66,11 @@ and was wrong:
   earlier measurements had the PC on 5 GHz. **Any timing-sensitive result should be
   distrusted until this is understood**, including the UMBmark protocol, which assumes
   odometry samples arrive promptly.
+- **Odometry over-reports yaw by ~7.7%** (median IMU/odom ratio 0.928 on the desk run).
+  For a skid-steer this is the effective-track error UMBmark calls `Eb`. Note this is far
+  *smaller* than the "expect a large Eb" I predicted in
+  `docs/odometry-calibration.md` — that prediction should be treated as unsupported until
+  a proper UMBmark run either confirms or replaces this single-bag estimate.
 - **This car has no servos.** `jq1_Joint`/`jq2_Joint` exist in the vendor URDF but the
   Standard chassis has no gimbal; they are only on the Vision version. The twin animates
   them anyway, and an earlier self-test reported `servos PASS` for hardware that is not
@@ -82,6 +88,8 @@ Do not trust the table; run the commands.
 | Governor live behaviour | run `cmd_vel_governor`, publish synthetic `/scan` + `/cmd_vel_raw` |
 | Firmware topic rates | `./tools/car_selftest.py --sensors-only` |
 | UMBmark maths | `./tools/umbmark.py compute --demo` — round-trips α=0.55°, β=1.30° |
+| Body really moved (not just wheels) | `./tools/check_body_moved.py MicroROS-assets/bags/*` |
+| Odometry vs gyro agreement | `./tools/check_odom_vs_imu.py MicroROS-assets/bags/selftest-20260806-004826` |
 | Agent bridges the firmware | run the `:jazzy` agent, `ros2 node list` → `/YB_Car_Node` |
 | USD has 9 meshes, 6 movable joints | needs the 5.1.0 importer path first |
 
