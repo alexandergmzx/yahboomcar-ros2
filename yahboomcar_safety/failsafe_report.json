@@ -1,30 +1,31 @@
 {
-  "timestamp": "20260806-134914",
+  "timestamp": "20260806-145410",
   "speed_m_s": 0.15,
   "stop_timeout_s": 3.0,
+  "deadman_active": true,
+  "deadman_nodes": [
+    "/cmd_vel_deadman"
+  ],
+  "firmware_has_watchdog": false,
+  "note": "The firmware retains commands indefinitely (measured 45 s). Any bound below is the host-side deadman, valid only while that process lives AND the link is up. It is not a property of the car.",
   "cases": {
     "command_cessation": {
       "title": "commands stop arriving",
       "stopped": true,
-      "time_to_stop_lo_s": 0.6007130146026611,
-      "time_to_stop_hi_s": 0.6873579025268555,
+      "time_to_stop_lo_s": 0.6215615272521973,
+      "time_to_stop_hi_s": 0.6926672458648682,
       "observation": "automatic",
       "detail": ""
     },
     "governor_sigkill": {
       "title": "governor SIGKILLed",
       "stopped": true,
-      "time_to_stop_lo_s": 0.6559271812438965,
-      "time_to_stop_hi_s": 0.7419517040252686,
+      "time_to_stop_lo_s": 0.6678032875061035,
+      "time_to_stop_hi_s": 0.7617199420928955,
       "observation": "automatic",
       "detail": ""
     }
   },
-  "stop_bound_s": 0.7419517040252686,
-  "stop_mechanism": "host deadman (cmd_vel_deadman)",
-  "deadman_active": true,
-  "firmware_has_watchdog": false,
-  "note": "The key \"watchdog_bound_s\" in an earlier version of this file was misleading and has been renamed: it reads as firmware protection, and this robot has none. The firmware retains commands indefinitely (measured 45 s with nothing publishing). The bound here is the HOST deadman, valid only while that process lives AND the Wi-Fi link is up. It is not a property of the car.",
-  "provenance": "Fields added by hand after an audit flagged the omission. The tool now records them natively; re-run tools/test_failsafe.py to regenerate this file from the instrument rather than by patch.",
-  "needs_rerun": true
+  "stop_bound_s": 0.7617199420928955,
+  "stop_mechanism": "host deadman"
 }

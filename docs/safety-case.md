@@ -17,7 +17,8 @@ publishing then ceased, and it held 0.15 m/s for the full 45 s the probe watched
 decaying, never timing out. It stopped only when an explicit zero was sent.
 
 `tools/test_failsafe.py` confirms this across every way the command path can die
-(`failsafe_report.json`, run 2026-08-06, car elevated):
+(car elevated, 2026-08-06). **Reconfirmed after a full power cycle of the board**, with
+no deadman running, so it is a property of the firmware and not of a wedged session:
 
 | Loss mode | Result |
 |---|---|
@@ -45,14 +46,19 @@ nobody has spoken since. It is a separate process specifically so it can outlive
 governor crash.
 
 **Re-running the same fail-safe test with the deadman running flips both observable cases**
-(2026-08-06, same elevated car, same 0.15 m/s):
+(same elevated car, same 0.15 m/s). Both configurations were re-measured back to back
+after the power cycle, so the comparison is not across board states:
 
 | Loss mode | Without deadman | With deadman |
 |---|---|---|
-| Publisher ceases | drove 45 s+, never stopped | **stopped in 687 ms** |
-| Governor `SIGKILL`ed | drove indefinitely | **stopped in 742 ms** |
+| Publisher ceases | drove 45 s+, never stopped | **stopped in 693 ms** |
+| Governor `SIGKILL`ed | drove indefinitely | **stopped in 762 ms** |
 
-742 ms is the worst upper bracket. It decomposes as the deadman's 0.5 s silence timeout
+762 ms is the worst upper bracket, from a report the tool now generates with its own
+provenance fields (`deadman_active`, `stop_mechanism`, `firmware_has_watchdog`) rather
+than a key called `watchdog_bound_s` that read as firmware protection this car does not
+have. An earlier back-to-back pair gave 687 / 742 ms; the ~20 ms difference is link
+jitter, not a change in behaviour. It decomposes as the deadman's 0.5 s silence timeout
 plus roughly 200 ms of command→motion-stop latency, and it is **tunable** — the timeout
 is a launch argument. It has not been lowered because the radio link is demonstrably
 jittery (scan gaps to 147 ms measured), and a timeout tight enough to trip on normal
@@ -61,7 +67,7 @@ jitter would produce spurious stops that teach the operator to distrust it.
 **This is a deadman-mediated stop, not a firmware watchdog.** It holds only while the
 deadman process is alive *and* the link is up. It is not a property of the car.
 
-At 0.30 m/s, 742 ms is **223 mm of coast**; at the 0.05 m/s first-floor cap, 37 mm. That
+At 0.30 m/s, 762 ms is **229 mm of coast**; at the 0.05 m/s first-floor cap, 38 mm. That
 is a **crash-case** term, separate from the normal stopping envelope — in ordinary
 operation the governor commands the stop itself and the reaction time is T, not this.
 
@@ -69,8 +75,8 @@ operation the governor commands the stop itself and the reaction time is T, not 
 
 | Failure | Covered by deadman? |
 |---|---|
-| Governor crashes / `SIGKILL` | **yes — measured, 742 ms** |
-| Teleop or a test tool dies mid-command | **yes — measured, 687 ms** |
+| Governor crashes / `SIGKILL` | **yes — measured, 762 ms** |
+| Teleop or a test tool dies mid-command | **yes — measured, 693 ms** |
 | The deadman itself dies | no |
 | This PC loses power, freezes, or is put to sleep | **no** |
 | Wi-Fi drops, or the agent dies | **no — measured, case 3** |
@@ -234,7 +240,7 @@ rather than with the safety filter. Until it is designed, the operating rule sta
 | Stale input stops the robot | bench: output went to 0.000 after commands ceased |
 | Bypass is detected and named | bench: governor logged the offending node |
 | **Firmware retains commands forever** | live car, 3 modes + a 45 s probe: never stops without an explicit zero |
-| **Deadman stops a dead publisher** | live car: 687 ms (publisher ceases), 742 ms (governor SIGKILLed) |
+| **Deadman stops a dead publisher** | live car: 693 ms (publisher ceases), 762 ms (governor SIGKILLed) |
 | Deadman covers link loss | **NO — measured to fail.** Nothing on this PC can |
 | Stop paths leak no translation | unit test over all 5 stop paths, both axes |
 | Reverse and near-obstacle yaw bounded | unit tests; **never exercised on hardware** |
