@@ -19,9 +19,23 @@ corridor of two parallel walls and every scan looks identical, so the estimate a
 corridor is unconstrained -- not noisy, UNCONSTRAINED, and ICP will still converge and
 still return a confident-looking number.
 
-That is not a corner case here. **A 4x4 m room with plain flat walls is close to the
-worst case**, which matters directly for the planned test arena: the boxes in it are not
-decoration, they are the thing that makes translation observable.
+CORRECTION, from measurement. An earlier version of this file asserted that a 4x4 m room
+with flat walls was "close to the worst case" and that boxes were what made translation
+observable there. **Both claims were wrong**, and tools/arena_observability.py disproved
+them by raytracing scans across the room:
+
+    4.0 x 4.0 m     median isotropy 0.914    well conditioned
+    8.0 x 2.0 m                     0.230    marginal
+   12.0 x 1.0 m                     0.058    DEGENERATE
+   30.0 x 30.0 m                    0.103    marginal (far walls out of range)
+
+The lidar reaches 8 m and the room is 4 m, so it sees ALL FOUR walls from every position,
+and four walls supply normals on both axes. Adding boxes slightly REDUCED isotropy,
+because box faces are axis-aligned too and they occlude wall returns.
+
+Degeneracy needs one of two things: an aspect ratio around 8:1 or worse, or a room bigger
+than the sensor's range, where the far walls are simply not there to be seen. The 4x4
+arena is neither.
 
 So degeneracy is a first-class output. `match()` returns the eigen-decomposition of the
 translational information matrix, and callers are expected to refuse the unconstrained
@@ -55,6 +69,7 @@ inside a 12 Hz budget, and it removes a dependency from an estimator that has to
 readable to be trusted.
 """
 import math
+import time
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -93,6 +108,7 @@ class MatchResult:
     degeneracy: Degeneracy = None
     reason: str = ''            # why this result should be distrusted; '' when fine
     seed_dominated: bool = False
+    budget_exceeded: bool = False
 
     @property
     def trustworthy(self):
@@ -198,7 +214,8 @@ CORR_SCHEDULE = (1.00, 0.50, 0.25, 0.12)
 
 
 def match(source, target, init=(0.0, 0.0, 0.0), max_iter=30, tol=1e-4,
-          corr_schedule=CORR_SCHEDULE, min_inliers=20, outlier_k=3.0):
+          corr_schedule=CORR_SCHEDULE, min_inliers=20, outlier_k=3.0,
+          time_budget=None):
     """Align `source` onto `target`. Returns the transform mapping source into target.
 
     Point-to-point ICP, coarse to fine. Point-to-point rather than point-to-plane for the
@@ -221,6 +238,17 @@ def match(source, target, init=(0.0, 0.0, 0.0), max_iter=30, tol=1e-4,
     A robust scale does not have that bias, because when a large motion makes every
     residual large it moves with them; it only rejects points that disagree with the bulk,
     which is what a moving obstacle actually looks like.
+
+    `time_budget` (seconds) bounds latency for real-time use. Cost is dominated by
+    ITERATION COUNT, not point count: on recorded scans the mean match took 119 ms but
+    the p95 took 546 ms, because cluttered real geometry runs the full 4x30 schedule
+    where clean synthetic geometry converges in a few. Against a 12 Hz scan interval
+    (83 ms) that overruns by 6.6x, and an estimator that silently misses its deadline
+    just drops scans until it looks like it is working.
+
+    When the budget is hit the refinement stops and the best estimate so far is returned
+    with `budget_exceeded` set, so the degradation is visible rather than inferred from a
+    thinning output rate.
     """
     source = np.asarray(source, dtype=float)
     target = np.asarray(target, dtype=float)
@@ -234,10 +262,18 @@ def match(source, target, init=(0.0, 0.0, 0.0), max_iter=30, tol=1e-4,
     inliers = 0
     rms = float('inf')
     converged = False
+    over_budget = False
+    t_start = time.perf_counter()
 
     for corr_dist in corr_schedule:
+        if over_budget:
+            break
         prev_rms = float('inf')
         for _ in range(max_iter):
+            if time_budget is not None and \
+                    time.perf_counter() - t_start > time_budget:
+                over_budget = True
+                break
             total_iters += 1
             moved = transform_xy(source, *est)
             idx, dist = nearest(moved, target)
@@ -277,7 +313,8 @@ def match(source, target, init=(0.0, 0.0, 0.0), max_iter=30, tol=1e-4,
         (init[0] or init[1] or init[2]) and deg.degenerate and moved_from_seed < 1e-3)
 
     res = MatchResult(est[0], est[1], wrap(est[2]), converged, total_iters, inliers,
-                      rms, degeneracy=deg, seed_dominated=seed_dominated)
+                      rms, degeneracy=deg, seed_dominated=seed_dominated,
+                      budget_exceeded=over_budget)
     if not converged:
         res.reason = f'did not converge ({total_iters} iterations)'
     elif deg.degenerate:
