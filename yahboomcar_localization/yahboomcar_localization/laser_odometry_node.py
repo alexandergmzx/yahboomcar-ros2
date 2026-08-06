@@ -24,6 +24,26 @@ entirely rather than published with a large number attached. A filter given a ba
 measurement with an honest covariance still degrades; one given a bad measurement with a
 confident covariance diverges.
 
+THE SENSOR IS NOT THE ROBOT
+---------------------------
+Scan matching measures the motion of the LASER, and this publishes the motion of
+base_footprint. Those differ whenever the lidar sits off the robot's centre of rotation:
+a pure turn about base_footprint drags an offset sensor sideways, and reporting that as
+base motion would be simply wrong.
+
+On this robot the offset is small. `/scan` is stamped `laser_frame`, which the URDF does
+not define at all -- it has `radar_Link` -- so the number comes from the vendor's own nav
+launches: x = -4.6 mm, y = 0. At the maximum per-scan rotation the car can produce
+(0.125 rad at 12 Hz) that is **0.58 mm**, well under the ~8 mm the matcher is good for.
+
+So the transform is applied not because it changes the answer today, but because "the
+lidar is close enough to the centre" was an unstated assumption, and unstated assumptions
+are what stop being true quietly when a sensor gets moved.
+
+When the transform is unavailable -- bag replay has no TF tree -- it falls back to the
+identity, warns exactly once, and keeps publishing. Refusing to run would make the node
+useless for offline analysis, which is where most of its testing happens.
+
 UNVALIDATED ON A MOVING ROBOT ON THE FLOOR
 ------------------------------------------
 As of writing this has been exercised against recorded bags and against the car on its
@@ -35,13 +55,15 @@ import math
 
 import numpy as np
 import rclpy
+import tf2_ros
 from geometry_msgs.msg import Quaternion
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 
-from yahboomcar_localization.scan_geometry import compose, scan_to_xy, wrap
+from yahboomcar_localization.scan_geometry import (compose, laser_step_to_base_step,
+                                                   scan_to_xy, wrap)
 from yahboomcar_localization.scan_matcher import estimate_motion
 
 
@@ -81,6 +103,14 @@ class LaserOdometry(Node):
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
 
+        # base_footprint <- laser_frame, resolved lazily from TF on first use.
+        self.declare_parameter('laser_frame', 'laser_frame')
+        self.laser_frame = self.get_parameter('laser_frame').value
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.base_from_laser = None       # (dx, dy, dyaw), None until resolved
+        self._warned_no_tf = False
+
         self.pose = (0.0, 0.0, 0.0)
         self.prev_xy = None
         self.prev_stamp = None
@@ -98,6 +128,34 @@ class LaserOdometry(Node):
         self.get_logger().warn(
             'SECOND OPINION ONLY. Never validated on a robot driving across a floor; '
             'do not fuse into a safety path until it has been.')
+
+    def _resolve_extrinsic(self):
+        """base_footprint <- laser_frame as a planar (dx, dy, dyaw). Cached once found."""
+        if self.base_from_laser is not None:
+            return self.base_from_laser
+        try:
+            t = self.tf_buffer.lookup_transform(
+                self.base_frame, self.laser_frame, rclpy.time.Time())
+        except Exception:
+            if not self._warned_no_tf:
+                self._warned_no_tf = True
+                self.get_logger().warn(
+                    f'no {self.base_frame} <- {self.laser_frame} transform; treating the '
+                    'lidar as coincident with the base. Correct under bag replay, where '
+                    'there is no TF tree. On the robot it means bringup is not running, '
+                    'and a real sensor offset would go uncorrected.')
+            return None
+        q = t.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                         1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        self.base_from_laser = (t.transform.translation.x,
+                                t.transform.translation.y, yaw)
+        self.get_logger().info(
+            f'{self.base_frame} <- {self.laser_frame}: '
+            f'x={self.base_from_laser[0]*1000:.1f} mm '
+            f'y={self.base_from_laser[1]*1000:.1f} mm '
+            f'yaw={math.degrees(yaw):.2f} deg')
+        return self.base_from_laser
 
     def _report(self):
         total = self.n_matched + self.n_dropped
@@ -147,8 +205,16 @@ class LaserOdometry(Node):
                 self.n_dropped += 1
                 return
 
+        # Laser-frame motion -> base-frame motion. A no-op when the extrinsic is the
+        # identity, which is the fallback when no TF is available. See
+        # scan_geometry.laser_step_to_base_step for the derivation.
+        step = (r.dx, r.dy, r.dtheta)
+        E = self._resolve_extrinsic()
+        if E is not None:
+            step = laser_step_to_base_step(step, E)
+
         self.n_matched += 1
-        self.pose = compose((r.dx, r.dy, r.dtheta), self.pose)
+        self.pose = compose(step, self.pose)
 
         out = Odometry()
         out.header.stamp = stamp

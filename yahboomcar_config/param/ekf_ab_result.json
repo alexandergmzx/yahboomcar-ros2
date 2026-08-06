@@ -1,0 +1,32 @@
+{
+  "timestamp": "20260806-172950",
+  "speed_m_s": 0.15,
+  "seconds": 15.0,
+  "ground_truth_displacement_m": 0.0,
+  "prediction": {
+    "vendor": "large",
+    "corrected": "near zero"
+  },
+  "conditions": "car elevated on centre stand, body held still",
+  "runs": {
+    "vendor": {
+      "config_file": "ekf.yaml",
+      "description": "wheel pose + twist, IMU yaw + rate; nothing observes the world",
+      "wheel_commanded_m": 2.25,
+      "ekf_displacement_m": 2.2392001074964356,
+      "laser_displacement_m": null,
+      "n_odom_msgs": 179,
+      "bag": "/home/alexmint/Development/MicroROS/MicroROS-assets/bags/ekf-ab-vendor-20260806-172950"
+    },
+    "corrected": {
+      "config_file": "ekf_corrected.yaml",
+      "description": "wheel twist only, IMU rate only, + /odom_laser pose",
+      "wheel_commanded_m": 2.25,
+      "ekf_displacement_m": 0.005922589756051782,
+      "laser_displacement_m": 0.006042642491929671,
+      "n_odom_msgs": 179,
+      "bag": "/home/alexmint/Development/MicroROS/MicroROS-assets/bags/ekf-ab-corrected-20260806-172950"
+    }
+  },
+  "verdict": "prediction held"
+}

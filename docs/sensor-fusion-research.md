@@ -53,6 +53,76 @@ floor tests start from.
 
 ---
 
+## 1b. What an EKF actually is
+
+Worth spelling out, because the vendor config's bug is only visible once you know what
+the filter is doing with its inputs.
+
+**The problem.** Several sensors, each wrong in a different way, and one robot that has
+exactly one true position. Averaging them is not good enough — you want the *best* guess,
+which means weighting each sensor by how much it deserves to be believed.
+
+**Predict, then correct.** The filter loops over two steps:
+
+1. **Predict.** From the last estimate and a model of how a robot moves, guess where it is
+   now. Nothing is measured here — it is dead reckoning, so uncertainty always *grows*.
+2. **Update.** A measurement arrives. Compare it with the prediction; the gap is the
+   *innovation*. Move the estimate part-way along that gap — a lot if the sensor is
+   trusted and the prediction is not, hardly at all if the reverse. That fraction is the
+   **Kalman gain**.
+
+**Covariance is the trust**, and it is where this gets subtle. The filter carries not just
+a position but a covariance saying how sure it is. Predicting inflates it; every update
+shrinks it. That bookkeeping is the whole mechanism — and it assumes every measurement
+brings **independent** information.
+
+Break that assumption and the filter draws a conclusion that is not merely inaccurate but
+unjustified. Feed the same information twice and it shrinks the covariance twice, and
+concludes it is more certain than the evidence supports. **That is exactly what
+`ekf.yaml` does**: pose *and* twist from `/odom_raw`, when pose is the integral of twist.
+Not one measurement plus a corroborating second, but one measurement counted twice.
+
+**Why "extended".** The plain Kalman filter is optimal for *linear* systems. A robot that
+turns is not linear — heading enters through sines and cosines — so the EKF linearises
+around the current estimate at each step. That works while the estimate is roughly right,
+and it is why a confidently wrong filter can *diverge*: it linearises about the wrong
+point, so its corrections point the wrong way and confirm its own error.
+
+**What it cannot do is invent information.** If every input is blind to a direction,
+fusing them adds confidence without adding knowledge. That is why lidar degeneracy has to
+be reported rather than smoothed over, and why `laser_odometry_node` withholds a
+measurement instead of publishing one with a big covariance attached.
+
+---
+
+## 1c. The vendor and corrected configs, measured
+
+The stand settles it. Body held still, wheels commanded to 0.15 m/s for 15 s: the true
+displacement is **zero**, and anything the filter reports is error. That is wheel slip
+taken to its limit — and to an encoder, a wheel spinning on a stand is indistinguishable
+from one driving across a floor.
+
+Prediction was recorded in `tools/ekf_ab_test.py` **before** the run. Result
+(`ekf_ab_result.json`, 2026-08-06, both runs bagged):
+
+| config | reported displacement | truth |
+|---|---|---|
+| vendor `ekf.yaml` | **2239 mm** | 0 mm |
+| corrected `ekf_corrected.yaml` | **6 mm** | 0 mm |
+
+The vendor filter tracked the commanded wheel distance of 2250 mm to within **0.5%**. It
+did not partly believe the wheels; it believed them almost exactly, because nothing in its
+inputs was in a position to disagree. The corrected config, given `/odom_laser` reporting
+a room that was not moving, stayed at 6 mm — a **373× improvement**, and within the
+matcher's own noise.
+
+**What this does not show.** That the corrected config is better at *driving*. A stand
+tests one claim — that a world-referenced input stops the filter believing a lying wheel —
+and says nothing about real motion, where the lidar has errors of its own and the wheels
+are mostly honest. Necessary, not sufficient.
+
+---
+
 ## 2. Fusion only helps when failures are independent
 
 This is the whole justification, and the vendor config violates it.

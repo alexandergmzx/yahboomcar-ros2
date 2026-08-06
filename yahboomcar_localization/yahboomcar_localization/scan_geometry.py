@@ -4,12 +4,11 @@ ROS-free on purpose, same split as yahboomcar_safety/governor.py, so every claim
 the geometry can be tested against synthetic scans with known answers rather than against
 a robot.
 
-NO SCIPY. scipy's compiled submodules (spatial, optimize, linalg, stats) are all broken
-on this machine: a pip-installed numpy 2.2.1 in ~/.local shadows apt's 1.26.4, and apt's
-scipy 1.11.4 is built against the numpy 1.x ABI, so importing any of them raises
-"numpy.dtype size changed". A 2D scan is a few hundred points, which is small enough that
-plain numpy is fast enough, so this file depends on nothing but numpy. That is a feature
-rather than a workaround -- one fewer undocumented surface in an estimator.
+numpy only, deliberately. scipy is used in scan_matcher for its KD-tree, but nothing in
+this file needs it, and keeping the geometry dependency-free means the parts that define
+what a scan MEANS cannot be broken by an ABI mismatch elsewhere. That is not theoretical:
+every compiled scipy submodule was broken on this machine for a while, and this file kept
+working throughout. See docs/porting-notes.md.
 """
 import math
 
@@ -101,3 +100,28 @@ def compose(a, b):
 def wrap(a):
     """Angle to [-pi, pi]."""
     return math.atan2(math.sin(a), math.cos(a))
+
+
+def invert(t):
+    """Inverse of a 2D rigid transform (dx, dy, dtheta)."""
+    x, y, th = t
+    c, s = math.cos(th), math.sin(th)
+    return (-(c * x + s * y), -(-s * x + c * y), wrap(-th))
+
+
+def laser_step_to_base_step(step, extrinsic):
+    """Motion measured by the LASER -> motion of the BASE.
+
+    `extrinsic` is base <- laser, i.e. where the sensor sits on the robot.
+
+    The robot and its sensor do not move by the same amount whenever the sensor is off
+    the centre of rotation: turn the base in place and an offset lidar swings through an
+    arc. Writing B for base motion and L for what the laser observed, the poses are
+    related by (base . E) before and (base . B . E) after, so
+
+        L = E^-1 . B . E      and therefore      B = E . L . E^-1
+
+    which is what this returns. With `extrinsic` at the identity it reduces to `step`,
+    which is why callers can safely fall back to the identity when no TF is available.
+    """
+    return compose(compose(invert(extrinsic), step), extrinsic)

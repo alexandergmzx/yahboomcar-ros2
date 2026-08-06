@@ -14,6 +14,8 @@ import numpy as np
 import pytest
 
 from yahboomcar_localization.scan_geometry import (compose, estimate_normals,
+                                                   invert,
+                                                   laser_step_to_base_step,
                                                    scan_to_xy, transform_xy, wrap)
 from yahboomcar_localization import scan_matcher as sm
 from yahboomcar_localization.scan_matcher import (degeneracy, estimate_motion,
@@ -364,3 +366,58 @@ def test_fallback_still_works_when_scipy_is_pretended_absent():
         assert r.converged and r.dx == pytest.approx(0.02, abs=0.005)
     finally:
         sm.HAVE_KDTREE = real
+
+
+# ------------------------------------------- sensor extrinsic (laser -> base)
+def test_invert_round_trips():
+    for t in ((0.1, -0.2, 0.3), (-0.05, 0.0, -1.2), (0.0, 0.0, 0.0)):
+        assert compose(t, invert(t)) == pytest.approx((0.0, 0.0, 0.0), abs=1e-12)
+        assert compose(invert(t), t) == pytest.approx((0.0, 0.0, 0.0), abs=1e-12)
+
+
+def test_identity_extrinsic_is_a_no_op():
+    """The fallback path when no TF is available must not alter the estimate."""
+    step = (0.02, -0.01, 0.06)
+    assert laser_step_to_base_step(step, (0.0, 0.0, 0.0)) == pytest.approx(step, abs=1e-12)
+
+
+@pytest.mark.parametrize('base_motion', [
+    (0.025, 0.000, 0.000),
+    (0.000, 0.000, 0.125),
+    (0.020, -0.010, 0.090),
+    (-0.015, 0.005, -0.100),
+])
+@pytest.mark.parametrize('extrinsic', [
+    (-0.0046412, 0.0, 0.0),      # this robot, from the vendor nav launches
+    (0.15, -0.08, 0.4),          # a deliberately awkward mount
+])
+def test_recovers_base_motion_from_what_the_laser_would_see(base_motion, extrinsic):
+    """Round trip: given base motion, work out what the laser observes, then check the
+    correction recovers the base motion. Pins the direction of the composition, which is
+    exactly the sort of maths that inverts silently -- a frame convention error in this
+    package once read -1.3 rad against a true +1.8."""
+    # L = E^-1 . B . E is what the sensor would report.
+    laser_sees = compose(compose(extrinsic, base_motion), invert(extrinsic))
+    assert laser_step_to_base_step(laser_sees, extrinsic) == pytest.approx(
+        base_motion, abs=1e-12)
+
+
+def test_offset_sensor_sees_translation_during_a_pure_base_rotation():
+    """The reason this correction exists at all: spin the base in place and an offset
+    lidar is dragged sideways, so raw scan matching reports translation that the robot
+    did not make."""
+    E = (0.15, 0.0, 0.0)                      # 150 mm forward of centre
+    pure_spin = (0.0, 0.0, 0.5)               # base turns in place
+    laser_sees = compose(compose(E, pure_spin), invert(E))
+    assert math.hypot(laser_sees[0], laser_sees[1]) > 0.05, laser_sees
+    # ...and the correction removes it.
+    assert laser_step_to_base_step(laser_sees, E) == pytest.approx(pure_spin, abs=1e-12)
+
+
+def test_this_robots_offset_is_negligible_but_applied():
+    """4.6 mm at the car's maximum per-scan rotation is 0.58 mm. Recorded so the claim in
+    the node docstring is checked rather than asserted."""
+    E = (-0.0046412, 0.0, 0.0)
+    laser_sees = compose(compose(E, (0.0, 0.0, 0.125)), invert(E))
+    err = math.hypot(laser_sees[0], laser_sees[1])
+    assert 0.0002 < err < 0.0010, f'{err*1000:.2f} mm'

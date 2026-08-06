@@ -36,10 +36,21 @@
 # * /odom_laser contributes POSE (x, y, yaw) -- the only world-referenced input available,
 #   and the only one that can bound drift rather than accumulate it.
 #
-# STATUS: NOT VALIDATED ON HARDWARE. /odom_laser has been exercised on recorded bags and
-# on the car elevated on its stand, never on a robot driving across a floor. Do not use
-# this config for anything safety-bearing until it has been. See
-# docs/sensor-fusion-research.md.
+# STATUS: BENCH-VALIDATED UNDER PURE SLIP, NOT VALIDATED IN MOTION.
+#
+# Measured 2026-08-06 with the car elevated and the body held still, wheels commanded to
+# 0.15 m/s for 15 s, so the true displacement was zero (tools/ekf_ab_test.py, prediction
+# recorded before the run, both runs bagged):
+#
+#     vendor ekf.yaml    2239 mm reported   <- tracked the commanded wheel distance to 0.5%
+#     this config           6 mm reported
+#     truth                 0 mm
+#
+# That confirms one specific claim: a world-referenced input stops the filter believing a
+# wheel that is lying. It says NOTHING about real motion, where the lidar has its own
+# errors and the wheels are mostly honest. Do not treat this as validated for driving,
+# and do not use it for anything safety-bearing until it has been run on a floor.
+# See docs/sensor-fusion-research.md.
 
 ekf_filter_node:
     ros__parameters:

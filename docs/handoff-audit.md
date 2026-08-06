@@ -210,3 +210,117 @@ Nav2) publish `/cmd_vel` directly and are **not** speed-limited. This was a scop
 decision so commands copied from the course PDFs keep working as documented. The
 governor logs an ERROR naming any such publisher, so the gap is visible rather than
 silent.
+
+---
+
+# Session 2 handoff (2026-08-06)
+
+Everything below happened after the audit above. Same purpose as the rest of this file:
+written to help you find my errors, not to defend the work. Two external audits landed
+during this session and both found real blocking defects; their findings are recorded as
+findings, not as things I noticed.
+
+## The single most important result
+
+**The firmware has no command watchdog. A commanded speed is retained indefinitely.**
+
+Measured three ways with the car elevated (`tools/test_failsafe.py`), then reconfirmed
+after a full power cycle so it is a property of the firmware and not of a wedged session:
+commands ceasing, the governor `SIGKILL`ed, and the agent frozen all leave the car
+driving. A follow-up probe held 0.15 m/s for the full 45 s it watched with nothing
+publishing. It stops only on an explicit zero, and `config_robot.py` exposes no timeout,
+so it is not configurable.
+
+**Any crash of any component leaves the car driving. Wi-Fi loss is unmitigable from this
+machine.** `cmd_vel_deadman` covers a publisher dying — measured 693 ms and 762 ms — and
+covers nothing else. That is a permanent operating constraint, not a gap pending work.
+
+**Attack this first.** If the watchdog claim is wrong, the entire safety case is
+mis-scoped. `./tools/test_failsafe.py` reproduces it in about two minutes on an elevated
+car. `--negative-test` proves the detector cannot false-positive a stop.
+
+## Claims from this session most likely to be wrong
+
+| claim | how to attack it |
+|---|---|
+| Corrected EKF: 6 mm vs vendor 2239 mm under pure slip | `tools/ekf_ab_test.py`; both runs bagged in `MicroROS-assets/bags/ekf-ab-*`. Stand only — it proves nothing about driving |
+| Lidar sees 92% slip on `twin_dataset` | `tools/sensor_agreement.py <bag>`; ground truth is structural (wheels off the ground) |
+| ICP recovers per-scan motion to ~2.7 mm | 48 unit tests against synthetic transforms; the real-scan figure is unverified against ground truth |
+| A bare 4×4 m room is well conditioned (isotropy 0.914) | `tools/arena_observability.py`; raytraced, not simulated. **I predicted the opposite** |
+| Deadman stops the car in 762 ms | one bench session; the bound holds only while that process lives AND the link is up |
+| Linear odometry is accurate to ~0.4% | five hand pushes, best-of not mean — see below |
+
+## Claims I made and had to retract, this session
+
+Recorded because the pattern matters more than any single error: **each was plausible,
+self-consistent, and wrong.**
+
+1. **"Elevated latency measurement is conservative."** Backwards. Unloaded wheels spin up
+   almost instantly and `/odom_raw` is encoder-derived, so the measurement is a *lower*
+   bound on the floor value — the safety-relevant direction to get wrong. Caught by the
+   user, not by me.
+2. **"A 4×4 m room is close to the worst case for scan matching."** Asserted in a plan, in
+   docstrings and in a commit message. Measurement showed median isotropy 0.914 — well
+   conditioned — and that adding boxes slightly *hurt*. The lidar reaches 8 m and the room
+   is 4 m, so it sees all four walls from everywhere.
+3. **"Trimming rejects outliers harmlessly."** Fixed-fraction trimming discards the points
+   furthest from the centre of rotation, which are exactly the ones that see rotation. It
+   converged to a stable 0.0852 rad against a true 0.12 and looked like clean convergence.
+4. **The scan-match frame convention was inverted.** `match(prev, curr)` returns the scene
+   transform, the inverse of the robot's. Encoders and gyro read ≈ +1.8 rad while the
+   lidar read −1.3. The magnitude was plausible; only the sign exposed it.
+5. **"Summing per-pair ICP gives total yaw."** It measures noise: 464 of 503 pairs were
+   near-stationary, and the sum implied a 25% lidar under-read while a regression over the
+   38 genuinely turning pairs implied the opposite.
+6. **"transforms3d was the pip install that broke things."** It is apt-installed and was
+   not the cause. It *was* broken, for a different reason, and that mattered more.
+
+## Defects found by external audit, not by me
+
+Both audits were right about everything I checked.
+
+- **The mandatory floor launch failed its own preflight.** The deadman must publish
+  `/cmd_vel`; the governor called every other `/cmd_vel` publisher a bypass; the procedure
+  says abort on bypass. Unpassable, and I built both halves. Unit tests could not catch it
+  — each node was correct alone. Now `tools/test_launch_preflight.py`.
+- **The battery gate demanded 11 V on a 7.4 V pack.** Would have rejected every healthy
+  battery.
+- **The braking protocol could not have produced a defensible result.** Timer-based rather
+  than mark-based, recorded commanded rather than measured speed, and two low speeds
+  cannot separate `T_stop` from `a` — the auditor showed 0.5 mm of bias moving `a` from
+  1.0 to 2.5 with essentially zero residual. The tool now reproduces that demonstration
+  itself and refuses to report `a` from fewer than three well-spread speeds.
+- **`failsafe_report.json` said `watchdog_bound_s`**, which reads as firmware protection
+  this robot does not have.
+- **`verify_twin.py --live` checked synthetic fixture waypoints**, so it tested nothing.
+
+## Open, and honest
+
+- **Stopping distance is unmeasured.** The floor gate. Everything about speed staging
+  depends on it, and `docs/safety-case.md` no longer claims braking is the minor term,
+  because that rested on an assumed `a`.
+- **`/odom_laser` has never run on a moving robot.** Bags and the stand only.
+- **`ekf_corrected.yaml` is bench-validated under slip only.**
+- **The lidar/gyro yaw scale disagreement (~1.556) is unresolved.** The body cannot rotate
+  on the stand, so it waits for the floor. The gyro can only be integrated between bag
+  arrival times, and scan jitter is 113–147 ms p95, which may be the whole explanation.
+- **Scan distortion is uncorrected.** At 12 Hz a scan is not an instantaneous snapshot.
+- **The URDF and the vendor's own static TF disagree** about lidar height by 15 mm
+  (0.0789 vs 0.094079). Irrelevant to planar work, unresolved for 3D.
+- **`cv2`/`image_geometry` is left broken**, deliberately: this robot has no camera.
+- Still never run: **Nav2, SLAM**, the twin as a launch against the real car. Still absent:
+  **SROS2**, command arbitration, licences. Still unexplained: the **1.87× simulated wheel
+  radius**.
+
+## What I changed outside this repository, this session
+
+- `pip install --user --break-system-packages "scipy>=1.14"` — every compiled scipy
+  submodule was broken machine-wide by a pip numpy shadowing apt's.
+- `pip install --user --break-system-packages --upgrade transforms3d` (0.4.1 → 0.4.2) —
+  it was broken by the same cause, and took `tf_transformations`, `tf2_geometry_msgs` and
+  `tf2_sensor_msgs` with it, so all Python TF maths was down.
+- Created `~/.venvs/microros` as the going-forward policy.
+- Replaced the `uros-udp` agent container after my own agent-freeze test corrupted the
+  XRCE session. Identical config, captured from `docker inspect` first.
+
+Reverse the pip installs with `pip uninstall`; apt's versions are untouched on disk.
