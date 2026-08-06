@@ -15,6 +15,28 @@ A safety filter that fails permissive is worse than none, because it invites tru
 import math
 from dataclasses import dataclass
 
+# Nodes that are SUPPOSED to publish /cmd_vel alongside the governor. The deadman's whole
+# job is to publish zeros there when a driver dies, so flagging it as a bypass made the
+# mandatory floor launch fail its own preflight -- the procedure says abort on BYPASSED,
+# and first_floor_launch.py always starts both. Found by external audit.
+EXPECTED_PUBLISHERS = ('cmd_vel_deadman',)
+
+
+def bypassing_nodes(publishers, me, expected=EXPECTED_PUBLISHERS):
+    """Split /cmd_vel publishers into (unexpected, expected_seen).
+
+    Matched on node name rather than full path so a namespaced deadman still counts.
+    That does mean anything calling itself cmd_vel_deadman is trusted -- acceptable,
+    because a hostile publisher on this graph can simply drive the car anyway; there is
+    no authorisation boundary (see the TODO in docs/safety-case.md).
+    """
+    unexpected, seen = [], []
+    for full in publishers:
+        if full == me:
+            continue
+        (seen if full.rsplit('/', 1)[-1] in expected else unexpected).append(full)
+    return unexpected, seen
+
 
 @dataclass
 class GovernorConfig:

@@ -166,10 +166,18 @@ These are properties of the design, not bugs, and they bound what the governor c
   The 195 ms intercept still contains up to one sampling interval of quantisation, so the
   true comms+firmware delay is bounded between roughly **104 and 195 ms**.
 
-- **Reaction still dominates braking, and the floor can only widen the gap.** The braking
-  term at 0.30 m/s is 45 mm even at a pessimistic `a = 1.0 m/s²` and 11 mm at `a = 4.0`,
-  against ≥118 mm of reaction. A 4× error in `a` moves the total by ~34 mm.
-  **The latency is the safety problem; the brakes are not.**
+- **Reaction appears to dominate braking — but that rests on an ASSUMED `a`.** Under
+  assumed values, the braking term at 0.30 m/s is 45 mm at a pessimistic `a = 1.0 m/s²`
+  and 11 mm at `a = 4.0`, against ≥118 mm of reaction, so a 4× error in `a` would move
+  the total by only ~34 mm.
+
+  That argument is worth stating and worth distrusting. `a` has never been measured on
+  this robot, on this floor, and an audit showed the planned measurement is
+  ill-conditioned at low speeds: 0.5 mm of systematic bias moved a fitted `a` from 1.0 to
+  2.5 m/s² *with essentially zero residual*. Until `tools/measure_braking.py --fit`
+  reports `identifiable: True`, **treat stopping distance as unmeasured**, not as a minor
+  term. The unmeasured-quantity statement governs the test decision; the
+  reaction-dominates argument does not.
 
 - **Deceleration `a` is still unmeasured** — it needs floor space. The simulated figure
   (~0.39 m from a wall at 0.25 m/s) came from a simulated 0.355 kg mass and a friction

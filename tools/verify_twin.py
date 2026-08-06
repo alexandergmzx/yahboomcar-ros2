@@ -103,6 +103,8 @@ def main():
     ap.add_argument('--tol-yaw', type=float, default=0.15, help='radians')
     ap.add_argument('--domain', type=int, default=20)
     ap.add_argument('--topic', default='odom', help='Odometry topic to follow')
+    ap.add_argument('--max-gap', type=float, default=0.5,
+                    help='live mode: worst tolerated gap between messages, seconds')
     ap.add_argument('--live', action='store_true',
                     help='use the real robot /tf instead of the fixture')
     ap.add_argument('--no-tf', action='store_true',
@@ -234,7 +236,7 @@ def main():
         return og.Controller.attribute(f'/TwinGraph/Odom.outputs:{name}')
 
     A = {k: attr(k) for k in (
-        'header:frame_id',
+        'header:frame_id', 'header:stamp:sec', 'header:stamp:nanosec',
         'pose:pose:position:x', 'pose:pose:position:y',
         'pose:pose:orientation:x', 'pose:pose:orientation:y',
         'pose:pose:orientation:z', 'pose:pose:orientation:w')}
@@ -266,7 +268,11 @@ def main():
     duration = args.hold * len(WAYPOINTS) + 2.0
     say(f'sampling for {duration:.0f} s')
     samples = []
-    n_msgs = 0
+    n_frames_with_msg = 0
+    msg_stamps = []          # (source stamp, wall time applied) per DISTINCT message
+    pose_errors = []         # |commanded pose - achieved sim pose|, metres
+    last_cmd_xy = None       # compared one frame late, see below
+    last_stamp = None
     t0 = time.time()
     dropped = False
     while time.time() - t0 < duration:
@@ -281,7 +287,15 @@ def main():
         except Exception:
             frame = ''
         if frame and not (args.drop_test and dropped):
-            n_msgs += 1
+            n_frames_with_msg += 1
+            # A LATCHED message is re-read every render frame. Counting frames therefore
+            # measures the renderer, not the link. Distinct source stamps measure the
+            # link. Audit finding.
+            stamp_s = (int(og.Controller.get(A['header:stamp:sec']))
+                       + int(og.Controller.get(A['header:stamp:nanosec'])) * 1e-9)
+            if stamp_s != last_stamp:
+                msg_stamps.append((stamp_s, time.time()))
+                last_stamp = stamp_s
             px = float(og.Controller.get(A['pose:pose:position:x']))
             py = float(og.Controller.get(A['pose:pose:position:y']))
             qx = float(og.Controller.get(A['pose:pose:orientation:x']))
@@ -290,6 +304,16 @@ def main():
             qw = float(og.Controller.get(A['pose:pose:orientation:w']))
             art.set_world_pose(position=np.array([px, py, spawn_z]),
                                orientation=np.array([qw, qx, qy, qz]))
+            # Compare against the pose commanded on the PREVIOUS frame. set_world_pose
+            # does not take effect until the next physics step, so comparing within the
+            # same frame charges the twin for a delay it has not had a chance to serve --
+            # it reported a 500 mm "error" on each waypoint step, which is exactly the
+            # step size. In live mode that would have been a false failure.
+            achieved = pose()
+            if last_cmd_xy is not None:
+                pose_errors.append(math.hypot(achieved[0] - last_cmd_xy[0],
+                                              achieved[1] - last_cmd_xy[1]))
+            last_cmd_xy = (px, py)
 
         samples.append(pose())
 
@@ -309,7 +333,7 @@ def main():
             pass
 
     say('')
-    say(f'{len(samples)} pose samples, {n_msgs} frames with a decoded message')
+    say(f'{len(samples)} pose samples')
     if not samples:
         say('FAIL: no samples collected at all')
         finish(1, 'no samples')
@@ -329,6 +353,61 @@ def main():
         say('FAIL: the base never moved. No pose is reaching the twin -- the graph is')
         say('      not receiving /tf, or the frame name does not match.')
         finish(1, 'no pose received')
+
+    # ---- link quality: distinct messages, dropouts, lag, tracking error ----
+    say('')
+    say(f'distinct messages: {len(msg_stamps)}  '
+        f'(vs {n_frames_with_msg} render frames that re-read a latched message)')
+    if len(msg_stamps) < 2:
+        say('FAIL: fewer than two distinct messages. The pose is latched, not live.')
+        finish(1, 'no live message stream')
+
+    gaps = [b[1] - a[1] for a, b in zip(msg_stamps, msg_stamps[1:])]
+    gaps.sort()
+    p95 = gaps[min(len(gaps) - 1, int(0.95 * (len(gaps) - 1)))]
+    dropouts = [g for g in gaps if g > args.max_gap]
+    rate = len(gaps) / (msg_stamps[-1][1] - msg_stamps[0][1])
+    say(f'  message rate {rate:.1f} Hz   inter-arrival p95 {p95*1000:.0f} ms   '
+        f'max {gaps[-1]*1000:.0f} ms')
+    say(f'  dropouts over {args.max_gap*1000:.0f} ms: {len(dropouts)}')
+    if pose_errors:
+        pe = sorted(pose_errors)
+        say(f'  sim-vs-commanded pose error: p95 {pe[int(0.95*(len(pe)-1))]*1000:.2f} mm, '
+            f'max {pe[-1]*1000:.2f} mm')
+
+    results_extra = {
+        'distinct_messages': len(msg_stamps),
+        'render_frames_with_message': n_frames_with_msg,
+        'message_rate_hz': rate,
+        'interarrival_p95_s': p95,
+        'interarrival_max_s': gaps[-1],
+        'dropouts': len(dropouts),
+        'pose_error_max_m': max(pose_errors) if pose_errors else None,
+    }
+
+    if args.live:
+        # The synthetic waypoints are meaningless against a real robot, which goes
+        # wherever it was driven. Checking them in live mode -- as an earlier version
+        # did -- tested nothing. What matters live is SYNCHRONISATION.
+        say('')
+        say('live mode: waypoint checks skipped (they describe the fixture, not a robot)')
+        bad = []
+        if gaps[-1] > args.max_gap:
+            bad.append(f'worst message gap {gaps[-1]*1000:.0f} ms exceeds '
+                       f'{args.max_gap*1000:.0f} ms')
+        if pose_errors and max(pose_errors) > args.tol_xy:
+            bad.append(f'pose error {max(pose_errors)*1000:.0f} mm exceeds tolerance')
+        say('')
+        if bad:
+            for b in bad:
+                say(f'FAIL: {b}')
+            finish(1, '; '.join(bad))
+        say(f'PASS: twin tracked live /{args.topic} at {rate:.1f} Hz, worst gap '
+            f'{gaps[-1]*1000:.0f} ms, pose error under {args.tol_xy*1000:.0f} mm')
+        say('NOTE: this bounds Isaac-side application lag against message arrival. It')
+        say('      does NOT measure robot-to-Isaac end-to-end latency -- that needs a')
+        say('      synchronised clock the firmware does not provide.')
+        finish(0, 'live twin synchronised within bounds')
 
     # ---- check 3: was every waypoint actually visited? ----
     say('')

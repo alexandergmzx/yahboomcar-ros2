@@ -8,7 +8,9 @@ import math
 
 import pytest
 
-from yahboomcar_safety.governor import (GovernorConfig, decide, forward_min_range)
+from yahboomcar_safety.governor import (EXPECTED_PUBLISHERS, GovernorConfig,
+                                        bypassing_nodes, decide,
+                                        forward_min_range)
 
 CFG = GovernorConfig()
 FRESH = 0.05  # a comfortably recent timestamp age, seconds
@@ -211,3 +213,51 @@ def test_output_never_exceeds_request_forward(vx):
     # The filter must only ever reduce forward speed, never amplify it.
     d = decide(vx, 0, 0, min_range=0.6, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
     assert d.vx <= vx + 1e-9
+
+
+# --------------------------------------------------- bypass detection vs the deadman
+ME = '/cmd_vel_governor'
+
+
+def test_deadman_is_not_a_bypass():
+    """The audited contradiction: first_floor_launch.py mandates the deadman, the
+    deadman must publish /cmd_vel to do its job, and the procedure says abort on
+    BYPASSED. The preflight could never pass legitimately."""
+    unexpected, seen = bypassing_nodes(['/cmd_vel_deadman'], ME)
+    assert unexpected == []
+    assert seen == ['/cmd_vel_deadman']
+
+
+def test_real_bypass_still_reported_alongside_the_deadman():
+    unexpected, seen = bypassing_nodes(
+        ['/cmd_vel_deadman', '/yahboom_keyboard'], ME)
+    assert unexpected == ['/yahboom_keyboard']
+    assert seen == ['/cmd_vel_deadman']
+
+
+def test_self_is_never_a_bypass():
+    unexpected, seen = bypassing_nodes([ME, '/cmd_vel_deadman'], ME)
+    assert unexpected == [] and seen == ['/cmd_vel_deadman']
+
+
+def test_namespaced_deadman_still_recognised():
+    unexpected, seen = bypassing_nodes(['/robot1/cmd_vel_deadman'], ME)
+    assert unexpected == []
+    assert seen == ['/robot1/cmd_vel_deadman']
+
+
+def test_absent_deadman_is_visible_to_the_caller():
+    """The caller needs to distinguish "no publishers" from "no deadman" -- the second
+    is the dangerous one and must be warnable."""
+    unexpected, seen = bypassing_nodes(['/yahboom_keyboard'], ME)
+    assert seen == []
+    assert unexpected == ['/yahboom_keyboard']
+
+
+def test_expected_list_is_configurable():
+    unexpected, seen = bypassing_nodes(['/my_watchdog'], ME, expected=('my_watchdog',))
+    assert unexpected == [] and seen == ['/my_watchdog']
+
+
+def test_default_expected_contains_the_deadman():
+    assert 'cmd_vel_deadman' in EXPECTED_PUBLISHERS

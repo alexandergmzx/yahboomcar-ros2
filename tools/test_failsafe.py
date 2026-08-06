@@ -188,8 +188,29 @@ def main():
         say('FAIL: no /odom_raw. Is the car powered and on this domain?')
         return 2
 
+    # PROVENANCE. A report showing clean stops is dangerously misleading if it does not
+    # say whether the external deadman was doing the stopping -- it reads as firmware
+    # protection, which this robot does not have. Audit finding.
+    deadman_nodes = [f'{ns.rstrip("/")}/{n}'.replace('//', '/')
+                     for n, ns in node.get_node_names_and_namespaces()
+                     if n == 'cmd_vel_deadman']
+    say(f'deadman present: {deadman_nodes if deadman_nodes else "NO"}')
+    if deadman_nodes:
+        say('  -> any stop below is DEADMAN-MEDIATED, not firmware behaviour.')
+    else:
+        say('  -> stops below would be firmware behaviour. None has ever been observed.')
+    say('')
+
     results = {'timestamp': stamp, 'speed_m_s': args.speed,
-               'stop_timeout_s': args.stop_timeout, 'cases': {}}
+               'stop_timeout_s': args.stop_timeout,
+               'deadman_active': bool(deadman_nodes),
+               'deadman_nodes': deadman_nodes,
+               'firmware_has_watchdog': False,
+               'note': ('The firmware retains commands indefinitely (measured 45 s). Any '
+                        'bound below is the host-side deadman, valid only while that '
+                        'process lives AND the link is up. It is not a property of the '
+                        'car.'),
+               'cases': {}}
 
     def record(key, title, stopped, bracket, detail='', observed='automatic'):
         results['cases'][key] = {
@@ -403,10 +424,15 @@ def main():
         bound = max(c['time_to_stop_hi_s'] for c in cases.values()
                     if c.get('time_to_stop_hi_s'))
         say('')
+        if deadman_nodes:
+            say('  MECHANISM: the host deadman, not the firmware. This bound holds only')
+            say('  while that process is alive and the link is up.')
         say(f'  Command loss stops the car within {bound*1000:.0f} ms in every case')
         say(f'  tested. At 0.30 m/s that is {0.30*bound*1000:.0f} mm of coast, which')
         say('  must be added to the stopping envelope as a crash-case term.')
-        results['watchdog_bound_s'] = bound
+        results['stop_bound_s'] = bound
+        results['stop_mechanism'] = ('host deadman' if deadman_nodes
+                                     else 'unknown -- no deadman was running')
         code = 0
 
     os.makedirs(OUT_DIR, exist_ok=True)

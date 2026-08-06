@@ -20,5 +20,11 @@
       "detail": ""
     }
   },
-  "watchdog_bound_s": 0.7419517040252686
+  "stop_bound_s": 0.7419517040252686,
+  "stop_mechanism": "host deadman (cmd_vel_deadman)",
+  "deadman_active": true,
+  "firmware_has_watchdog": false,
+  "note": "The key \"watchdog_bound_s\" in an earlier version of this file was misleading and has been renamed: it reads as firmware protection, and this robot has none. The firmware retains commands indefinitely (measured 45 s with nothing publishing). The bound here is the HOST deadman, valid only while that process lives AND the Wi-Fi link is up. It is not a property of the car.",
+  "provenance": "Fields added by hand after an audit flagged the omission. The tool now records them natively; re-run tools/test_failsafe.py to regenerate this file from the instrument rather than by patch.",
+  "needs_rerun": true
 }

@@ -17,8 +17,10 @@ The decision logic lives in governor.py, deliberately free of ROS types so it ca
 unit-tested exhaustively without hardware. See test/test_governor.py.
 
 LIMITATIONS, stated plainly:
-  * The lidar sector faces FORWARD. Nothing here protects the rear, and reversing is
-    deliberately unrestricted.
+  * The lidar sector faces FORWARD. Nothing here protects the rear or the sides.
+    Reverse and near-obstacle yaw stay possible but are bounded, not unrestricted.
+  * cmd_vel_deadman is an EXPECTED co-publisher on /cmd_vel, not a bypass. Its absence
+    is warned about, because the firmware retains commands forever without it.
   * It limits commands; it cannot exceed the robot's own braking. Stopping distance is
     a measured quantity, not a guarantee -- see docs/safety-governor.md.
   * It assumes /scan is trustworthy. A lidar reporting confidently wrong ranges defeats
@@ -33,7 +35,9 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32
 
-from yahboomcar_safety.governor import GovernorConfig, decide, forward_min_range
+from yahboomcar_safety.governor import (EXPECTED_PUBLISHERS, GovernorConfig,
+                                        bypassing_nodes, decide,
+                                        forward_min_range)
 
 
 class CmdVelGovernor(Node):
@@ -52,6 +56,7 @@ class CmdVelGovernor(Node):
         self.declare_parameter('scan_timeout', cfg.scan_timeout)
         self.declare_parameter('cmd_timeout', cfg.cmd_timeout)
         self.declare_parameter('rate', 20.0)
+        self.declare_parameter('expected_publishers', list(EXPECTED_PUBLISHERS))
 
         self.cfg = GovernorConfig(
             stop_distance=self.get_parameter('stop_distance').value,
@@ -72,6 +77,7 @@ class CmdVelGovernor(Node):
         self.req = (0.0, 0.0, 0.0)
         self._last_reason = None
         self._warned_bypass = set()
+        self._seen_expected = set()
 
         self.create_subscription(LaserScan, '/scan', self._on_scan,
                                  qos_profile_sensor_data)
@@ -107,7 +113,7 @@ class CmdVelGovernor(Node):
             return None
         return (self.get_clock().now() - stamp).nanoseconds * 1e-9
 
-    def _bypassing_nodes(self):
+    def _cmd_vel_publishers(self):
         """Which nodes publish /cmd_vel besides us.
 
         A count alone ("2 publishers are bypassing me") is not actionable at 2am with a
@@ -129,7 +135,24 @@ class CmdVelGovernor(Node):
         return names
 
     def _check_bypass(self):
-        names = self._bypassing_nodes()
+        names, expected = bypassing_nodes(
+            self._cmd_vel_publishers(),
+            (self.get_namespace().rstrip('/') + '/' + self.get_name()).replace('//', '/'),
+            tuple(self.get_parameter('expected_publishers').value))
+
+        # Report the safety companion POSITIVELY rather than merely not complaining about
+        # it. Its absence is the dangerous state -- the firmware retains commands forever,
+        # so with no deadman a crashed driver leaves the car driving.
+        if set(expected) != self._seen_expected:
+            self._seen_expected = set(expected)
+            if expected:
+                self.get_logger().info(
+                    f'safety companion present on /cmd_vel: {", ".join(expected)}')
+        if not expected:
+            self.get_logger().warn(
+                'NO DEADMAN on /cmd_vel. If whatever is driving dies, the firmware will '
+                'hold the last command indefinitely. Do not run on the floor like this.')
+
         if not names:
             self._warned_bypass = set()
             return
