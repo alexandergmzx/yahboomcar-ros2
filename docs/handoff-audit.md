@@ -70,7 +70,8 @@ and was wrong:
 - **Stopping distance is unmeasured.** The safety governor limits commands; it cannot
   beat the robot's braking. Nobody should call it safe until that number exists.
 - **`yahboomcar_multi` is unverified** — needs two robots.
-- **`transforms3d` is installed but broken** (apt 0.4.1 calls `np.maximum_sctype`,
+- **`transforms3d` was installed but broken — NOW FIXED** (0.4.2, see porting-notes).
+  Originally: apt 0.4.1 calls `np.maximum_sctype`,
   removed in NumPy 2.0). Nothing imports it, so it is inert.
 - **A 15 mm frame disagreement**: the cartographer launch places `laser_frame` 0.094079 m
   above `base_link`; the URDF's `radar_Joint` says 0.078934 m.
