@@ -29,6 +29,38 @@ RUN-UP, which happens at steady speed where encoders are trustworthy. k is an od
 scale factor from --calibrate, obtained by pushing the robot a tape-measured distance
 with the motors off -- no traction, no slip, no braking.
 
+WHAT THE IMU CAN AND CANNOT WITNESS
+-----------------------------------
+The obvious wish is for the IMU to give a second opinion on distance. It depends
+entirely on DURATION, because double integration accumulates bias as 0.5*b*t^2. With a
+realistic ~0.05 m/s^2 residual after static-bias removal:
+
+    calibration push, ~4 s     ->  ~400 mm of drift on an 1830 mm push   USELESS
+    braking event,  ~0.3 s     ->  ~2 mm on a ~50 mm stop                GOOD
+
+So the IMU is not a witness for the push, and is one for braking. Short is why.
+
+There is a second limit that runs the other way. The chassis pitches forward under
+braking, tilting the accelerometer into gravity and ADDING apparent deceleration. One
+degree of dive leaks 0.171 m/s^2, which against the actual decel is:
+
+    at 0.05 m/s   103% of the signal      unusable
+    at 0.10 m/s    51%                    indicative only
+    at 0.30 m/s    17%                    useful
+
+Static bias subtraction cannot remove it, because the tilt happens during the event. It
+biases `a` HIGH, meaning shorter predicted stopping distance -- the dangerous direction.
+So IMU distance is reported with the speed-dependent caveat and never overrides tape.
+
+What IS robust at every speed is SINGLE integration. Delta-v drifts linearly, not
+quadratically, so comparing the encoder's speed change against the IMU's is a direct
+slip detector: encoders measure wheels, the IMU measures the body, and a gap between
+them IS the slip. That is the check that matters on a dirty floor.
+
+For the calibration push the gyro is the useful axis, not the accelerometer: integrating
+yaw rate shows whether the push actually went straight. A curved push makes the wheels
+travel an arc while the tape measures the chord, inflating odometry and biasing k low.
+
 WHY SEVERAL SPEEDS, AND WHY LOW SPEEDS ALONE ARE NOT ENOUGH
 ------------------------------------------------------------
     d(v) = v*T_stop + v^2/(2a)
@@ -234,9 +266,71 @@ def main():
     ap.add_argument('--fit', action='store_true', help='analyse recorded runs and exit')
     ap.add_argument('--calibrate', action='store_true',
                     help='hand-push odometry scale calibration; motors stay off')
+    ap.add_argument('--list-calibrations', action='store_true',
+                    help='show every recorded calibration and which one is active')
+    ap.add_argument('--use-calibration', type=int, metavar='N',
+                    help='make calibration N active (see --list-calibrations)')
     args = ap.parse_args()
 
     store = load()
+
+    cals = store.get('calibrations', [])
+
+    if args.list_calibrations or args.use_calibration is not None:
+        import statistics
+        ks = [c['k'] for c in cals]
+        med = statistics.median(ks) if ks else None
+        print(f'{len(cals)} calibration(s); active k = {store.get("odom_scale_k")}')
+        print()
+        print('  #  when              push      odom      k       vs median  notes')
+        for i, c in enumerate(cals):
+            notes = []
+            if c['odom_m'] < 1.0:
+                notes.append(f'SHORT ({10.0/(c["odom_m"]*1000)*100:.1f}%/10mm)')
+            dy = c.get('yaw_change_rad')
+            if dy is not None and abs(math.degrees(dy)) > 5.0:
+                notes.append(f'CURVED {math.degrees(dy):+.0f}deg')
+            elif dy is None:
+                notes.append('no IMU record')
+            dev = (c['k'] / med - 1) * 100 if med else 0.0
+            if abs(dev) > 2.0:
+                notes.append('OUTLIER')
+            active = '*' if abs(c['k'] - (store.get('odom_scale_k') or -1)) < 1e-12 else ' '
+            print(f' {active}{i}  {c["timestamp"]}  {c["tape_m"]*1000:6.0f}mm  '
+                  f'{c["odom_m"]*1000:6.0f}mm  {c["k"]:.4f}  {dev:+6.2f}%   '
+                  f'{", ".join(notes)}')
+        if med:
+            print()
+            print(f'  median k = {med:.4f}   spread '
+                  f'{(max(ks)/min(ks)-1)*100:.1f}%')
+            print('  Slip during a push makes odometry UNDER-report, so k > 1. That is')
+            print('  a ONE-DIRECTIONAL error, which changes how to combine these:')
+            print('  the MINIMUM k among long, straight pushes is the least-contaminated')
+            print('  estimate. Median and mean are both wrong here, because they average')
+            print('  in contamination that only ever pushes one way.')
+            good = [c for c in cals if c['odom_m'] >= 1.0
+                    and (c.get('yaw_change_rad') is None
+                         or abs(math.degrees(c['yaw_change_rad'])) <= 5.0)]
+            if good:
+                best = min(good, key=lambda c: c['k'])
+                i = cals.index(best)
+                print()
+                print(f'  RECOMMENDED: calibration {i} (k = {best["k"]:.4f}) -- lowest k '
+                      f'among {len(good)} push(es) over 1 m.')
+                if abs(best['k'] - (store.get('odom_scale_k') or -1)) > 1e-12:
+                    print(f'  Active is {store.get("odom_scale_k"):.4f}. '
+                          f'Set it with --use-calibration {i}')
+                else:
+                    print('  That is already active.')
+        if args.use_calibration is not None:
+            if not 0 <= args.use_calibration < len(cals):
+                print(f'\nno calibration {args.use_calibration}')
+                return 2
+            store['odom_scale_k'] = cals[args.use_calibration]['k']
+            save(store)
+            print(f'\nactive k set to {store["odom_scale_k"]:.4f} '
+                  f'(calibration {args.use_calibration})')
+        return 0
 
     if args.fit:
         print('=== fit over recorded runs ===')
@@ -265,6 +359,7 @@ def main():
     from rclpy.qos import qos_profile_sensor_data
     from geometry_msgs.msg import Twist
     from nav_msgs.msg import Odometry
+    from sensor_msgs.msg import Imu
 
     lines = []
 
@@ -279,6 +374,12 @@ def main():
         Odometry, '/odom_raw',
         lambda m: samples.append((time.time(), m.twist.twist.linear.x)),
         qos_profile_sensor_data)
+    imu = []          # (t, accel_x, gyro_z)
+    node.create_subscription(
+        Imu, '/imu',
+        lambda m: imu.append((time.time(), m.linear_acceleration.x,
+                              m.angular_velocity.z)),
+        qos_profile_sensor_data)
     topic = '/cmd_vel' if args.direct else '/cmd_vel_raw'
     pub = node.create_publisher(Twist, topic, 10)
 
@@ -291,6 +392,32 @@ def main():
     if not samples:
         print('FAIL: no /odom_raw. Car powered? Right domain? Agent up?')
         return 2
+
+    def imu_bias(t_from, t_to):
+        """Mean accel-x and gyro-z while stationary: removes static tilt and gyro drift."""
+        w = [(a, g) for t, a, g in imu if t_from <= t <= t_to]
+        if not w:
+            return None, None
+        return (sum(x[0] for x in w) / len(w), sum(x[1] for x in w) / len(w))
+
+    def imu_integrate(t_from, t_to, ab, gb):
+        """-> (delta_v, distance, delta_yaw) from IMU over a window, biases removed.
+
+        Trapezoidal. /imu runs at 25 Hz, so a 0.3 s event is only ~7 samples and the
+        integration itself is coarse; this is a cross-check, not a precision instrument.
+        """
+        w = [(t, a - ab, g - gb) for t, a, g in imu if t_from <= t <= (t_to or 1e18)]
+        if len(w) < 2:
+            return None, None, None
+        dv = d = dyaw = 0.0
+        v = 0.0
+        for (t0, a0, g0), (t1, a1, g1) in zip(w, w[1:]):
+            dt = t1 - t0
+            dv += 0.5 * (a0 + a1) * dt
+            d += abs(v) * dt + 0.5 * abs(0.5 * (a0 + a1)) * dt * dt
+            v += 0.5 * (a0 + a1) * dt
+            dyaw += 0.5 * (g0 + g1) * dt
+        return dv, d, dyaw
 
     def integrate(t_from, t_to=None):
         seg = [s for s in samples if s[0] >= t_from and (t_to is None or s[0] <= t_to)]
@@ -305,6 +432,10 @@ def main():
             input('Place the car at the start mark and press Enter... ')
         except EOFError:
             pass
+        say('  holding still for 2 s to measure IMU bias...')
+        t_bias0 = time.time()
+        time.sleep(2.0)
+        ab, gb = imu_bias(t_bias0, time.time())
         t0 = time.time()
         try:
             raw = input('Push it now, then type the tape distance in mm and press Enter: ')
@@ -312,18 +443,40 @@ def main():
         except (EOFError, ValueError):
             say('no measurement given; aborted')
             return 2
+        t_end = time.time()
         odo = integrate(t0)
         if odo <= 0:
             say('FAIL: odometry recorded no movement. Did the car move? Is it powered?')
             return 2
         k = tape / odo
         say(f'  odometry {odo*1000:.0f} mm   tape {tape*1000:.0f} mm   k = {k:.4f}')
+
+        # Straightness, from the gyro. A curved push makes the wheels trace an arc while
+        # the tape measures the chord; arc/chord ~ 1 + theta^2/24 for small theta, so the
+        # odometry reads long and k comes out low.
+        dyaw = None
+        if gb is not None:
+            _, _, dyaw = imu_integrate(t0, t_end, ab or 0.0, gb)
+        if dyaw is None:
+            say('  straightness: NO IMU DATA -- cannot tell whether the push was straight')
+        else:
+            infl = (dyaw ** 2) / 24.0
+            say(f'  straightness: yaw changed {math.degrees(dyaw):+.1f} deg over the push')
+            say(f'    implied arc-vs-chord inflation of odometry: {infl*100:.2f}%')
+            if abs(math.degrees(dyaw)) > 5.0:
+                say('    *** the push CURVED. k is biased low; redo it against a '
+                    'straight edge. ***')
+        if odo < 1.0:
+            say(f'  *** SHORT PUSH ({odo*1000:.0f} mm). A fixed +/-10 mm tape error is '
+                f'{10.0/(odo*1000)*100:.1f}% here. Push at least 1.5 m. ***')
         if not 0.5 < k < 2.0:
             say(f'  REFUSED: k={k:.3f} is implausible. Check the push was straight and')
             say('  that the tape figure is in millimetres.')
             return 2
         store.setdefault('calibrations', []).append(
-            {'timestamp': stamp, 'tape_m': tape, 'odom_m': odo, 'k': k})
+            {'timestamp': stamp, 'tape_m': tape, 'odom_m': odo, 'k': k,
+             'yaw_change_rad': dyaw,
+             'arc_chord_inflation': ((dyaw ** 2) / 24.0) if dyaw is not None else None})
         store['odom_scale_k'] = k
         save(store)
         say(f'  saved. Odometry reads {(1/k - 1)*100:+.1f}% vs ground truth.')
@@ -350,6 +503,11 @@ def main():
                 input('  Car at the START mark, then press Enter... ')
             except EOFError:
                 pass
+
+            # Stationary window first: removes static tilt from accel-x and gyro drift.
+            t_bias0 = time.time()
+            time.sleep(1.5)
+            ab, gb = imu_bias(t_bias0, time.time())
 
             t_start = time.time()
             t = Twist()
@@ -387,6 +545,30 @@ def main():
             say(f'  time to rest: {rest_t*1000:.0f} ms' if rest_t
                 else '  NEVER REACHED REST -- abort and check the deadman')
 
+            # --- IMU cross-check over the braking window only ---
+            dv_imu = d_imu = slip = None
+            t_rest = (t_zero + rest_t) if rest_t else None
+            if ab is not None and t_rest:
+                dv_imu, d_imu, _ = imu_integrate(t_zero, t_rest, ab, gb)
+            if dv_imu is not None and v_meas:
+                # Encoders say the wheels lost v_meas. The IMU says the BODY lost
+                # |dv_imu|. A gap between them is slip -- the wheels and the ground
+                # disagreeing, which is exactly what a dirty floor produces.
+                slip = (abs(dv_imu) - v_meas) / v_meas
+                say(f'  IMU delta-v {abs(dv_imu)*1000:.0f} mm/s vs encoder '
+                    f'{v_meas*1000:.0f} mm/s   -> {slip*100:+.0f}%')
+                if abs(slip) > 0.30:
+                    say('    *** WHEELS AND BODY DISAGREE BY >30% -- suspect slip. ***')
+                # Distance: trustworthy only where brake-dive is small next to the decel.
+                a_est = v_meas / rest_t if rest_t else 0.0
+                dive_frac = (9.81 * 0.01745 / a_est) if a_est > 0 else 9.9
+                verdict = ('useful' if dive_frac < 0.25 else
+                           'indicative' if dive_frac < 0.6 else 'UNUSABLE')
+                say(f'  IMU stopping distance {d_imu*1000:.0f} mm  '
+                    f'[1 deg of brake-dive = {dive_frac*100:.0f}% of decel -> {verdict}]')
+            elif ab is None:
+                say('  IMU: no data (is /imu publishing?)')
+
             total = None
             try:
                 raw = input('  tape: START mark to final rest, in mm '
@@ -412,6 +594,9 @@ def main():
                 'runup_m': runup, 'stop_distance_m': stop_d,
                 'odom_braking_m': odo_stop, 'time_to_rest_s': rest_t,
                 'odom_scale_k': k, 'governed': not args.direct,
+                'imu_delta_v_m_s': abs(dv_imu) if dv_imu is not None else None,
+                'imu_distance_m': d_imu,
+                'imu_vs_encoder_slip_frac': slip,
                 # Raw samples kept so a later analysis can revisit the derivation
                 # without needing the robot back.
                 'samples': [(round(s[0] - t_start, 4), round(s[1], 4))
