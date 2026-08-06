@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>yahboomcar_localization</name>
+  <version>0.1.0</version>
+  <description>
+    Lidar-derived odometry for the Yahboom microROS car: a scan matcher giving a movement
+    estimate that is independent of the wheels and of any dead-reckoned integration, with
+    explicit detection of the geometry degeneracies that make such an estimate untrustworthy.
+  </description>
+  <maintainer email="alexander.gomez.contact@gmail.com">Alexander Gomez</maintainer>
+  <license>MIT</license>
+
+  <!-- Declared properly, unlike the vendor packages. NOTE: python3-scipy is deliberately
+       NOT a dependency. scipy's compiled submodules are broken on this machine (a pip
+       numpy 2.x shadows apt's 1.x, and apt scipy is built against the 1.x ABI), and a 2D
+       scan is small enough that plain numpy is fast enough. See docs/porting-notes.md. -->
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
