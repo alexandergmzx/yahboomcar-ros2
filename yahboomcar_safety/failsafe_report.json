@@ -1,31 +1,24 @@
 {
-  "timestamp": "20260806-133032",
+  "timestamp": "20260806-134914",
   "speed_m_s": 0.15,
   "stop_timeout_s": 3.0,
   "cases": {
     "command_cessation": {
       "title": "commands stop arriving",
-      "stopped": false,
-      "time_to_stop_lo_s": null,
-      "time_to_stop_hi_s": null,
+      "stopped": true,
+      "time_to_stop_lo_s": 0.6007130146026611,
+      "time_to_stop_hi_s": 0.6873579025268555,
       "observation": "automatic",
-      "detail": "firmware appears to LATCH the last command"
+      "detail": ""
     },
     "governor_sigkill": {
       "title": "governor SIGKILLed",
-      "stopped": false,
-      "time_to_stop_lo_s": null,
-      "time_to_stop_hi_s": null,
+      "stopped": true,
+      "time_to_stop_lo_s": 0.6559271812438965,
+      "time_to_stop_hi_s": 0.7419517040252686,
       "observation": "automatic",
-      "detail": "no zero escaped, and the firmware did not expire it"
-    },
-    "agent_loss": {
-      "title": "micro-ROS agent stopped",
-      "stopped": false,
-      "observation": "human + reconnect probe",
-      "human_observation": "not observed",
-      "detail": "DECISIVE: still moving on reconnect -- the firmware latched the command through the entire outage",
-      "outage_s": 6.0
+      "detail": ""
     }
-  }
+  },
+  "watchdog_bound_s": 0.7419517040252686
 }

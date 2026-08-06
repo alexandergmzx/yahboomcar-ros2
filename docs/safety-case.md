@@ -38,13 +38,39 @@ battery dies.** The governor's protection is entirely contingent on the governor
 remaining alive. This is not a bug to fix; it is a property of the hardware to design
 around.
 
-`cmd_vel_deadman` (below) covers the subset that software can reach. What remains
-uncovered is uncoverable from this machine:
+### The mitigation, and its measured bound
+
+`cmd_vel_deadman` watches `/cmd_vel` and zeros it when the last command was a move and
+nobody has spoken since. It is a separate process specifically so it can outlive a
+governor crash.
+
+**Re-running the same fail-safe test with the deadman running flips both observable cases**
+(2026-08-06, same elevated car, same 0.15 m/s):
+
+| Loss mode | Without deadman | With deadman |
+|---|---|---|
+| Publisher ceases | drove 45 s+, never stopped | **stopped in 687 ms** |
+| Governor `SIGKILL`ed | drove indefinitely | **stopped in 742 ms** |
+
+742 ms is the worst upper bracket. It decomposes as the deadman's 0.5 s silence timeout
+plus roughly 200 ms of command→motion-stop latency, and it is **tunable** — the timeout
+is a launch argument. It has not been lowered because the radio link is demonstrably
+jittery (scan gaps to 147 ms measured), and a timeout tight enough to trip on normal
+jitter would produce spurious stops that teach the operator to distrust it.
+
+**This is a deadman-mediated stop, not a firmware watchdog.** It holds only while the
+deadman process is alive *and* the link is up. It is not a property of the car.
+
+At 0.30 m/s, 742 ms is **223 mm of coast**; at the 0.05 m/s first-floor cap, 37 mm. That
+is a **crash-case** term, separate from the normal stopping envelope — in ordinary
+operation the governor commands the stop itself and the reaction time is T, not this.
+
+### What remains uncovered is uncoverable from this machine
 
 | Failure | Covered by deadman? |
 |---|---|
-| Governor crashes / `SIGKILL` | **yes** — separate process, zeros the car |
-| Teleop or a test tool dies mid-command | **yes** |
+| Governor crashes / `SIGKILL` | **yes — measured, 742 ms** |
+| Teleop or a test tool dies mid-command | **yes — measured, 687 ms** |
 | The deadman itself dies | no |
 | This PC loses power, freezes, or is put to sleep | **no** |
 | Wi-Fi drops, or the agent dies | **no — measured, case 3** |
@@ -101,8 +127,14 @@ ros2 run <pkg> <node> --ros-args -r /cmd_vel:=/cmd_vel_raw
 
 These are properties of the design, not bugs, and they bound what the governor can claim:
 
-- **Forward sector only.** The governor watches ±45° ahead. **Nothing guards the rear**,
-  and reverse is deliberately unrestricted.
+- **Forward sector only.** The governor watches ±45° ahead. **Nothing guards the rear or
+  the sides.** Reverse and rotation stay *possible* — blocking them would trap the car
+  against whatever it is trying to escape — but they are now bounded rather than passed
+  through: reverse is capped at `max_reverse_speed` (0.10 m/s) because it is sensor-blind,
+  and yaw is capped at `max_yaw_near` (0.4 rad/s) inside `stop_distance` because rotating
+  sweeps the footprint corners past what the forward sector cannot watch. Lateral motion
+  is zeroed outright: the chassis is differential, and the filter should not depend on the
+  firmware ignoring a command it cannot govern.
 - **System response time has been measured ELEVATED, which makes it a LOWER BOUND, not a
   conservative value.** Two runs of `tools/measure_latency.py` on the live car:
 
@@ -165,6 +197,26 @@ These are properties of the design, not bugs, and they bound what the governor c
   Any ROS 2 participant reachable on the same domain can publish `/cmd_vel` and drive the
   car. Audit finding #7, open.
 
+## TODO: command arbitration (open design question, deliberately not built)
+
+Bypass detection is an **alarm, not an interlock** — the governor logs an ERROR naming
+the offending node and nothing more. Raised here rather than implemented, because the
+obvious fixes are all wrong in an instructive way:
+
+- **ROS 2 cannot prevent a bypass.** Any participant on the domain may publish `/cmd_vel`.
+  The only real enforcement is SROS2 permissions, and the enforcement point would have to
+  be the **agent's DDS side** — the board is a Micro-XRCE-DDS v2.x client with no security
+  story of its own, so nothing can be enforced on the firmware.
+- **Making the governor hard-fault on bypass punishes the wrong person.** It would brick
+  governed teleop the moment anyone ran a command out of the course PDFs, while the
+  bypassing node kept driving the car regardless. Strictly worse than the alarm.
+- **Zeroing on bypass turns two publishers into a fight**, at 20 Hz, over a car.
+
+What this actually is: several sources want to command one actuator, and there is no
+arbiter. That is a **command-arbitration** problem, and it belongs with sensor fusion
+rather than with the safety filter. Until it is designed, the operating rule stands:
+**only run governed launch files, and watch the log for BYPASSED.**
+
 ## What has actually been tested
 
 | Claim | Evidence |
@@ -173,6 +225,11 @@ These are properties of the design, not bugs, and they bound what the governor c
 | It limits real commands with real lidar | bench, live car: 0.39 m ahead → 0.25 m/s request throttled to **0.022 m/s** |
 | Stale input stops the robot | bench: output went to 0.000 after commands ceased |
 | Bypass is detected and named | bench: governor logged the offending node |
+| **Firmware retains commands forever** | live car, 3 modes + a 45 s probe: never stops without an explicit zero |
+| **Deadman stops a dead publisher** | live car: 687 ms (publisher ceases), 742 ms (governor SIGKILLed) |
+| Deadman covers link loss | **NO — measured to fail.** Nothing on this PC can |
+| Stop paths leak no translation | unit test over all 5 stop paths, both axes |
+| Reverse and near-obstacle yaw bounded | unit tests; **never exercised on hardware** |
 | It stops before contact | **simulation only**, 0.394 m from a wall |
 | Scan interval, governor loop | measured, live car, 2 runs; load-independent so they transfer |
 | Command→motion latency | measured **elevated only**; a lower bound on the floor value |
@@ -182,7 +239,7 @@ These are properties of the design, not bugs, and they bound what the governor c
 
 ## Before driving on the floor
 
-1. Measure real braking distance at several speeds with a tape measure.
-2. Decide whether the unprotected vendor paths are acceptable, or remap them too.
-3. Keep the car's lidar clear — a blocked scanner is the failure the governor cannot see
-   past, since it stops on *stale* data but trusts *wrong* data.
+Follow [`first-floor-procedure.md`](first-floor-procedure.md). It replaces the checklist
+that used to sit here, which was circular — it required braking distance to be measured
+before any floor test, and that measurement *is* a floor test. The first session's whole
+job is that measurement, at 0.05 m/s, with a hand on the power switch.
