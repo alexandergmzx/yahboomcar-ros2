@@ -63,16 +63,30 @@ DISCRETISATION of the scene rather than by this code: measured error tracked
 (sample spacing / room radius) to within 5% over a 16x density sweep. The real lidar is
 360 beams at 1 deg, ~12 mm of arc at a 0.7 m range.
 
-NO SCIPY -- see scan_geometry for why. Nearest neighbours are brute force, vectorised and
-chunked. For a few hundred points per scan that is a few milliseconds, which is well
-inside a 12 Hz budget, and it removes a dependency from an estimator that has to be
-readable to be trusted.
+NEAREST NEIGHBOURS: scipy WHEN AVAILABLE, numpy WHEN NOT
+--------------------------------------------------------
+scipy's cKDTree is 6.1x faster than the brute-force fallback here (mean 110 -> 18 ms,
+p95 485 -> 43 ms on real 355-point scans), which is the difference between needing
+subsampling and a time budget to hit 12 Hz and not needing them.
+
+It is optional rather than required because scipy was broken on this machine for a while
+-- a pip numpy shadowing apt's while apt scipy was built against the older ABI -- and a
+localisation package that cannot run because a dependency's dependency is mismatched is
+worse than one that runs slower. The fallback is exercised by its own test so it cannot
+silently rot.
 """
 import math
 import time
 from dataclasses import dataclass, field
 
 import numpy as np
+
+try:                                     # optional: 6.1x faster when present
+    from scipy.spatial import cKDTree
+    HAVE_KDTREE = True
+except Exception:                        # ImportError, or a numpy/scipy ABI mismatch
+    cKDTree = None
+    HAVE_KDTREE = False
 
 from yahboomcar_localization.scan_geometry import (compose, estimate_normals,
                                                    transform_xy, wrap)
@@ -115,12 +129,12 @@ class MatchResult:
         return self.converged and not self.reason
 
 
-def nearest(src, dst, chunk=256):
-    """Nearest neighbour of each src point in dst. Returns (indices, distances).
+def nearest_bruteforce(src, dst, chunk=256):
+    """Nearest neighbour of each src point in dst, in plain numpy.
 
-    Brute force, chunked over src so peak memory stays at chunk*len(dst)*2 floats
-    instead of len(src)*len(dst)*2. With ~500 points per scan the whole thing is a few
-    milliseconds; a KD-tree would be faster asymptotically and is not available here.
+    Chunked over src so peak memory stays at chunk*len(dst)*2 floats rather than
+    len(src)*len(dst)*2. Kept as the fallback for machines without a working scipy, and
+    tested directly so it cannot rot unnoticed.
     """
     n = len(src)
     idx = np.zeros(n, dtype=int)
@@ -134,6 +148,18 @@ def nearest(src, dst, chunk=256):
         idx[a:b] = j
         dist[a:b] = d[np.arange(b - a), j]
     return idx, dist
+
+
+def nearest(src, dst, chunk=256):
+    """Nearest neighbour of each src point in dst. Returns (indices, distances).
+
+    Uses scipy's cKDTree when it imports, and the numpy fallback otherwise. Both return
+    identical results; only the speed differs. A test asserts that equivalence.
+    """
+    if not HAVE_KDTREE or len(src) == 0 or len(dst) == 0:
+        return nearest_bruteforce(src, dst, chunk)
+    d, i = cKDTree(dst).query(src)
+    return np.asarray(i, dtype=int), np.asarray(d, dtype=float)
 
 
 def rigid_transform(p, q):

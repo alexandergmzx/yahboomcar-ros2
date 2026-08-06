@@ -15,8 +15,10 @@ import pytest
 
 from yahboomcar_localization.scan_geometry import (compose, estimate_normals,
                                                    scan_to_xy, transform_xy, wrap)
+from yahboomcar_localization import scan_matcher as sm
 from yahboomcar_localization.scan_matcher import (degeneracy, estimate_motion,
                                                   match, nearest,
+                                                  nearest_bruteforce,
                                                   rigid_transform)
 
 
@@ -325,3 +327,40 @@ def test_raw_match_returns_the_INVERSE_of_robot_motion():
     raw = match(prev, curr)
     assert wrap(raw.dtheta + motion[2]) == pytest.approx(0.0, abs=0.02), \
         'match(prev, curr) should give the NEGATIVE of the robot rotation'
+
+
+# ----------------------------------------------- scipy path vs numpy fallback
+def test_kdtree_and_bruteforce_agree_exactly():
+    """The fast path and the fallback must be interchangeable. scipy is optional here
+    because it was broken on this machine for a while (a pip numpy shadowing apt's, with
+    apt scipy built against the older ABI), so the fallback is a real code path and not
+    a formality."""
+    rng = np.random.default_rng(11)
+    src, dst = rng.normal(size=(200, 2)), rng.normal(size=(150, 2))
+    i_bf, d_bf = nearest_bruteforce(src, dst)
+    i_now, d_now = nearest(src, dst)
+    assert np.array_equal(i_bf, i_now)
+    assert np.allclose(d_bf, d_now)
+
+
+def test_matching_gives_the_same_answer_on_either_backend():
+    target = np.vstack([room(n=180), box(1.0, 0.8, n=40)])
+    source = transform_xy(target, -0.02, 0.01, -0.05)
+    fast = match(source, target)
+    real, sm.HAVE_KDTREE = sm.HAVE_KDTREE, False
+    try:
+        slow = match(source, target)
+    finally:
+        sm.HAVE_KDTREE = real
+    assert (fast.dx, fast.dy) == pytest.approx((slow.dx, slow.dy), abs=1e-6)
+    assert fast.dtheta == pytest.approx(slow.dtheta, abs=1e-6)
+
+
+def test_fallback_still_works_when_scipy_is_pretended_absent():
+    real, sm.HAVE_KDTREE = sm.HAVE_KDTREE, False
+    try:
+        target = np.vstack([room(n=180), box(1.0, 0.8, n=40)])
+        r = match(transform_xy(target, -0.02, 0.0, 0.0), target)
+        assert r.converged and r.dx == pytest.approx(0.02, abs=0.005)
+    finally:
+        sm.HAVE_KDTREE = real

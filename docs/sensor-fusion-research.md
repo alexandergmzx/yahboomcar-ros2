@@ -225,7 +225,10 @@ state estimate.
 - **Fusion cannot rescue a degenerate direction.** If every sensor is blind to it,
   combining them adds confidence without adding information — the specific way this could
   make things *worse*.
-- **scipy is unusable on this machine**, so none of it is available to lean on:
-  `spatial`, `optimize`, `linalg` and `stats` all raise `numpy.dtype size changed`,
-  because a pip numpy 2.2.1 in `~/.local` shadows apt's 1.26.4 while apt's scipy 1.11.4 is
-  built against the numpy 1.x ABI. Everything here is plain numpy.
+- **scipy was unusable while this was built** — a pip numpy 2.2.1 in `~/.local`
+  shadowing apt's 1.26.4 against an apt scipy compiled for the 1.x ABI, which broke
+  `spatial`, `optimize`, `linalg` and `stats` machine-wide. Since resolved
+  (`scipy>=1.14`), and the matcher now uses `cKDTree` — **6.1x faster**, mean 110 to
+  18 ms, so `/odom_laser` runs full resolution at the sensor's own 12.5 Hz. The numpy
+  fallback is retained and tested, because it is what kept the package usable while
+  scipy was broken.

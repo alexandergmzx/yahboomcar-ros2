@@ -11,12 +11,19 @@
   <maintainer email="alexander.gomez.contact@gmail.com">Alexander Gomez</maintainer>
   <license>MIT</license>
 
-  <!-- Declared properly, unlike the vendor packages. NOTE: python3-scipy is deliberately
-       NOT a dependency. scipy's compiled submodules are broken on this machine (a pip
-       numpy 2.x shadows apt's 1.x, and apt scipy is built against the 1.x ABI), and a 2D
-       scan is small enough that plain numpy is fast enough. See docs/porting-notes.md. -->
+  <!-- Declared properly, unlike the vendor packages.
+
+       scipy is OPTIONAL. Its cKDTree makes scan matching 6.1x faster (p95 485 to 43 ms
+       on real scans), which is the difference between needing decimation and a time
+       budget to hold 12 Hz and not needing them. But scipy was broken on this machine
+       for a while (a pip numpy shadowing apt's, with apt scipy compiled against the
+       older ABI), and a localisation package that will not run because a dependency's
+       dependency is mismatched is worse than one that runs slower. There is a tested
+       numpy fallback, so python3-scipy is declared because it SHOULD be installed, not
+       because the code stops without it. See docs/porting-notes.md. -->
   <exec_depend>rclpy</exec_depend>
   <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
   <exec_depend>nav_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>

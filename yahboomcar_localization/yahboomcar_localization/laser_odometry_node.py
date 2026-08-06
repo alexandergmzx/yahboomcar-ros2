@@ -53,9 +53,17 @@ class LaserOdometry(Node):
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('min_points', 40)
-        # Cost is quadratic in point count and linear in iterations. Measured on real
-        # scans: 355 points ran to a 546 ms p95 against an 83 ms budget at 12 Hz.
-        self.declare_parameter('max_points', 180)
+        # Both of these are SAFETY NETS that no longer bind on the fast path, and they
+        # are kept because the slow path still exists.
+        #
+        # With scipy's cKDTree, full-resolution 355-point scans run at mean 15.8 ms and
+        # p95 39.1 ms against the 83 ms interval -- 0/99 over budget, so no decimation is
+        # needed and the extra points are free accuracy. Without scipy the same work is
+        # 6.1x slower (mean 110 ms, p95 485 ms) and both limits become load-bearing.
+        #
+        # max_points is therefore set high enough not to bind on a 360-beam lidar, and
+        # the time budget stays as the thing that keeps the numpy fallback real-time.
+        self.declare_parameter('max_points', 1000)
         self.declare_parameter('time_budget', 0.05)
         self.declare_parameter('publish_degenerate', False)
         # Baseline sigmas for a well-conditioned match. 5 mm and 10 mrad are of the order
