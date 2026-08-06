@@ -49,6 +49,10 @@ BAG_TOPICS = ['/scan', '/imu', '/imu/data', '/odom_raw', '/odom', '/battery',
 MIN_BATTERY_V = 7.0     # below this, refuse to command motion
 
 
+class SystemExit_NoData(Exception):
+    """Raised when nothing was received, so no conclusion may be drawn."""
+
+
 class Results:
     def __init__(self):
         self.rows = []
@@ -91,7 +95,25 @@ def main():
     ap.add_argument('--duration', type=float, default=8.0,
                     help='seconds to sample each topic set')
     ap.add_argument('--no-bag', action='store_true')
+    ap.add_argument('--domain', type=int, default=20,
+                    help='ROS_DOMAIN_ID the board is configured for (default 20). '
+                         'Must match, or nothing is received and every check reads 0 Hz.')
+    ap.add_argument('--servos', action='store_true',
+                    help='also command the 2-DOF gimbal. Off by default: the Standard '
+                         'chassis has no servos, and commanding absent hardware proves '
+                         'nothing.')
     args = ap.parse_args()
+
+    # Set the domain BEFORE rclpy.init, or we silently join the wrong graph. An earlier
+    # run with ROS_DOMAIN_ID unset received zero messages and still printed a confident
+    # conclusion about the encoders -- see the no-data gate below.
+    env_domain = os.environ.get('ROS_DOMAIN_ID')
+    if env_domain is None:
+        os.environ['ROS_DOMAIN_ID'] = str(args.domain)
+    elif int(env_domain) != args.domain:
+        print(f'NOTE: ROS_DOMAIN_ID={env_domain} in the environment, but --domain='
+              f'{args.domain}. Using {env_domain}; pass --domain to override.')
+        args.domain = int(env_domain)
 
     import threading
 
@@ -115,7 +137,7 @@ def main():
         transcript.append(str(m))
 
     say(f'car self-test  {stamp}')
-    say(f'ROS_DOMAIN_ID={os.environ.get("ROS_DOMAIN_ID", "<unset>")}')
+    say(f'ROS_DOMAIN_ID={os.environ.get("ROS_DOMAIN_ID")} (board must match)')
 
     # --- agent -------------------------------------------------------------
     names = agent_running()
@@ -198,6 +220,23 @@ def main():
             ok = abs(hz - expected) <= tol and counts[topic] > 0
             res.add(topic, f'{hz:.2f} Hz', f'{expected:.0f}+/-{tol:.0f}', ok)
 
+        # HARD GATE. Every conclusion below assumes we are actually receiving from the
+        # robot. A previous version reported "odometry is probably open-loop" after
+        # receiving zero messages of any kind, because the domain id did not match.
+        # No data means no verdict.
+        total = sum(counts.values())
+        if total == 0:
+            say('\n*** RECEIVED NOTHING FROM THE ROBOT ***')
+            say(f'  Zero messages on all {len(counts)} topics over {args.duration:.0f}s.')
+            say('  This says nothing about the robot. Likely causes, in order:')
+            say(f'    1. domain mismatch  - trying {os.environ.get("ROS_DOMAIN_ID")}; '
+                'check the board with tools/provision_board.py --dry-run')
+            say('    2. car powered off, or needs a reset press to rejoin the agent')
+            say('    3. agent not bridging - docker logs uros-udp')
+            say('  No further checks will run, and no conclusions drawn.')
+            res.add('data received', '0 messages', '> 0', False, 'aborting; see above')
+            raise SystemExit_NoData()
+
         if scan_meta:
             say(f'\nlidar: {scan_meta.get("n")} points, {scan_meta.get("span_deg")} deg span, '
                 f'frame={scan_meta.get("frame")}')
@@ -269,24 +308,32 @@ def main():
                         res.add(f'motion {label}', f'vx={peak_v:.3f}',
                                 f'vx > {abs(vx)*0.4:.2f}', ok)
 
-                say('  servos ...')
-                for ang in (-40, 0, 40, 0):
-                    s1.publish(Int32(data=ang)); spin(0.5)
-                for ang in (-40, 0, 20, 0):
-                    s2.publish(Int32(data=ang)); spin(0.5)
-                res.add('servos', 'commanded', 'commanded', True,
-                        'watch the gimbal; not observable from ROS')
+                if args.servos:
+                    say('  servos ...')
+                    for ang in (-40, 0, 40, 0):
+                        s1.publish(Int32(data=ang)); spin(0.5)
+                    for ang in (-40, 0, 20, 0):
+                        s2.publish(Int32(data=ang)); spin(0.5)
+                    res.add('servos', 'commanded', 'commanded', True,
+                            'watch the gimbal yourself; not observable from ROS')
+                else:
+                    say('  servos: skipped (--servos to command them)')
 
                 say('\nNOTE: these motion rows say the ROBOT REPORTED motion on /odom_raw.')
                 say('      They do NOT prove the wheels physically turned. Use --handspin,')
                 say('      and watch the wheels yourself.')
+    except SystemExit_NoData:
+        pass
     finally:
+        # Order matters: stop the robot while the node is still usable, then tear the
+        # executor down, or rclpy raises "cannot use Destroyable" on the way out.
         try:
-            executor.shutdown()
+            stop_wheels()
         except Exception:
             pass
         try:
-            stop_wheels()
+            executor.remove_node(node)
+            executor.shutdown()
         except Exception:
             pass
         if bag_proc:
