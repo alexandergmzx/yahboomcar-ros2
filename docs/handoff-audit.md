@@ -4,9 +4,10 @@ For a reviewer (human or LLM) checking this work. Written to help you find my er
 to defend the work. Where I am unsure, it says so; where I was wrong, it says that too.
 
 **One-line summary:** the ROS 2 Humble→Jazzy port is real and well tested; the Isaac Sim
-work was rushed, wasteful, and produced a false "working" claim; and the single most
-load-bearing assumption — that `/odom_raw` reflects physical wheel rotation — is **still
-unverified**.
+work was rushed, wasteful, and produced a false "working" claim; the load-bearing
+assumption that `/odom_raw` reflects physical wheel rotation is now **measured and
+confirmed**; and the radio link to the car is **degraded to roughly half its specified
+rates**, which the project has not yet explained.
 
 ---
 
@@ -16,8 +17,9 @@ Check these first. They are ordered by how much rests on them.
 
 | # | Claim | Status | Why it deserves scrutiny |
 |---|---|---|---|
-| 1 | `/odom_raw` reflects real wheel rotation | ❌ **UNVERIFIED** | Never checked against the physical robot. If the firmware computes odometry open-loop from `cmd_vel`, then UMBmark calibration, cartographer (`use_odometry = true`), and the twin's wheel animation all rest on a number that never observed the world. `tools/car_selftest.py --handspin` settles it and has not been run. |
-| 2 | "The motors move" | ⚠️ **INFERRED ONLY** | I asserted this from `/odom_raw` values. The operator watching the robot did not see motion. Both can be true if odometry is open-loop. Unresolved. |
+| 1 | `/odom_raw` reflects real wheel rotation | ✅ **RESOLVED — measured** | Hand-spin test, `selftest-20260806-004042`: turning a wheel by hand with nothing commanded produced peak twist **1.5446** and pose change **0.221 m**. Encoders are real; odometry is **not** open-loop. UMBmark, cartographer and the twin rest on a sound foundation after all. |
+| 2 | "The motors move" | ✅ **RESOLVED — measured** | `selftest-20260806-004114`: commanded 0.12 → `/odom_raw` 0.127 forward, 0.131 back, yaw 0.693 for a commanded 0.6. Since claim #1 establishes the encoders are genuine, odometry responding to commands means the wheels physically turned. The inference is now sound; it was not before. |
+| 2b | Earlier "all tests failed" | ❌ **INVALID RUN** | Three runs (`003440`, `003546`, `003918`) received **zero** messages because `ROS_DOMAIN_ID` was unset and defaulted to 0 while the board is on 20. One of them still printed "odometry is probably open-loop" from no data. Those logs prove nothing about the robot. |
 | 3 | The chassis is differential, not mecanum | ✅ measured | A commanded strafe produced *exactly* zero on every `/odom_raw` axis. Strong, but note it shares dependency #1: if odometry is open-loop, this shows only that the firmware ignores `linear.y`, which still supports the conclusion. |
 | 4 | Isaac twin "articulates and tracks" | ⚠️ **PARTLY FALSE** | Joints did track. But the robot was **falling through the floor** the whole time and I never checked base pose. The verification was blind to the most obvious possible failure. |
 | 5 | Nav2 params fixed for Jazzy | ✅ measured | All eleven nodes reach `inactive` (configured). Activation was never reached — it needs a live robot. Do not read this as "navigation works". |
@@ -56,6 +58,17 @@ and was wrong:
   removed in NumPy 2.0). Nothing imports it, so it is inert.
 - **A 15 mm frame disagreement**: the cartographer launch places `laser_frame` 0.094079 m
   above `base_link`; the URDF's `radar_Joint` says 0.078934 m.
+- **The radio link runs at roughly half spec and is unexplained.** Measured across runs:
+  `/scan` 4.1–8.9 Hz against 12, `/imu` 5.3–16.5 against 25, `/odom_raw` 3.1–8.3 against
+  11, while the 1 Hz `/battery` topic is unaffected — the signature of bandwidth, not
+  firmware. Battery is healthy at 8.3 V. Both PC and car now share the 2.4 GHz band;
+  earlier measurements had the PC on 5 GHz. **Any timing-sensitive result should be
+  distrusted until this is understood**, including the UMBmark protocol, which assumes
+  odometry samples arrive promptly.
+- **This car has no servos.** `jq1_Joint`/`jq2_Joint` exist in the vendor URDF but the
+  Standard chassis has no gimbal; they are only on the Vision version. The twin animates
+  them anyway, and an earlier self-test reported `servos PASS` for hardware that is not
+  present. Now `--servos` opt-in, but the twin still needs them gated.
 
 ## Verified, with the command to re-run
 
