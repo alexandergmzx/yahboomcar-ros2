@@ -1,5 +1,10 @@
 # Audit handoff
 
+> **External audit completed.** Its findings held up: I verified each one rather than
+> taking them on trust, and every claim I checked was correct. The section
+> "Post-audit status" at the end records what was closed and what remains open.
+> Where earlier sections of this file contradict that one, the later section wins.
+
 For a reviewer (human or LLM) checking this work. Written to help you find my errors, not
 to defend the work. Where I am unsure, it says so; where I was wrong, it says that too.
 
@@ -168,3 +173,39 @@ MicroROS-assets/             git-ignored vendor drop, bags, logs
 Branch `jazzy-port`, ~30 commits. Commit messages state what was measured versus
 inferred; where they disagree with this document, trust this document — it was written
 later and with less to prove.
+
+
+---
+
+## Post-audit status
+
+An external audit (Codex) reviewed the repository. Ten findings; all verified as
+correct. One was worse than reported — the laserscan node passes `angle_increment`
+twice, so `angle_min` never reaches the conversion at all.
+
+### Closed
+
+| # | Finding | What was done |
+|---|---|---|
+| 4 | Governor bypassed by everything | **Scoped fix.** `car_selftest` and `twin_motion_sequence` now publish `/cmd_vel_raw`; `safe_teleop_launch.py` runs the governor with the vendor keyboard remapped. The governor now **names** bypassing publishers at ERROR. Verified on the live car: real lidar at 0.39 m throttled a 0.25 m/s request to **0.022 m/s**, and withheld input drove output to zero. Coverage is deliberately partial — see `docs/safety-case.md`. |
+| 8 | laserscan node broken | Five defects fixed (angle_min never passed; 135 **radians** added to every angle; no headers; undefined variable on shutdown; node name colliding with `robot_pose_publisher_ros2`). 9 tests pin each. |
+| 10 | Manifests | `exec_depend` added across 12 packages from real imports; descriptions written. |
+| — | Docs asserting falsehoods | `CLAUDE.md` no longer claims the twin syncs chassis pose. |
+
+### Open, deliberately
+
+| # | Finding | Why it is still open |
+|---|---|---|
+| 1, 2, 3, 5 | Twin is not a twin; asset paths disagree; live twin still falls; verifier cannot fail | Deferred by decision. `isaac_twin_setup.py` and `isaac_twin_verify.py` now carry **KNOWN BROKEN** banners so a passing run is not mistaken for a working twin. Design is settled: 5.1.0 has `ROS2SubscribeTransformTree`, which takes `articulationRoots` and a `frameNamesMap` and drives prims from `/tf`; with a **kinematic** base posed from `odom`→`base_footprint`, the falling bug becomes structurally impossible rather than merely patched. |
+| 6 | Sim physics untrustworthy for calibration | Agreed and documented. The 1.87× effective-radius anomaly is unexplained and flagged; the arena is for visualisation and collision experiments, not controller or odometry validation. |
+| 7 | No SROS2 authorisation boundary | Real gap. Enclaves and keystores are a deliberate piece of work, not a bolt-on. Recorded in `docs/safety-case.md`. |
+| 9 | Braking distance unmeasured | Needs the floor. This is the number that gates real driving and it does not exist. |
+| 10 | **Licences** | Left as `TODO` **on purpose**. This is third-party Yahboom code shipping no licence declaration; writing one into `package.xml` is a legal assertion nobody here can make, and a fabricated licence is worse than an obvious gap because it looks settled. Each manifest carries a comment explaining this. **Blocks redistribution** until Yahboom clarifies. |
+
+### Vendor packages: what "unprotected" means
+
+The vendor course nodes (`yahboom_keyboard`, `yahboom_joy`, `calibrate_*`, `laser_*`,
+Nav2) publish `/cmd_vel` directly and are **not** speed-limited. This was a scope
+decision so commands copied from the course PDFs keep working as documented. The
+governor logs an ERROR naming any such publisher, so the gap is visible rather than
+silent.

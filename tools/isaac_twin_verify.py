@@ -1,5 +1,23 @@
 #!/usr/bin/env python3
-"""Verify the Isaac twin actually articulates from ROS /joint_states.
+"""!! KNOWN BROKEN -- DEFERRED. Do not trust a passing run. !!
+
+Superseded in practice by tools/build_arena.py + tools/sim_runner.py, which are working
+and verified. This file is kept only because the live-twin design will build on it.
+
+Three defects, all confirmed by external audit:
+
+  1. It references usd/MicroROS/MicroROS.usda, which tools/urdf_to_usd.py no longer
+     produces -- the converter now writes usd/micro4/micro4.usd. This script cannot
+     find its asset on a clean checkout.
+  2. The ground is a UsdGeom.Plane with no collider, so the robot falls through the
+     world. build_arena.py fixed this; that fix was never carried over here.
+  3. It reports failure without failing: main() returns no status and swallows
+     exceptions, so it is unusable as a gate.
+
+It also never subscribed to /odom or /tf, which is why the twin animates joints but
+does not follow the real chassis.
+
+Verify the Isaac twin actually articulates from ROS /joint_states.
 
     export ROS_DOMAIN_ID=20
     ~/isaacsim/python.sh tools/isaac_twin_verify.py --seconds 40
