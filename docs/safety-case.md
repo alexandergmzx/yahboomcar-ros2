@@ -54,10 +54,24 @@ These are properties of the design, not bugs, and they bound what the governor c
 
 - **Forward sector only.** The governor watches ±45° ahead. **Nothing guards the rear**,
   and reverse is deliberately unrestricted.
-- **Braking distance is unmeasured.** The governor limits *commands*; it cannot exceed
-  the robot's own braking. The simulated figure (~0.39 m from a wall at 0.25 m/s) comes
-  from a simulated 0.355 kg mass and a friction coefficient I chose rather than measured.
-  **The real number has to come off a tape measure and does not exist yet.**
+- **System response time is now MEASURED: T(p95) = 444 ms.** From 20 wheel-step
+  trials plus 233 scan intervals on the live car (`tools/measure_latency.py`):
+  scan interval p95 147 ms, governor loop 50 ms,
+  command→motion p95 247 ms. At 0.30 m/s that
+  is **133 mm of travel before braking begins**.
+- **Reaction dominates braking, by 3–12×.** Using `d = v·T + v²/(2a) + C`, the braking
+  term at 0.30 m/s is 45 mm even for a pessimistic `a = 1.0 m/s²` and 11 mm at
+  `a = 4.0`, against 133 mm of reaction. A 4× error in `a` moves the total
+  by only ~34 mm. **The latency is the safety problem; the brakes are not.**
+- **Deceleration `a` is still unmeasured** — it needs floor space. Because it is the
+  minor term, a conservative value can be used now and confirmed later, rather than
+  blocking. The simulated figure (~0.39 m from a wall at 0.25 m/s) came from a simulated
+  0.355 kg mass and a friction coefficient I chose, and predicts nothing about the real
+  robot.
+- **The measured latency is command→motion START, not braking response.** Spin-up must
+  overcome static friction and rotor inertia, so it is probably the more conservative of
+  the two, but that is an argument rather than a measurement. Braking response is
+  measured with `a`, on the floor.
 - **The taper creeps rather than hard-stopping.** Speed scales linearly to zero *at*
   `stop_distance`, so a steady approach decelerates asymptotically and may never command
   an exact zero. It stops short of contact — measured at 0.394 m in simulation — but a
