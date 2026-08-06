@@ -54,24 +54,55 @@ These are properties of the design, not bugs, and they bound what the governor c
 
 - **Forward sector only.** The governor watches ±45° ahead. **Nothing guards the rear**,
   and reverse is deliberately unrestricted.
-- **System response time is now MEASURED: T(p95) = 444 ms.** From 20 wheel-step
-  trials plus 233 scan intervals on the live car (`tools/measure_latency.py`):
-  scan interval p95 147 ms, governor loop 50 ms,
-  command→motion p95 247 ms. At 0.30 m/s that
-  is **133 mm of travel before braking begins**.
-- **Reaction dominates braking, by 3–12×.** Using `d = v·T + v²/(2a) + C`, the braking
-  term at 0.30 m/s is 45 mm even for a pessimistic `a = 1.0 m/s²` and 11 mm at
-  `a = 4.0`, against 133 mm of reaction. A 4× error in `a` moves the total
-  by only ~34 mm. **The latency is the safety problem; the brakes are not.**
-- **Deceleration `a` is still unmeasured** — it needs floor space. Because it is the
-  minor term, a conservative value can be used now and confirmed later, rather than
-  blocking. The simulated figure (~0.39 m from a wall at 0.25 m/s) came from a simulated
-  0.355 kg mass and a friction coefficient I chose, and predicts nothing about the real
-  robot.
-- **The measured latency is command→motion START, not braking response.** Spin-up must
-  overcome static friction and rotor inertia, so it is probably the more conservative of
-  the two, but that is an argument rather than a measurement. Braking response is
-  measured with `a`, on the floor.
+- **System response time has been measured ELEVATED, which makes it a LOWER BOUND, not a
+  conservative value.** Two runs of `tools/measure_latency.py` on the live car:
+
+  | term | run A | run B | transfers to the floor? |
+  |---|---|---|---|
+  | scan interval p95 | 147 ms | 113 ms | **yes** — sensor + radio, no load |
+  | governor loop | 50 ms | 50 ms | **yes** — software |
+  | command→motion p95 | 247 ms | 230 ms | **no** — contains unloaded spin-up |
+  | **T (p95)** | **444 ms** | **393 ms** | lower bound only |
+
+  At 0.30 m/s, run B's T is 118 mm of travel before braking begins. The two runs differ
+  by 51 ms almost entirely in the scan term, which is the link variability already
+  documented below.
+
+- **The wheels were off the ground, so they spun up unloaded.** `/odom_raw` is
+  encoder-derived, so it registers motion as soon as the wheels turn — not as soon as the
+  *robot* moves. On the floor the motors must first overcome static friction, rolling
+  resistance and the chassis inertia, so command→motion takes **longer** there.
+  An earlier version of this document claimed spin-up made the figure conservative. That
+  was backwards, and it was the safety-relevant direction to get wrong.
+
+- **A threshold sweep separates the load-independent part.** Timing to reach 10/25/50/75%
+  of commanded speed gave 219/230/274/326 ms — a 107 ms spread, well above the 91 ms
+  `/odom_raw` sampling interval, so spin-up is genuinely visible rather than lost in
+  quantisation. Extrapolating to zero threshold gives **~195 ms of comms + firmware**,
+  which *is* load-independent and does carry to the floor. The remaining ~35 ms at the
+  25% threshold is unloaded spin-up, and that is the term that grows.
+
+  The 195 ms intercept still contains up to one sampling interval of quantisation, so the
+  true comms+firmware delay is bounded between roughly **104 and 195 ms**.
+
+- **Reaction still dominates braking, and the floor can only widen the gap.** The braking
+  term at 0.30 m/s is 45 mm even at a pessimistic `a = 1.0 m/s²` and 11 mm at `a = 4.0`,
+  against ≥118 mm of reaction. A 4× error in `a` moves the total by ~34 mm.
+  **The latency is the safety problem; the brakes are not.**
+
+- **Deceleration `a` is still unmeasured** — it needs floor space. The simulated figure
+  (~0.39 m from a wall at 0.25 m/s) came from a simulated 0.355 kg mass and a friction
+  coefficient I chose, and predicts nothing about the real robot.
+
+- **What was timed is command→motion STARTS. Safety depends on command→motion STOPS.**
+  These are different quantities and both are load-dependent, but not in the same
+  direction: load *opposes* starting and *assists* stopping. So the start figure is not a
+  usable proxy for the stop figure in either direction.
+
+  Phase 2 sidesteps the decomposition entirely. Tape-measuring total stopping distance at
+  several speeds and fitting `d = v·T_stop + v²/(2a) + C` separates both parameters at
+  once — `T_stop` from the linear term, `a` from the quadratic — and measures them under
+  exactly the load that matters. No elevated figure is carried forward.
 - **The taper creeps rather than hard-stopping.** Speed scales linearly to zero *at*
   `stop_distance`, so a steady approach decelerates asymptotically and may never command
   an exact zero. It stops short of contact — measured at 0.394 m in simulation — but a
@@ -94,6 +125,10 @@ These are properties of the design, not bugs, and they bound what the governor c
 | Stale input stops the robot | bench: output went to 0.000 after commands ceased |
 | Bypass is detected and named | bench: governor logged the offending node |
 | It stops before contact | **simulation only**, 0.394 m from a wall |
+| Scan interval, governor loop | measured, live car, 2 runs; load-independent so they transfer |
+| Command→motion latency | measured **elevated only**; a lower bound on the floor value |
+| Comms + firmware delay | bounded to 104–195 ms by a threshold sweep |
+| Braking response / deceleration `a` | **NOT MEASURED** |
 | Real stopping distance | **NOT MEASURED** |
 
 ## Before driving on the floor

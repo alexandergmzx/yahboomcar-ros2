@@ -1,21 +1,39 @@
 {
-  "timestamp": "20260806-121620",
+  "timestamp": "20260806-123233",
   "scan": {
-    "n": 233,
-    "rate_hz": 11.619704970721184,
-    "interarrival_p50_s": 0.08061814308166504,
-    "interarrival_p95_s": 0.14667797088623047,
-    "interarrival_max_s": 0.4031808376312256
+    "n": 246,
+    "rate_hz": 12.289181599324534,
+    "interarrival_p50_s": 0.0800623893737793,
+    "interarrival_p95_s": 0.1130971908569336,
+    "interarrival_max_s": 0.21601009368896484
   },
   "command_latency": {
     "n": 20,
-    "lower_p50_s": 0.11548066139221191,
-    "lower_p95_s": 0.14484143257141113,
-    "upper_p50_s": 0.20303606986999512,
-    "upper_p95_s": 0.24739694595336914,
-    "upper_max_s": 0.27248311042785645,
-    "speed_m_s": 0.15
+    "lower_p50_s": 0.09099841117858887,
+    "lower_p95_s": 0.14475369453430176,
+    "upper_p50_s": 0.18738818168640137,
+    "upper_p95_s": 0.23010873794555664,
+    "upper_max_s": 0.23775863647460938,
+    "speed_m_s": 0.15,
+    "conditions": "ELEVATED (unloaded)",
+    "threshold_sweep": {
+      "fractions": [
+        0.1,
+        0.25,
+        0.5,
+        0.75
+      ],
+      "upper_p95_s": [
+        0.21895909309387207,
+        0.23010873794555664,
+        0.2735300064086914,
+        0.3256394863128662
+      ],
+      "extrapolated_zero_threshold_s": 0.1949200946457532,
+      "spread_s": 0.10668039321899414
+    }
   },
-  "T_p95_s": 0.4440749168395996,
-  "reaction_distance_at_0.3_m": 0.13322247505187987
+  "T_p95_s": 0.3932059288024902,
+  "T_conditions": "ELEVATED -- lower bound on the on-floor value",
+  "reaction_distance_at_0.3_m": 0.11796177864074706
 }

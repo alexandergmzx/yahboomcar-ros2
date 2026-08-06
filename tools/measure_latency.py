@@ -28,11 +28,25 @@ taken from the upper bound and the p95, never the mean.
 
 IMPORTANT CAVEAT ON WHAT IS MEASURED
 ------------------------------------
-The command-latency test times command -> motion STARTS, which includes motor spin-up.
-Safety depends on command -> motion STOPS, i.e. the braking response. These are not the
-same quantity. Spin-up must overcome static friction and rotor inertia, so using it as a
-proxy is probably conservative, but that is an argument, not a measurement. The braking
-response is measured in Phase 2 alongside deceleration, on the floor.
+Run ELEVATED, this measurement is a LOWER BOUND on the on-floor latency, not a
+conservative one. An earlier version of this file claimed the opposite; that was wrong.
+
+Unloaded wheels spin up almost instantly, and /odom_raw is encoder-derived, so it
+registers motion as soon as the wheels turn. On the floor the motors must first overcome
+static friction, rolling resistance and the chassis inertia before the wheels move at
+all, so command -> motion takes LONGER there. Sizing a safety distance from the elevated
+figure therefore under-sizes it.
+
+Two consequences:
+  * T measured here = comms + firmware + (near-zero) spin-up. On the floor the spin-up
+    term grows by an unknown amount, so T_floor > T_elevated.
+  * What safety actually depends on is command -> motion STOPS (braking response), which
+    is a third quantity again, and also load-dependent.
+
+Both must be re-measured on the floor. --thresholds helps separate the load-independent
+part: latency to reach a detection threshold is comms + time-to-reach-that-threshold, so
+sweeping the threshold and extrapolating toward zero isolates the comms/firmware delay,
+which does transfer between elevated and floor.
 
 Firmware and host clocks are not synchronised, so `now - header.stamp` is not a
 trustworthy age. Scan timing is therefore measured by host-side inter-arrival, which is
@@ -72,7 +86,13 @@ def main():
     ap.add_argument('--no-motion', action='store_true',
                     help='skip the command-latency test; nothing moves')
     ap.add_argument('--scan-seconds', type=float, default=20.0)
+    ap.add_argument('--thresholds', default='0.10,0.25,0.50,0.75',
+                    help='detection thresholds as fractions of --speed. Sweeping these '
+                         'separates the load-independent comms/firmware delay from the '
+                         'load-dependent spin-up: extrapolating toward zero threshold '
+                         'removes the spin-up term.')
     args = ap.parse_args()
+    fracs = sorted(float(x) for x in args.thresholds.split(','))
 
     if os.environ.get('ROS_DOMAIN_ID') is None:
         os.environ['ROS_DOMAIN_ID'] = str(args.domain)
@@ -164,6 +184,7 @@ def main():
         say(f'=== command latency: {args.repeats} steps at {args.speed} m/s ===')
         say('    (car must be ELEVATED -- the wheels will spin)')
         brackets = []
+        trial_samples = []        # per trial: [(dt_since_cmd, vx), ...] for the sweep
         for i in range(args.repeats):
             # settle at rest
             t = Twist()
@@ -186,8 +207,10 @@ def main():
                 cmd.publish(Twist())
                 time.sleep(0.03)
 
-            thresh = args.speed * 0.25
             samples = [(ts, vx) for ts, vx, _ in odom if ts >= t_cmd - 0.4]
+            trial_samples.append([(ts - t_cmd, vx) for ts, vx in samples])
+
+            thresh = args.speed * 0.25
             first = next((ts for ts, vx in samples if ts > t_cmd and abs(vx) > thresh),
                          None)
             if first is None:
@@ -219,7 +242,60 @@ def main():
                 'upper_p50_s': pct(his, 50), 'upper_p95_s': pct(his, 95),
                 'upper_max_s': max(his),
                 'speed_m_s': args.speed,
+                'conditions': 'ELEVATED (unloaded)',
             }
+
+            # --- threshold sweep: separate comms/firmware from spin-up ---------
+            # Latency to reach threshold f = t_comms + t_spinup(f). t_comms is load-
+            # independent and transfers to the floor; t_spinup does not. If the upper
+            # bound is flat across f, spin-up is below the /odom_raw sampling interval
+            # and the whole figure is comms + sampling granularity -- which is a useful
+            # negative result, not a failure.
+            say('')
+            say('  threshold sweep (isolating the load-independent part):')
+            say('    frac   thresh      upper p95    n')
+            sweep = []
+            for f in fracs:
+                th = args.speed * f
+                ups = []
+                for s in trial_samples:
+                    hit = next((dt for dt, vx in s if dt > 0 and abs(vx) > th), None)
+                    if hit is not None:
+                        ups.append(hit)
+                if ups:
+                    u = pct(ups, 95)
+                    sweep.append((f, u))
+                    say(f'    {f:4.2f}   {th:5.3f} m/s   {u*1000:6.1f} ms   {len(ups):3d}')
+                else:
+                    say(f'    {f:4.2f}   {th:5.3f} m/s   never reached')
+
+            if len(sweep) >= 2:
+                xs = [f for f, _ in sweep]
+                ys = [u for _, u in sweep]
+                # least-squares line, extrapolated to zero threshold
+                mx, my = statistics.fmean(xs), statistics.fmean(ys)
+                den = sum((x - mx) ** 2 for x in xs)
+                slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den if den else 0.0
+                intercept = my - slope * mx
+                spread = max(ys) - min(ys)
+                say('')
+                say(f'    extrapolated to zero threshold: {intercept*1000:6.1f} ms')
+                say(f'    slope {slope*1000:+.1f} ms per unit fraction; '
+                    f'spread across thresholds {spread*1000:.1f} ms')
+                results['command_latency']['threshold_sweep'] = {
+                    'fractions': xs, 'upper_p95_s': ys,
+                    'extrapolated_zero_threshold_s': intercept,
+                    'spread_s': spread,
+                }
+                odom_interval = 1.0 / 11.0
+                if spread < odom_interval:
+                    say(f'    Spread is below the /odom_raw interval (~{odom_interval*1000:.0f} ms),')
+                    say('    so spin-up is NOT resolvable here: elevated, the wheels reach every')
+                    say('    threshold within one sample. The figure is comms + firmware +')
+                    say('    sampling granularity. On the floor spin-up becomes real and adds to it.')
+                else:
+                    say('    Spread exceeds the sampling interval, so spin-up IS visible: the')
+                    say('    intercept is the load-independent part that transfers to the floor.')
         else:
             say('  FAIL: no trial produced detectable motion')
 
@@ -235,20 +311,32 @@ def main():
         say(f'  command -> motion p95  {cmd_p95*1000:6.1f} ms   (WiFi + agent + firmware)')
         T = scan_p95 + gov + cmd_p95
         say(f'  ------------------------------------')
-        say(f'  T (p95, conservative)  {T*1000:6.1f} ms')
+        say(f'  T (p95, ELEVATED)      {T*1000:6.1f} ms   <-- LOWER BOUND, not conservative')
         say(f'  reaction distance at 0.30 m/s: {0.30*T*1000:.0f} mm')
         say(f'  reaction distance at 0.15 m/s: {0.15*T*1000:.0f} mm')
         results['T_p95_s'] = T
+        results['T_conditions'] = 'ELEVATED -- lower bound on the on-floor value'
         results['reaction_distance_at_0.3_m'] = 0.30 * T
         say('')
-        say('  Reaction DOMINATES braking for this robot. At 0.30 m/s the braking term')
-        say('  v^2/(2a) is 45 mm even for a pessimistic a=1.0 m/s^2, and 11 mm at a=4.0,')
-        say('  against 133 mm of reaction. A 4x error in `a` moves the total by ~34 mm.')
-        say('  Consequence: the safety distance can be sized NOW from measured latency')
-        say('  plus a conservative `a`; the floor measurement confirms rather than gates.')
+        say('  DO NOT SIZE A SAFETY DISTANCE FROM THIS YET. Measured with the wheels off')
+        say('  the ground, so they spin up unloaded and /odom_raw -- which is encoder-')
+        say('  derived -- registers motion almost immediately. On the floor the motors')
+        say('  must first overcome static friction, rolling resistance and the chassis')
+        say('  inertia, so command -> motion is SLOWER there and T_floor > T_elevated.')
         say('')
-        say('  CAVEAT: this timed command -> motion STARTS (includes spin-up). Braking')
-        say('  response is a different quantity and is measured in Phase 2.')
+        say('  Of the three terms, only the first two transfer to the floor:')
+        say(f'    scan interval  {scan_p95*1000:6.1f} ms  transfers (sensor + link, no load)')
+        say(f'    governor loop  {gov*1000:6.1f} ms  transfers (software)')
+        say(f'    command path   {cmd_p95*1000:6.1f} ms  DOES NOT -- contains unloaded spin-up')
+        say('')
+        say('  Reaction still dominates braking: at 0.30 m/s the braking term v^2/(2a) is')
+        say('  45 mm even at a pessimistic a=1.0 m/s^2 and 11 mm at a=4.0, against')
+        say(f'  {0.30*T*1000:.0f} mm of reaction -- and the reaction term only grows on the floor.')
+        say('  So `a` remains the minor term, but T must be re-measured under load before')
+        say('  either is used.')
+        say('')
+        say('  Also note: this timed command -> motion STARTS. Safety depends on')
+        say('  command -> motion STOPS, a third quantity, also load-dependent.')
     else:
         say('  command latency not measured; T incomplete')
 
@@ -280,4 +368,11 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    code = main()
+    # rclpy's teardown aborts with "terminate called without an active exception" on the
+    # way out, AFTER every result is printed and both files are written. Same workaround
+    # as tools/build_arena.py: leave before the destructor can turn a clean run into a
+    # core dump and lose the exit status.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
