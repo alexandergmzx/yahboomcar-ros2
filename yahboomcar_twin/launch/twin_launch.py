@@ -32,9 +32,10 @@ def generate_launch_description():
                     'bag already supplies /robot_description and /tf.')
 
     odom_topic = DeclareLaunchArgument(
-        'odom_topic', default_value='/odom',
-        description='Body twist source. /odom is EKF-filtered; /odom_raw is the '
-                    'firmware estimate.')
+        'odom_topic', default_value='/odom_raw',
+        description='Body twist source for WHEEL animation. /odom_raw is the raw wheel '
+                    'estimate and is what makes wheels spin correctly even on a stand; '
+                    '/odom is EKF-filtered and reports ~zero when the body is still.')
 
     bridge = Node(
         package='yahboomcar_twin',
@@ -50,6 +51,9 @@ def generate_launch_description():
             'ly': 0.0675,
             'publish_rate': 30.0,
             # The URDF mirrors the right wheels (axis 0,-1,0) against the left (0,1,0).
+            # Measured, not assumed: a commanded strafe produces exactly zero on
+            # every /odom_raw axis, so this firmware is differential, not mecanum.
+            'mecanum': False,
             'mirror_right': True,
             'direction_sign': 1.0,
         }],

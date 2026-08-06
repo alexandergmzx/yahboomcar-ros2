@@ -6,8 +6,8 @@ Why this node exists
 The microROS firmware exposes no per-wheel encoder state. Its topic contract is
 /odom_raw, /imu, /scan, /battery out and /cmd_vel, /beep, /servo_s1, /servo_s2 in --
 there is no wheel joint position anywhere. So the twin's wheels cannot be replayed from
-measurement; they have to be *derived* from body twist via mecanum inverse kinematics
-and integrated over time.
+measurement; they have to be *derived* from body twist by inverse kinematics and
+integrated over time.
 
 Be clear about what that means: the wheel angles produced here are **visual only**. They
 make the twin's wheels turn plausibly in step with the robot's motion. They are not an
@@ -23,16 +23,23 @@ wide; the X and Z extents match, confirming rotation about Y). Chassis half-leng
 from the URDF joint origins: front wheels at x=+0.0455, rear at x=-0.0495 (lx=0.0475),
 track +/-0.0675 (ly=0.0675), so lx+ly = 0.115.
 
+Chassis type: differential, measured not assumed
+------------------------------------------------
+The vendor package ships a `Mcnamu_driver_X3` executable, which suggests mecanum. This
+board's firmware is not that. Commanding a pure strafe (0, +/-0.15, 0) produced
+*exactly* zero on every axis of /odom_raw -- the motors never ran -- while forward and
+yaw tracked their commands closely (0.170 for 0.15, 1.04 for 0.8). The firmware ignores
+linear.y, so the default IK is differential. Set `mecanum: true` for the X3 variant.
+
 Sign conventions
 ----------------
 The URDF mirrors the right-hand wheels (axis 0,-1,0) against the left (axis 0,1,0), so a
-positive joint value spins left and right wheels opposite ways in world terms. The
-standard mecanum IK below assumes a single shared axis convention, so the right wheels
-get negated when `mirror_right` is true.
+positive joint value spins left and right wheels opposite ways in world terms. The IK
+below assumes a single shared axis convention, so the right wheels get negated when
+`mirror_right` is true.
 
 Direction cannot be verified without the sim running, so every sign is a parameter. If
-the twin's wheels spin backwards, flip `direction_sign`; if the robot appears to strafe
-the wrong way, flip `mirror_right`.
+the twin's wheels spin backwards, flip `direction_sign`.
 """
 import math
 
@@ -63,8 +70,14 @@ class JointStateBridge(Node):
         self.declare_parameter('lx', 0.0475)
         self.declare_parameter('ly', 0.0675)
         self.declare_parameter('publish_rate', 30.0)
-        self.declare_parameter('odom_topic', '/odom')
+        # /odom_raw, not /odom, and the reason matters. /odom is EKF-filtered and
+        # fuses the IMU, so with the car on a stand it correctly reports ~zero motion
+        # (the body really isn't moving) even while the wheels spin at 1 rad/s. For
+        # animating WHEELS we want what the wheels did, which is /odom_raw. Base pose
+        # still comes from the EKF's TF, so both stay correct on the bench and driving.
+        self.declare_parameter('odom_topic', '/odom_raw')
         self.declare_parameter('joint_states_topic', '/joint_states')
+        self.declare_parameter('mecanum', False)   # measured: this firmware ignores linear.y
         self.declare_parameter('mirror_right', True)
         self.declare_parameter('direction_sign', 1.0)
         # Stop spinning the wheels if odometry goes stale, so a paused bag or a
@@ -72,7 +85,9 @@ class JointStateBridge(Node):
         self.declare_parameter('odom_timeout', 0.5)
 
         self.r = self.get_parameter('wheel_radius').value
-        self.lxy = self.get_parameter('lx').value + self.get_parameter('ly').value
+        self.ly = self.get_parameter('ly').value
+        self.lxy = self.get_parameter('lx').value + self.ly
+        self.mecanum = self.get_parameter('mecanum').value
         self.mirror_right = self.get_parameter('mirror_right').value
         self.dir = self.get_parameter('direction_sign').value
         self.odom_timeout = self.get_parameter('odom_timeout').value
@@ -100,7 +115,8 @@ class JointStateBridge(Node):
         self.create_timer(1.0 / rate, self._tick)
 
         self.get_logger().info(
-            f'twin bridge up: r={self.r} m, lx+ly={self.lxy:.4f} m, '
+            f'twin bridge up: {"mecanum" if self.mecanum else "differential"}, '
+            f'r={self.r} m, ly={self.ly:.4f} m, '
             f'{rate:.0f} Hz -> {self.get_parameter("joint_states_topic").value}')
         self.get_logger().warn(
             'wheel angles are DERIVED from body twist (the firmware has no wheel '
@@ -118,15 +134,29 @@ class JointStateBridge(Node):
         self.gimbal[GIMBAL_PITCH] = math.radians(float(msg.data))
 
     def _wheel_rates(self):
-        """Mecanum inverse kinematics: body twist -> four wheel angular rates."""
+        """Body twist -> four wheel angular rates.
+
+        Differential (skid-steer) by default. This was measured, not assumed: commanding
+        a pure strafe (0, +/-0.15, 0) produced *exactly* zero on every axis of
+        /odom_raw -- the motors never ran -- while forward and yaw both tracked their
+        commands. The firmware ignores linear.y.
+
+        The mecanum branch is kept for the Mcnamu/X3 chassis variant the vendor package
+        also supports, but it is off by default because this board's firmware is not it.
+        """
         vx, vy, wz = self.twist
-        k = self.lxy
-        return {
-            WHEEL_LF: (vx - vy - k * wz) / self.r,
-            WHEEL_RF: (vx + vy + k * wz) / self.r,
-            WHEEL_RR: (vx - vy + k * wz) / self.r,
-            WHEEL_LR: (vx + vy - k * wz) / self.r,
-        }
+        if self.mecanum:
+            k = self.lxy
+            return {
+                WHEEL_LF: (vx - vy - k * wz) / self.r,
+                WHEEL_RF: (vx + vy + k * wz) / self.r,
+                WHEEL_RR: (vx - vy + k * wz) / self.r,
+                WHEEL_LR: (vx + vy - k * wz) / self.r,
+            }
+        # Differential: only vx and wz have any effect; both wheels on a side match.
+        left = (vx - wz * self.ly) / self.r
+        right = (vx + wz * self.ly) / self.r
+        return {WHEEL_LF: left, WHEEL_LR: left, WHEEL_RF: right, WHEEL_RR: right}
 
     def _tick(self):
         now = self.get_clock().now()
