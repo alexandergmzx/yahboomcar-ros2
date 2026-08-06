@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""Convert the car's URDF to a USD articulation for Isaac Sim, headless.
+"""Convert the car's URDF to a USD articulation for Isaac Sim 5.1.0, headless.
 
-Run with Isaac Sim's own interpreter, not the system one:
+    ~/isaac/env_isaaclab/bin/python tools/urdf_to_usd.py
 
-    ~/isaacsim/python.sh tools/urdf_to_usd.py
+Output: yahboomcar_ws/src/yahboomcar_twin/usd/micro4/micro4.usd
 
-The first run is slow (shader compilation and extension loading), several minutes is
-normal. Output goes to yahboomcar_ws/src/yahboomcar_twin/usd/micro4.usd.
+Two hard-won details, both of which previously caused the simulated robot to fall
+through the world:
 
-Two details that matter:
+  * `collision_from_visuals` MUST be True. This URDF has no <collision> elements at
+    all, so without it the wheels are imported with no collision geometry and pass
+    through any floor, however solid that floor is.
+  * `fix_base` MUST be False for a mobile robot, but that is only safe once the scene
+    actually has a ground collider. A free base over visual-only ground falls forever.
 
-  * The URDF references meshes as package://yahboomcar_description/..., which Isaac
-    cannot resolve without a ROS environment. This script rewrites them to absolute
-    paths in a temporary copy, leaving the tracked URDF untouched.
-  * fix_base is False. The base must be free to move, or the twin cannot follow the
-    real robot's pose.
+The importer API differs between Isaac versions and the docs lag it. 5.1.0 uses the
+`_urdf` binding with the `URDFParseAndImportFile` command; 6.0.1 replaced both with a
+class-based `URDFImporter`. This targets 5.1.0, which is what is installed, and logs the
+config it actually applied so a mismatch is visible rather than silent.
 """
 import argparse
 import os
@@ -26,15 +29,17 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DESC = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_description')
 DEFAULT_URDF = os.path.join(DESC, 'urdf', 'MicroROS.urdf')
-DEFAULT_OUT = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd',
-                           'micro4.usd')
+USD_DIR = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd')
+DEFAULT_OUT = os.path.join(USD_DIR, 'micro4', 'micro4.usd')
+
+EXPECTED_JOINTS = {'zq_Joint', 'yq_Joint', 'yh_Joint', 'zh_Joint',
+                   'jq1_Joint', 'jq2_Joint'}
 
 
 def resolve_package_paths(urdf_path):
     """Rewrite package:// mesh refs to absolute paths in a temp copy."""
     with open(urdf_path) as f:
         text = f.read()
-
     missing = []
 
     def sub(m):
@@ -46,113 +51,133 @@ def resolve_package_paths(urdf_path):
 
     new, n = re.subn(r'(filename=")package://yahboomcar_description/([^"]+)(")',
                      sub, text)
-    print(f'resolved {n} package:// mesh references')
-    if missing:
-        print(f'WARNING: {len(missing)} mesh files do not exist: {sorted(set(missing))}')
-
     tmp_dir = tempfile.mkdtemp(prefix='urdf_abs_')
     tmp_urdf = os.path.join(tmp_dir, os.path.basename(urdf_path))
     with open(tmp_urdf, 'w') as f:
         f.write(new)
-    return tmp_urdf, tmp_dir
+    return tmp_urdf, tmp_dir, n, missing
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--urdf', default=DEFAULT_URDF)
     ap.add_argument('--out', default=DEFAULT_OUT)
+    ap.add_argument('--velocity-drives', action='store_true', default=True,
+                    help='wheels get velocity drives (physics drive mode)')
+    ap.add_argument('--position-drives', dest='velocity_drives',
+                    action='store_false', help='wheels get position drives (twin mode)')
     args = ap.parse_args()
 
     if not os.path.exists(args.urdf):
         sys.exit(f'error: no URDF at {args.urdf}')
 
-    tmp_urdf, tmp_dir = resolve_package_paths(args.urdf)
+    tmp_urdf, tmp_dir, n_meshes, missing = resolve_package_paths(args.urdf)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
 
-    # Isaac's carb logger swallows plain stdout once SimulationApp starts, so the
-    # report is written to a file as well -- otherwise a failed run looks like a
-    # silent success (exit 0, no output, no USD).
     report_path = os.path.splitext(args.out)[0] + '_import_report.txt'
-    report_lines = []
+    lines = []
 
-    def say(msg):
-        print(msg, flush=True)
-        report_lines.append(str(msg))
+    def say(m=''):
+        print(m, flush=True)
+        lines.append(str(m))
 
-    def flush_report():
+    def flush():
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
         with open(report_path, 'w') as f:
-            f.write('\n'.join(report_lines) + '\n')
+            f.write('\n'.join(lines) + '\n')
+
+    say(f'resolved {n_meshes} package:// mesh references')
+    if missing:
+        say(f'WARNING: {len(missing)} mesh files missing: {sorted(set(missing))}')
 
     from isaacsim import SimulationApp
     app = SimulationApp({'headless': True})
-
     try:
-        # The URDF importer is not enabled in the default headless experience.
         from isaacsim.core.utils.extensions import enable_extension
         enable_extension('isaacsim.asset.importer.urdf')
         app.update()
 
-        # Isaac Sim 6.0.1 replaced the old _urdf binding and the
-        # "URDFParseAndImportFile" kit command with this class-based API.
-        from isaacsim.asset.importer.urdf import URDFImporter, URDFImporterConfig
+        import omni.kit.commands
+        from isaacsim.asset.importer.urdf import _urdf
 
-        out_dir = os.path.dirname(args.out)
-        cfg = URDFImporterConfig(
-            urdf_path=tmp_urdf,
-            usd_path=out_dir,          # a DIRECTORY, not a file
-            merge_fixed_joints=False,  # keep imu_Link / radar_Link as real frames
-            fix_base=False,            # the twin must be free to move
-            allow_self_collision=False,
-            collision_from_visuals=True,   # the URDF ships no <collision> geometry
-            # Position targets so /joint_states can drive the articulation.
-            joint_target_type='position',
-        )
+        cfg = _urdf.ImportConfig()
+        # Without this the wheels have NO collision geometry -- the URDF declares only
+        # <visual>. This is what made the robot fall through a solid floor.
+        cfg.collision_from_visuals = True
+        cfg.fix_base = False            # mobile robot; requires real ground beneath it
+        cfg.merge_fixed_joints = False  # keep imu_Link / radar_Link as usable frames
+        cfg.make_default_prim = True
+        cfg.self_collision = False
+        cfg.distance_scale = 1.0
+        cfg.create_physics_scene = False   # the arena owns the physics scene
+        cfg.import_inertia_tensor = True
+        if args.velocity_drives:
+            cfg.default_drive_type = _urdf.UrdfJointTargetType.JOINT_DRIVE_VELOCITY
 
-        say(f'importing {tmp_urdf}')
-        produced = URDFImporter(cfg).import_urdf()
-        say(f'importer returned: {produced}')
+        say('\nimport config applied:')
+        for a in sorted(dir(cfg)):
+            if a.startswith('_'):
+                continue
+            try:
+                v = getattr(cfg, a)
+            except Exception:
+                continue
+            if not callable(v):
+                say(f'    {a} = {v!r}')
 
-        # Report the articulation so the result can be checked without opening the GUI.
-        from pxr import Usd
-        stage_path = produced if produced and os.path.exists(produced) else args.out
-        # LoadAll pulls in the payload layers, and TraverseInstanceProxies is essential:
-        # the importer emits *instanced* geometry, and a plain Traverse() silently skips
-        # instance proxies. Without it this reports "meshes: 0" on a perfectly good
-        # asset -- a false negative that looks exactly like a failed import.
+        say(f'\nimporting {tmp_urdf}')
+        status, prim_path = omni.kit.commands.execute(
+            'URDFParseAndImportFile', urdf_path=tmp_urdf,
+            import_config=cfg, dest_path=args.out)
+        say(f'status={status}  prim={prim_path}')
+
+        from pxr import Usd, UsdPhysics
+        stage_path = args.out if os.path.exists(args.out) else None
+        if stage_path is None:
+            say('ERROR: no USD written')
+            flush()
+            sys.exit(1)
+
+        # LoadAll + instance proxies: the importer emits instanced geometry, and a plain
+        # traversal reports zero meshes on a perfectly good asset.
         stage = Usd.Stage.Open(stage_path, Usd.Stage.LoadAll)
-        joints, meshes = [], 0
+        meshes, joints, colliders = 0, [], 0
         for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
             t = str(prim.GetTypeName())
-            if 'Joint' in t:
-                joints.append((prim.GetName(), t))
             if t == 'Mesh':
                 meshes += 1
+            if 'Joint' in t:
+                joints.append((prim.GetName(), t))
+            if prim.HasAPI(UsdPhysics.CollisionAPI):
+                colliders += 1
 
-        say(f'USD: {stage_path}  exists={os.path.exists(stage_path)}')
-        say(f'meshes: {meshes}  (expect 9, one per link)')
-        say(f'joints: {len(joints)}')
-        for n, t in sorted(joints):
-            say(f'    {n:22s} {t}')
+        say(f'\nUSD: {stage_path}')
+        say(f'meshes        : {meshes}   (expect 9, one per link)')
+        say(f'joints        : {len(joints)}')
+        say(f'collider prims: {colliders}   (0 here means it WILL fall through the floor)')
+        for nme, t in sorted(joints):
+            say(f'    {nme:22s} {t}')
 
-        movable = [n for n, t in joints if 'Revolute' in t or 'Prismatic' in t]
-        say(f'movable joints: {len(movable)} -> {sorted(movable)}')
-        expected = {'zq_Joint', 'yq_Joint', 'yh_Joint', 'zh_Joint',
-                    'jq1_Joint', 'jq2_Joint'}
-        if expected <= set(movable):
-            say('OK   all six expected movable joints present')
-        else:
-            say(f'MISSING: {sorted(expected - set(movable))}')
+        movable = {n for n, t in joints if 'Revolute' in t or 'Prismatic' in t}
+        say(f'\nmovable joints: {len(movable)} -> {sorted(movable)}')
+        ok = EXPECTED_JOINTS <= movable and meshes >= 9 and colliders > 0
+        if not EXPECTED_JOINTS <= movable:
+            say(f'MISSING joints: {sorted(EXPECTED_JOINTS - movable)}')
+        if colliders == 0:
+            say('FAIL: no collision geometry -- check collision_from_visuals')
+        say('\nRESULT: ' + ('PASS' if ok else 'FAIL'))
+        flush()
+        return 0 if ok else 1
     except Exception as e:
         import traceback
         say(f'EXCEPTION: {type(e).__name__}: {e}')
         say(traceback.format_exc())
+        flush()
         raise
     finally:
-        flush_report()
         app.close()
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
