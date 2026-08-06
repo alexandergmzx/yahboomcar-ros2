@@ -116,9 +116,13 @@ def main():
         # Report the articulation so the result can be checked without opening the GUI.
         from pxr import Usd
         stage_path = produced if produced and os.path.exists(produced) else args.out
-        stage = Usd.Stage.Open(stage_path)
+        # LoadAll pulls in the payload layers, and TraverseInstanceProxies is essential:
+        # the importer emits *instanced* geometry, and a plain Traverse() silently skips
+        # instance proxies. Without it this reports "meshes: 0" on a perfectly good
+        # asset -- a false negative that looks exactly like a failed import.
+        stage = Usd.Stage.Open(stage_path, Usd.Stage.LoadAll)
         joints, meshes = [], 0
-        for prim in stage.Traverse():
+        for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
             t = str(prim.GetTypeName())
             if 'Joint' in t:
                 joints.append((prim.GetName(), t))
@@ -126,7 +130,7 @@ def main():
                 meshes += 1
 
         say(f'USD: {stage_path}  exists={os.path.exists(stage_path)}')
-        say(f'meshes: {meshes}')
+        say(f'meshes: {meshes}  (expect 9, one per link)')
         say(f'joints: {len(joints)}')
         for n, t in sorted(joints):
             say(f'    {n:22s} {t}')
