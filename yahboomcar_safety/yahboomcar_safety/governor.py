@@ -23,6 +23,16 @@ class GovernorConfig:
     sector_half_angle: float = 0.785  # rad (45 deg), matches the vendor's LaserAngle
     max_speed: float = 0.35          # m/s: absolute cap on forward speed
     max_yaw: float = 1.5             # rad/s: absolute cap on yaw
+    # Rotation near an obstacle sweeps the footprint CORNERS past it, and the forward
+    # sector cannot see that happen. Gated rather than forbidden: rotating in place is
+    # how the operator escapes a stop.
+    max_yaw_near: float = 0.4        # rad/s: cap on yaw inside stop_distance
+    # Reverse is entirely sensor-blind -- there is no rear lidar. "Unprotected" should
+    # not also mean "at full speed".
+    max_reverse_speed: float = 0.10  # m/s
+    # The chassis is differential; a commanded strafe produces exactly zero on every
+    # /odom_raw axis. Zeroed here rather than relying on the firmware to ignore it.
+    allow_lateral: bool = False
     scan_timeout: float = 0.5        # s: no lidar this recent -> stop
     cmd_timeout: float = 0.3         # s: no operator input this recent -> stop
     min_valid_range: float = 0.02    # m: below this the reading is noise, not an object
@@ -82,24 +92,57 @@ def decide(vx, vy, wz, min_range, scan_age, cmd_age, cfg):
     reasons = []
     out_vx, out_vy, out_wz = vx, vy, wz
 
-    # 4. Absolute caps, independent of obstacles.
-    if abs(out_vx) > cfg.max_speed:
-        out_vx = math.copysign(cfg.max_speed, out_vx)
+    # 4. Lateral motion. The forward sector cannot vouch for sideways clearance, so
+    #    strafing is not something this filter can govern.
+    if not cfg.allow_lateral:
+        if out_vy != 0.0:
+            reasons.append('lateral zeroed')
+        out_vy = 0.0
+    elif abs(out_vy) > cfg.max_speed:
+        out_vy = math.copysign(cfg.max_speed, out_vy)
+        reasons.append('lateral capped')
+
+    # 5. Absolute caps, independent of obstacles. Forward and reverse have separate
+    #    ceilings because only forward is sensed.
+    if out_vx > cfg.max_speed:
+        out_vx = cfg.max_speed
         reasons.append('speed capped')
+    elif out_vx < -cfg.max_reverse_speed:
+        out_vx = -cfg.max_reverse_speed
+        reasons.append('reverse capped (no rear sensor)')
     if abs(out_wz) > cfg.max_yaw:
         out_wz = math.copysign(cfg.max_yaw, out_wz)
         reasons.append('yaw capped')
 
-    # 5. Obstacle rules apply to FORWARD motion only; the lidar sector faces forward,
-    #    so reversing away from an obstacle stays allowed. This is a real limitation:
-    #    nothing here protects the rear.
+    # 6. Rotation near an obstacle, whether or not the robot is also translating.
+    #    Applied before the forward rules so it still binds on a full stop, where
+    #    rotating in place is exactly what an operator will try next.
+    if math.isfinite(min_range) and min_range <= cfg.stop_distance \
+            and abs(out_wz) > cfg.max_yaw_near:
+        out_wz = math.copysign(cfg.max_yaw_near, out_wz)
+        reasons.append(f'yaw gated at {min_range:.2f} m')
+
+    # 7. Obstacle rules apply to FORWARD motion only; the lidar sector faces forward,
+    #    so reversing away from an obstacle stays allowed (bounded above). This is a
+    #    real limitation: nothing here protects the rear.
+    #
+    #    Every stop path zeroes BOTH translation axes. Returning out_vy unchanged here
+    #    was a real defect: a command carrying linear.y kept its lateral component
+    #    through an obstacle stop, inert only because this chassis happens to be
+    #    differential.
+    #    The stop reason is appended to whatever else already applied, rather than
+    #    replacing it. An operator told only "obstacle at 0.10 m" would not know their
+    #    yaw was gated too, and would read the sluggish turn as a fault.
     if out_vx > 0.0:
         if min_range == math.inf:
             # Empty sector. Could be a clear field, could be a blind lidar. Fail closed.
-            return Decision(0.0, out_vy, out_wz, 'no valid lidar returns', True, min_range)
+            return Decision(0.0, 0.0, out_wz,
+                            '; '.join(reasons + ['no valid lidar returns']),
+                            True, min_range)
         if min_range <= cfg.stop_distance:
-            return Decision(0.0, out_vy, out_wz,
-                            f'obstacle at {min_range:.2f} m', True, min_range)
+            return Decision(0.0, 0.0, out_wz,
+                            '; '.join(reasons + [f'obstacle at {min_range:.2f} m']),
+                            True, min_range)
         if min_range < cfg.slow_distance:
             span = cfg.slow_distance - cfg.stop_distance
             scale = (min_range - cfg.stop_distance) / span if span > 0 else 0.0

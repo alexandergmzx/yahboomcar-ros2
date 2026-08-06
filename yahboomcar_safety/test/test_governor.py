@@ -108,11 +108,18 @@ def test_no_valid_returns_stops_forward_motion():
     assert d.vx == 0.0 and 'no valid lidar' in d.reason
 
 
-def test_reverse_allowed_near_obstacle():
-    # Backing away from a wall must stay possible, and is documented as unprotected
-    # because the sector faces forward.
+def test_reverse_allowed_near_obstacle_but_bounded():
+    # Backing away from a wall must stay possible -- blocking it would trap the robot
+    # against the thing it is trying to escape. But reverse is entirely sensor-blind,
+    # so it is bounded well below the forward cap rather than passed through.
     d = decide(-0.2, 0, 0, min_range=0.10, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
-    assert d.vx == pytest.approx(-0.2)
+    assert d.vx == pytest.approx(-CFG.max_reverse_speed)
+    assert 'reverse capped' in d.reason
+
+
+def test_slow_reverse_passes_through_untouched():
+    d = decide(-0.05, 0, 0, min_range=0.10, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
+    assert d.vx == pytest.approx(-0.05)
 
 
 def test_speed_and_yaw_caps():
@@ -132,11 +139,66 @@ def test_stale_scan_beats_a_clear_reading():
     assert d.vx == 0.0
 
 
-def test_rotation_allowed_when_blocked_ahead():
-    # Turning in place is how you escape; blocking it would trap the robot.
+def test_rotation_allowed_when_blocked_ahead_but_gated():
+    # Turning in place is how you escape; blocking it would trap the robot. But rotating
+    # sweeps the footprint CORNERS past an obstacle the forward sector cannot watch, so
+    # near an obstacle it is gated rather than passed through.
     d = decide(0.3, 0.0, 0.8, min_range=0.10, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
     assert d.vx == 0.0
+    assert d.wz == pytest.approx(CFG.max_yaw_near)
+    assert 'yaw gated' in d.reason
+
+
+def test_rotation_ungated_away_from_obstacles():
+    d = decide(0.0, 0.0, 0.8, min_range=5.0, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
     assert d.wz == pytest.approx(0.8)
+
+
+def test_slow_rotation_near_obstacle_passes_through():
+    d = decide(0.0, 0.0, 0.2, min_range=0.10, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
+    assert d.wz == pytest.approx(0.2)
+
+
+# ------------------------------------------------- lateral: the audited defect
+def test_lateral_zeroed_on_obstacle_stop():
+    """The defect this pins: obstacle-stop paths returned out_vy UNCHANGED while
+    zeroing vx, so a command carrying linear.y kept its lateral component straight
+    through a stop. Inert only because this chassis is differential."""
+    d = decide(0.3, 0.25, 0.0, min_range=0.10, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
+    assert d.vx == 0.0
+    assert d.vy == 0.0
+
+
+def test_lateral_zeroed_on_blind_lidar_stop():
+    d = decide(0.3, 0.25, 0.0, min_range=math.inf, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
+    assert d.vy == 0.0
+
+
+def test_lateral_zeroed_in_normal_driving():
+    # The chassis is differential -- a commanded strafe produces exactly zero on every
+    # /odom_raw axis. Do not rely on the firmware to ignore it.
+    d = decide(0.1, 0.25, 0.0, min_range=5.0, scan_age=FRESH, cmd_age=FRESH, cfg=CFG)
+    assert d.vy == 0.0
+    assert 'lateral zeroed' in d.reason
+
+
+def test_every_stop_path_zeroes_all_translation():
+    """No stop path may leak translation on any axis."""
+    stops = [
+        decide(0.3, 0.2, 0.0, 5.0, 99.0, FRESH, CFG),            # stale scan
+        decide(0.3, 0.2, 0.0, 5.0, FRESH, 99.0, CFG),            # stale command
+        decide(float('nan'), 0.2, 0.0, 5.0, FRESH, FRESH, CFG),  # non-finite
+        decide(0.3, 0.2, 0.0, math.inf, FRESH, FRESH, CFG),      # blind lidar
+        decide(0.3, 0.2, 0.0, 0.10, FRESH, FRESH, CFG),          # obstacle
+    ]
+    for d in stops:
+        assert d.vx == 0.0 and d.vy == 0.0, d.reason
+
+
+def test_lateral_capped_when_explicitly_enabled():
+    cfg = GovernorConfig(allow_lateral=True)
+    d = decide(0.0, 10.0, 0.0, min_range=5.0, scan_age=FRESH, cmd_age=FRESH, cfg=cfg)
+    assert d.vy == pytest.approx(cfg.max_speed)
 
 
 @pytest.mark.parametrize('rng', [0.05, 0.2, 0.34, 0.349])

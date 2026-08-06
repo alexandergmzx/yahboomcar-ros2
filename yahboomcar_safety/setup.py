@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'cmd_vel_governor = yahboomcar_safety.cmd_vel_governor:main',
+            'cmd_vel_deadman = yahboomcar_safety.cmd_vel_deadman:main',
         ],
     },
 )

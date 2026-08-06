@@ -46,6 +46,9 @@ class CmdVelGovernor(Node):
         self.declare_parameter('sector_half_angle', cfg.sector_half_angle)
         self.declare_parameter('max_speed', cfg.max_speed)
         self.declare_parameter('max_yaw', cfg.max_yaw)
+        self.declare_parameter('max_yaw_near', cfg.max_yaw_near)
+        self.declare_parameter('max_reverse_speed', cfg.max_reverse_speed)
+        self.declare_parameter('allow_lateral', cfg.allow_lateral)
         self.declare_parameter('scan_timeout', cfg.scan_timeout)
         self.declare_parameter('cmd_timeout', cfg.cmd_timeout)
         self.declare_parameter('rate', 20.0)
@@ -56,6 +59,9 @@ class CmdVelGovernor(Node):
             sector_half_angle=self.get_parameter('sector_half_angle').value,
             max_speed=self.get_parameter('max_speed').value,
             max_yaw=self.get_parameter('max_yaw').value,
+            max_yaw_near=self.get_parameter('max_yaw_near').value,
+            max_reverse_speed=self.get_parameter('max_reverse_speed').value,
+            allow_lateral=self.get_parameter('allow_lateral').value,
             scan_timeout=self.get_parameter('scan_timeout').value,
             cmd_timeout=self.get_parameter('cmd_timeout').value,
         )

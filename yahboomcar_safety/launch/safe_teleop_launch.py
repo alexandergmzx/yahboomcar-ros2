@@ -37,6 +37,14 @@ def generate_launch_description():
                               description='begin scaling speed down here, metres'),
         DeclareLaunchArgument('max_speed', default_value='0.35',
                               description='absolute forward speed cap, m/s'),
+        DeclareLaunchArgument('max_yaw', default_value='1.5',
+                              description='absolute yaw cap, rad/s'),
+        DeclareLaunchArgument('max_yaw_near', default_value='0.4',
+                              description='yaw cap inside stop_distance, rad/s'),
+        DeclareLaunchArgument('max_reverse_speed', default_value='0.10',
+                              description='reverse cap, m/s -- reverse is sensor-blind'),
+        DeclareLaunchArgument('deadman', default_value='true',
+                              description='run the command deadman (keep this on)'),
         DeclareLaunchArgument('keyboard', default_value='true',
                               description='also start the vendor keyboard node'),
     ]
@@ -50,7 +58,21 @@ def generate_launch_description():
             'stop_distance': LaunchConfiguration('stop_distance'),
             'slow_distance': LaunchConfiguration('slow_distance'),
             'max_speed': LaunchConfiguration('max_speed'),
+            'max_yaw': LaunchConfiguration('max_yaw'),
+            'max_yaw_near': LaunchConfiguration('max_yaw_near'),
+            'max_reverse_speed': LaunchConfiguration('max_reverse_speed'),
         }],
+    )
+
+    # Separate process on purpose: it exists to outlive a governor crash. The firmware
+    # retains a commanded speed forever, so without this a SIGKILLed governor leaves the
+    # car driving -- measured, docs/safety-case.md.
+    deadman = Node(
+        package='yahboomcar_safety',
+        executable='cmd_vel_deadman',
+        name='cmd_vel_deadman',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('deadman')),
     )
 
     # The vendor node is unmodified; only its output topic is remapped here.
@@ -63,4 +85,4 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration('keyboard')),
     )
 
-    return LaunchDescription(args + [governor, keyboard])
+    return LaunchDescription(args + [governor, deadman, keyboard])

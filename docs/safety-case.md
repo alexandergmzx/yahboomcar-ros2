@@ -10,6 +10,55 @@ repository, including my own test tools.
 
 ---
 
+## ⚠️ The firmware has NO command watchdog. Measured, three ways.
+
+**A commanded speed is retained indefinitely.** The car was commanded to 0.15 m/s, all
+publishing then ceased, and it held 0.15 m/s for the full 45 s the probe watched — never
+decaying, never timing out. It stopped only when an explicit zero was sent.
+
+`tools/test_failsafe.py` confirms this across every way the command path can die
+(`failsafe_report.json`, run 2026-08-06, car elevated):
+
+| Loss mode | Result |
+|---|---|
+| Publisher ceases, no zeros sent | **FAIL** — still driving |
+| Governor `SIGKILL`ed mid-motion | **FAIL** — no zero escapes, firmware does not expire it |
+| micro-ROS agent frozen 6 s | **FAIL** — still at 0.145 m/s on reconnect |
+
+`geometry_msgs/Twist` carries no timestamp and no expiry, so nothing in the message says
+"stale". The firmware must expire retained commands on its own, and it does not. The
+vendor config surface (`config_robot.py`) exposes no timeout parameter — wifi, UDP,
+baudrate, namespace, car type, domain ID, servo offsets, two PID sets, and nothing else —
+so **this is not configurable**, and Yahboom ships no source to patch.
+
+### What this means
+
+**Any crash of any component leaves the car driving until it hits something or the
+battery dies.** The governor's protection is entirely contingent on the governor
+remaining alive. This is not a bug to fix; it is a property of the hardware to design
+around.
+
+`cmd_vel_deadman` (below) covers the subset that software can reach. What remains
+uncovered is uncoverable from this machine:
+
+| Failure | Covered by deadman? |
+|---|---|
+| Governor crashes / `SIGKILL` | **yes** — separate process, zeros the car |
+| Teleop or a test tool dies mid-command | **yes** |
+| The deadman itself dies | no |
+| This PC loses power, freezes, or is put to sleep | **no** |
+| Wi-Fi drops, or the agent dies | **no — measured, case 3** |
+
+Wi-Fi loss is the one that matters most, because it is the most likely, and it is
+**unmitigable in software**: when the link goes, nothing on this machine can reach the
+board at all. The only remaining stop is the physical power switch.
+
+**Therefore every floor session requires a hand on the power switch, at a speed slow
+enough to catch the car on foot.** That is a permanent operating constraint, not a
+temporary one pending more work.
+
+---
+
 ## Protected paths
 
 Commands here pass through `cmd_vel_governor`, which limits them against `/scan` before
