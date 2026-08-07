@@ -532,3 +532,37 @@ stands: rotate-by-hand gyro PASS → motors-off ≥1.5 m calibration → elevate
 rerun with exactly one governor → `first_floor_launch.py` preflight → supervised
 0.05 m/s session. All tooling for that chain now exists and refuses to certify what it
 does not witness.
+
+
+---
+
+# Sixth audit (commit `70e35e8`) — verdict NO-GO, seven findings
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | The physical robot was NONFUNCTIONAL — node registered, all sensors 0.0 Hz, agent up 24 h | ✅ **recovered live**: the wedged-XRCE signature; `tools/board_reset.py` restored every channel (lidar 349/360, battery 8.3 V). Gyro remains UNDETERMINED, as it must until rotated by hand |
+| 2 | Nav2 late-goal race: one cancel-all cannot affect a goal accepted after it; and "at rest" was judged from encoders | ✅ cancel-all now REPEATS over 12 s with `return_code`/`goals_canceling` checked (empty + ERROR_NONE = "nothing running", the success state); at-rest verdict names its witness — ground truth (body) in sim, encoders (wheels only, sliding invisible) on hardware |
+| 3 | `measure_braking --sim-tape` defaulted to domain 20 with only a raceable one-shot check | ✅ structural `forbid_car_domain()` FIRST — before the calibration gate, which was shadowing it — and sim mode defaults to 66. Verified the refusal fires from the domain guard |
+| 4 | Fail-safe governor exclusivity used one graph snapshot — a slowly-discovered governor confounds the kill | ✅ pre-check polls 8 s, and the un-raceable POST-condition: after SIGKILL the graph must show zero governors, or the case is recorded INVALID (a survivor produced any observed stop) |
+| 5 | `teleop --direct` contested by the governor's stale-command zeros — reproduced as 25 stopped / 19 moving samples | ✅ `--direct` refuses while a governor runs, with the two honest alternatives printed. Driving checkers added to COMMAND_SOURCES |
+| 6 | Live twin unfinished | ⬜ open, unchanged — feature work; README now says "generated fixtures only" instead of implying live tracking |
+| 7 | Hardware evidence absent | ⬜ open, unchanged — Alex's floor session; item 1's recovery unblocks it |
+
+## Notes for the pattern ledger
+
+Finding 4 is the discovery race in its **third costume** (targets, then governors). The
+durable fix again turned out to be a post-condition rather than a better observation:
+"after the kill, the graph must show zero governors" cannot lose to slow discovery,
+because a survivor discovered late still shows up by verification time.
+
+Finding 2's at-rest half is the repo's own founding fact pointed back at itself a second
+time: encoders witness wheels, not bodies. The fix is not a better sensor — there is
+none on this robot — but a verdict that says exactly which witness testified.
+
+Finding 1 was operations, not code: the board wedges (documented since the agent-freeze
+experiment) and had been sitting wedged. The serial-reset tool did its job on the first
+try. Worth knowing: the agent container had been up 24 h across the wedge — "agent
+running" tells you nothing about session health; only data rates do.
+
+Also corrected: README/porting-notes test totals (165 → 170) and the twin row, which
+overstated fixture results as live tracking.

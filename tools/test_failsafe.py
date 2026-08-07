@@ -310,9 +310,18 @@ def main():
     # the survivor keeps forwarding /cmd_vel_raw: the "governor crashed" scenario was
     # never actually created, and the report records a stop the surviving governor
     # produced. Confounded evidence that looks like a pass. Audit finding.
-    pre_existing = [f'{ns.rstrip("/")}/{n}'.replace('//', '/')
-                    for n, ns in node.get_node_names_and_namespaces()
-                    if n == 'cmd_vel_governor']
+    # POLLED, not a snapshot: discovery is incremental, and a single look missed a
+    # governor whose discovery took longer than one probe -- audit finding (the same
+    # race class as target discovery, in its third costume).
+    pre_existing = []
+    poll_end = time.time() + 8.0
+    while time.time() < poll_end:
+        pre_existing = [f'{ns.rstrip("/")}/{n}'.replace('//', '/')
+                        for n, ns in node.get_node_names_and_namespaces()
+                        if n == 'cmd_vel_governor']
+        if pre_existing:
+            break
+        time.sleep(1.0)
     if pre_existing:
         say(f'  REFUSED: a governor is already running: {pre_existing}')
         say('  This case must own the ONLY governor, or killing its own proves nothing')
@@ -353,9 +362,24 @@ def main():
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             say('  SIGKILL sent to the governor process group at t=0')
             time.sleep(args.stop_timeout + 0.5)
+            # POST-CONDITION, the check that cannot race: after the kill the graph must
+            # contain NO governor at all. A survivor here -- however it got here, and
+            # however slowly it was discovered -- means the crash scenario never
+            # actually existed and any observed stop is ITS work, not evidence about
+            # the firmware. The pre-poll narrows the window; this closes it.
+            survivors = [n for n, _ in node.get_node_names_and_namespaces()
+                         if n == 'cmd_vel_governor']
             br = find_rest(mon.samples, t_ref, args.stop_timeout)
-            record('governor_sigkill', 'governor SIGKILLed', br is not None, br,
-                   '' if br else 'no zero escaped, and the firmware did not expire it')
+            if survivors:
+                say(f'  INVALID: a governor SURVIVED the kill ({survivors}) -- the')
+                say('  crash scenario never existed; any stop observed was its doing.')
+                results['cases']['governor_sigkill'] = {
+                    'stopped': None,
+                    'detail': f'confounded: surviving governor {survivors}'}
+            else:
+                record('governor_sigkill', 'governor SIGKILLed', br is not None, br,
+                       '' if br else 'no zero escaped, and the firmware did not '
+                                     'expire it')
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):

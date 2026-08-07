@@ -212,6 +212,12 @@ def main():
         Odometry, '/odom_raw',
         lambda m: odom_twist.append((time.time(), m.twist.twist.linear.x,
                                      m.twist.twist.angular.z)), 10)
+    # Body witness, present only in simulation; the real firmware cannot publish it.
+    truth_pose = []
+    node.create_subscription(
+        Odometry, '/sim/ground_truth',
+        lambda m: truth_pose.append((time.time(), m.pose.pose.position.x,
+                                     m.pose.pose.position.y)), 10)
 
     def cancel_and_verify(handle, why):
         """Cancel, CHECK the response, publish EXPLICIT ZEROS, then OBSERVE at rest.
@@ -248,22 +254,42 @@ def main():
             except Exception as e:
                 say(f'  WARNING: cancel failed ({e})')
         else:
-            # The send future timed out, so there is no handle -- but the goal may
-            # still be accepted late and start driving. A zero goal ID cancels ALL
-            # goals on the server.
-            say('  no goal handle (send timed out) -- cancelling ALL goals')
+            # The send future timed out, so there is no handle -- but the goal may be
+            # accepted LATE, after any single cancel-all has already fired. One shot
+            # therefore cannot close the window (audit finding, twice: the response
+            # was also read as acked without checking goals_canceling). So: REPEAT the
+            # cancel-all over a period longer than any plausible late acceptance,
+            # checking return_code each time. For a zero-UUID cancel-all, an empty
+            # goals_canceling with ERROR_NONE legitimately means "nothing running" --
+            # that combination is the success condition, not a rejection.
+            say('  no goal handle (send timed out) -- cancel-all, REPEATED to cover a '
+                'late acceptance')
             try:
                 from action_msgs.srv import CancelGoal
                 cli = node.create_client(CancelGoal,
                                          '/navigate_to_pose/_action/cancel_goal')
                 if cli.wait_for_service(timeout_sec=5.0):
-                    fut = cli.call_async(CancelGoal.Request())   # zero UUID = all
-                    tc = time.time()
-                    while not fut.done() and time.time() - tc < 10.0:
-                        time.sleep(0.1)
-                    acked = fut.done()
-                    say('  cancel-all sent' if acked else
-                        '  WARNING: cancel-all response never arrived')
+                    rounds = 0
+                    end_ca = time.time() + 12.0
+                    while time.time() < end_ca:
+                        fut = cli.call_async(CancelGoal.Request())   # zero UUID = all
+                        tc = time.time()
+                        while not fut.done() and time.time() - tc < 5.0:
+                            time.sleep(0.1)
+                        rounds += 1
+                        resp = fut.result() if fut.done() else None
+                        if resp is not None:
+                            n_cancel = len(resp.goals_canceling)
+                            code = resp.return_code
+                            if n_cancel:
+                                say(f'  round {rounds}: cancelling {n_cancel} goal(s)')
+                            elif code == 0:
+                                acked = True     # nothing running -- the goal state
+                            else:
+                                say(f'  round {rounds}: server return_code {code}')
+                        time.sleep(2.0)
+                    say(f'  cancel-all repeated {rounds}x over 12 s; final state: '
+                        + ('no goals running' if acked else 'UNCONFIRMED'))
                 else:
                     say('  WARNING: cancel service absent')
             except Exception as e:
@@ -296,11 +322,27 @@ def main():
             time.sleep(0.05)
         say('  explicit zeros published (silence is not a stop on this firmware)')
 
-        # 3. OBSERVE the stop. /odom_raw is the witness; no data means UNKNOWN.
+        # 3. OBSERVE the stop, with the best witness available -- and say WHICH.
+        #
+        # /sim/ground_truth, when a simulator provides it, observes the BODY. On the
+        # real robot the only witness is /odom_raw, which observes the WHEELS -- and
+        # this project's own record says wheels-stopped does not prove body-stopped
+        # (a sliding robot reads as at rest). That gap is not closable from software;
+        # the honest verdict names exactly what was witnessed. Audit finding.
         odom_twist.clear()
+        truth_pose.clear()
         t_obs = time.time()
         while time.time() - t_obs < 4.0:
             time.sleep(0.2)
+        tr = [s for s in truth_pose if s[0] > time.time() - 2.5]
+        if len(tr) >= 3:
+            d = math.hypot(tr[-1][1] - tr[0][1], tr[-1][2] - tr[0][2])
+            if d <= 0.01:
+                say(f'  VERIFIED AT REST (BODY, via ground truth): moved {d*1000:.0f} '
+                    'mm over the window')
+                return acked and nav2_quiet
+            say(f'  *** BODY STILL MOVING: ground truth moved {d*1000:.0f} mm. ***')
+            return False
         recent = [s for s in odom_twist if s[0] > time.time() - 2.0]
         if not recent:
             say('  *** NO /odom_raw DATA: the stop is UNVERIFIED. Do not walk away')
@@ -308,7 +350,9 @@ def main():
             return False
         peak = max(max(abs(v), abs(w)) for _, v, w in recent)
         if peak <= 0.03:
-            say(f'  VERIFIED AT REST: /odom_raw peak {peak:.3f} over the last 2 s')
+            say(f'  WHEELS at rest: /odom_raw peak {peak:.3f} over 2 s. NOTE: encoders')
+            say('  observe the wheels, not the body -- a sliding robot would read the')
+            say('  same. Body-at-rest is not observable from software on this robot.')
             return acked and nav2_quiet
         say(f'  *** STILL MOVING: /odom_raw peak {peak:.3f}. Power switch. ***')
         return False

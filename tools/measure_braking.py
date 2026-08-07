@@ -91,7 +91,7 @@ import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _cmd_vel_safety import install_stop_handlers               # noqa: E402
+from _cmd_vel_safety import forbid_car_domain, install_stop_handlers  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
@@ -515,6 +515,17 @@ def main():
                          'simulator ground truth instead of prompting. Refuses to run '
                          'against real hardware.')
     args = ap.parse_args()
+
+    if args.sim_tape:
+        # --domain defaults to 20 because HARDWARE braking is this tool's purpose --
+        # but in --sim-tape mode that default pointed a DRIVING tool at the car's
+        # domain, and its only protection was a one-shot discovery check that races.
+        # Audit finding. Simulator mode defaults to the simulator's domain and is then
+        # STRUCTURALLY forbidden from the car's, FIRST -- before any other gate, so
+        # this refusal cannot be shadowed by a calibration refusal firing earlier.
+        if os.environ.get('ROS_DOMAIN_ID') is None:
+            os.environ['ROS_DOMAIN_ID'] = '66'
+        forbid_car_domain('measure_braking.py --sim-tape')
 
     global DATA
     DATA = DATA_SIM if args.sim_tape else DATA_HW

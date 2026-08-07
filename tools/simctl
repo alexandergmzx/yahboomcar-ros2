@@ -75,6 +75,9 @@ COMMAND_SOURCES = [
     'sim_patrol', 'yahboom_keyboard', 'yahboom_joy', 'teleop_twist_keyboard',
     'controller_server', 'bt_navigator', 'nav2_smoke', 'measure_braking',
     'twin_motion_sequence', 'component_container_isolated',
+    # The checkers DRIVE too -- an audit found them missing from this list.
+    'check_isaac_contract', 'check_odom_properties', 'measure_latency',
+    'test_failsafe', 'ekf_ab_test',
 ]
 
 # Everything simctl is allowed to kill. The micro-ROS agent is deliberately absent.
@@ -619,8 +622,21 @@ def cmd_teleop(args):
         zero_domain(args.domain, seconds=2.0)
         print('  silenced; the keyboard is now the only command source')
 
-    governed = not args.direct and bool(running(['cmd_vel_governor'],
-                                                domain=args.domain))
+    gov_up = bool(running(['cmd_vel_governor'], domain=args.domain))
+    if args.direct and gov_up:
+        # REFUSE, measured: with a governor alive, --direct interleaves with the
+        # governor's stale-command zeros on /cmd_vel -- an audit reproduced 44 odometry
+        # samples alternating 25 stopped / 19 moving during a single direct command.
+        # Two writers on one topic is the exact defect teleop exists to prevent.
+        print('REFUSED: --direct while a governor is running on this domain.')
+        print('  The governor also publishes /cmd_vel (its stale-command rule emits')
+        print('  zeros), so your direct commands and its zeros interleave -- measured')
+        print('  as the robot stuttering between stopped and moving. Either:')
+        print('    * drop --direct (governed teleop, the normal path), or')
+        print('    * restart without the safety layer:')
+        print('        ./tools/simctl stop && ./tools/simctl start --no-patrol --no-safety')
+        return 2
+    governed = not args.direct and gov_up
     if governed:
         print('  governor detected: keys go to /cmd_vel_raw, governed onto /cmd_vel')
         # The LIVE cap, not the default -- printing "0.35" while the governor ran at
