@@ -244,3 +244,43 @@ def test_runs_from_another_calibration_are_excluded():
     assert k == 1.02
     assert len(keep) == 1
     assert len(skip) == 2, 'a run with no k recorded is foreign, not assumed compatible' 
+
+
+# ---- calibration provenance ------------------------------------------------------
+# Two audit rounds of the same defect. Round 4 fixed run-matching by float k; round 5
+# found the SELECTOR still floating and --use-calibration setting k without cal_id, so
+# later runs were stamped with the identity of a calibration they were not computed
+# under -- corrupted provenance that looks healthy. These pin all of it.
+def test_active_calibration_selects_by_id_not_by_float():
+    """Two sessions can legitimately share a scale factor; the id cannot collide."""
+    store = {'odom_scale_k': 1.02, 'active_cal_id': 'B', 'calibrations': [
+        {'cal_id': 'A', 'k': 1.02, 'floor': 'kitchen'},
+        {'cal_id': 'B', 'k': 1.02, 'floor': 'garage'},
+    ]}
+    assert mb.active_calibration(store)['floor'] == 'garage'
+
+
+def test_dangling_active_cal_id_returns_none_rather_than_guessing():
+    store = {'odom_scale_k': 1.02, 'active_cal_id': 'GONE',
+             'calibrations': [{'cal_id': 'A', 'k': 1.02}]}
+    assert mb.active_calibration(store) is None
+
+
+def test_legacy_store_without_ids_still_resolves_by_float():
+    store = {'odom_scale_k': 1.02, 'calibrations': [{'k': 1.02, 'legacy': True}]}
+    assert mb.active_calibration(store)['legacy'] is True
+
+
+def test_runs_match_by_cal_id_never_by_coincident_k():
+    """The float path may not resurrect once ids exist: a run recorded under cal A must
+    not pool with active cal B just because both measured k = 1.02."""
+    store = {'odom_scale_k': 1.02, 'active_cal_id': 'B',
+             'calibrations': [{'cal_id': 'A', 'k': 1.02}, {'cal_id': 'B', 'k': 1.02}],
+             'runs': [
+                 {'cal_id': 'A', 'odom_scale_k': 1.02, 'stop_distance_m': 0.02},
+                 {'cal_id': 'B', 'odom_scale_k': 1.02, 'stop_distance_m': 0.03},
+                 {'odom_scale_k': 1.02, 'stop_distance_m': 0.04},   # pre-id legacy
+             ]}
+    keep, skip, _ = mb.runs_for_active_calibration(store)
+    assert len(keep) == 1 and keep[0]['stop_distance_m'] == 0.03
+    assert len(skip) == 2, 'same-k runs from another calibration must be foreign'

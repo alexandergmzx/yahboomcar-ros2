@@ -206,36 +206,75 @@ def main():
         f'{args.tolerance*1000:.0f} mm, timeout {args.timeout:.0f} s')
     cmds.clear()
 
-    def cancel_and_verify(handle, why):
-        """Cancel the goal, CHECK the response, and confirm motion actually ceased.
+    zero_pub = node.create_publisher(Twist, '/cmd_vel', 10)
+    odom_twist = []
+    node.create_subscription(
+        Odometry, '/odom_raw',
+        lambda m: odom_twist.append((time.time(), m.twist.twist.linear.x,
+                                     m.twist.twist.angular.z)), 10)
 
-        A completed cancel future is not an accepted cancellation: the CancelGoal
-        response carries `goals_canceling`, and an empty list means the server declined
-        (ERROR_REJECTED and friends). The old code read `cancel.done()` as
-        "acknowledged" -- which is true even of a rejection -- and never looked at what
-        Nav2 did next. Audit finding. The only proof that matters is /cmd_vel going
-        quiet, so that is what is checked last.
+    def cancel_and_verify(handle, why):
+        """Cancel, CHECK the response, publish EXPLICIT ZEROS, then OBSERVE at rest.
+
+        Two audit findings live here, and the second is the one this whole repo exists
+        to remember:
+
+        * A completed cancel future is not an accepted cancellation -- the CancelGoal
+          response carries `goals_canceling`, and an empty list is a rejection.
+        * "/cmd_vel went quiet" is NOT a stop on this firmware. THE ESP32 RETAINS THE
+          LAST NONZERO COMMAND INDEFINITELY, so silence after a cancel means the car
+          keeps driving on whatever Nav2 said last. A previous version of this function
+          declared success on exactly that silence.
+
+        So the sequence is: cancel -> wait for Nav2 to stop publishing (otherwise it
+        republishes over the zeros) -> publish an explicit zero burst -> and only call
+        it stopped when /odom_raw is OBSERVED near zero. No observation, no verdict.
         """
         say(f'  {why} -- CANCELLING the goal')
         acked = False
-        try:
-            cancel = handle.cancel_goal_async()
-            tc = time.time()
-            while not cancel.done() and time.time() - tc < 10.0:
-                time.sleep(0.1)
-            if cancel.done():
-                resp = cancel.result()
-                acked = bool(resp and resp.goals_canceling)
-                say('  cancel ACCEPTED by the server' if acked else
-                    '  WARNING: server DECLINED the cancel (no goals canceling)')
-            else:
-                say('  WARNING: cancel response never arrived')
-        except Exception as e:
-            say(f'  WARNING: cancel failed ({e})')
-        # Proof over promises: watch /cmd_vel until nothing nonzero for 2 s.
+        if handle is not None:
+            try:
+                cancel = handle.cancel_goal_async()
+                tc = time.time()
+                while not cancel.done() and time.time() - tc < 10.0:
+                    time.sleep(0.1)
+                if cancel.done():
+                    resp = cancel.result()
+                    acked = bool(resp and resp.goals_canceling)
+                    say('  cancel ACCEPTED by the server' if acked else
+                        '  WARNING: server DECLINED the cancel (no goals canceling)')
+                else:
+                    say('  WARNING: cancel response never arrived')
+            except Exception as e:
+                say(f'  WARNING: cancel failed ({e})')
+        else:
+            # The send future timed out, so there is no handle -- but the goal may
+            # still be accepted late and start driving. A zero goal ID cancels ALL
+            # goals on the server.
+            say('  no goal handle (send timed out) -- cancelling ALL goals')
+            try:
+                from action_msgs.srv import CancelGoal
+                cli = node.create_client(CancelGoal,
+                                         '/navigate_to_pose/_action/cancel_goal')
+                if cli.wait_for_service(timeout_sec=5.0):
+                    fut = cli.call_async(CancelGoal.Request())   # zero UUID = all
+                    tc = time.time()
+                    while not fut.done() and time.time() - tc < 10.0:
+                        time.sleep(0.1)
+                    acked = fut.done()
+                    say('  cancel-all sent' if acked else
+                        '  WARNING: cancel-all response never arrived')
+                else:
+                    say('  WARNING: cancel service absent')
+            except Exception as e:
+                say(f'  WARNING: cancel-all failed ({e})')
+
+        # 1. Wait for Nav2 to stop COMMANDING -- zeros published under a live
+        #    controller just get overridden at its next cycle.
         quiet_since = time.time()
         deadline = time.time() + 8.0
         n_before = len(cmds)
+        nav2_quiet = False
         while time.time() < deadline:
             time.sleep(0.2)
             recent = cmds[n_before:]
@@ -243,10 +282,35 @@ def main():
             if any(abs(v) > 0.01 or abs(w) > 0.01 for v, w in recent):
                 quiet_since = time.time()
             elif time.time() - quiet_since >= 2.0:
-                say('  motion commands ceased -- verified quiet for 2 s')
-                return acked
-        say('  *** Nav2 IS STILL COMMANDING MOTION after the cancel. Kill the nav')
-        say('  launch, and on the real robot use the power switch. ***')
+                nav2_quiet = True
+                break
+        if not nav2_quiet:
+            say('  *** Nav2 IS STILL COMMANDING MOTION after the cancel. Kill the nav')
+            say('  launch, and on the real robot use the power switch. ***')
+
+        # 2. EXPLICIT ZEROS. Silence is not a stop on a firmware that latches the last
+        #    command; only a zero is.
+        z = Twist()
+        for _ in range(20):
+            zero_pub.publish(z)
+            time.sleep(0.05)
+        say('  explicit zeros published (silence is not a stop on this firmware)')
+
+        # 3. OBSERVE the stop. /odom_raw is the witness; no data means UNKNOWN.
+        odom_twist.clear()
+        t_obs = time.time()
+        while time.time() - t_obs < 4.0:
+            time.sleep(0.2)
+        recent = [s for s in odom_twist if s[0] > time.time() - 2.0]
+        if not recent:
+            say('  *** NO /odom_raw DATA: the stop is UNVERIFIED. Do not walk away')
+            say('  from this robot. ***')
+            return False
+        peak = max(max(abs(v), abs(w)) for _, v, w in recent)
+        if peak <= 0.03:
+            say(f'  VERIFIED AT REST: /odom_raw peak {peak:.3f} over the last 2 s')
+            return acked and nav2_quiet
+        say(f'  *** STILL MOVING: /odom_raw peak {peak:.3f}. Power switch. ***')
         return False
 
     send = client.send_goal_async(goal)
@@ -254,7 +318,10 @@ def main():
     while not send.done() and time.time() - t0 < 10.0:
         time.sleep(0.1)
     if not send.done():
-        say('  FAIL: goal was never accepted or rejected')
+        say('  FAIL: goal was never accepted or rejected within 10 s')
+        # The goal may still be accepted LATE, with no handle here to cancel it --
+        # a driving goal owned by nobody. Cancel everything and verify the stop.
+        cancel_and_verify(None, 'send-goal response timed out')
         return 1
     handle = send.result()
     if not handle.accepted:

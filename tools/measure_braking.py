@@ -171,6 +171,20 @@ def calibration_problems(cal):
 
 
 def active_calibration(store):
+    """The calibration record the active pointer refers to, BY ID.
+
+    Selection used to be by float k -- `abs(c.k - active_k) < 1e-12` -- which returns
+    the FIRST of any calibrations sharing a scale factor, and two sessions on two
+    floors can legitimately share one. The id is minted once and never recomputed, so
+    it cannot collide. The float path survives only for stores predating ids.
+    Audit finding (round 5; round 4 fixed the run matching but missed this selector).
+    """
+    cal_id = store.get('active_cal_id')
+    if cal_id is not None:
+        for c in store.get('calibrations', []):
+            if c.get('cal_id') == cal_id:
+                return c
+        return None          # dangling pointer: refuse to guess by value
     k = store.get('odom_scale_k')
     if k is None:
         return None
@@ -559,10 +573,20 @@ def main():
             if not 0 <= args.use_calibration < len(cals):
                 print(f'\nno calibration {args.use_calibration}')
                 return 2
-            store['odom_scale_k'] = cals[args.use_calibration]['k']
+            chosen = cals[args.use_calibration]
+            store['odom_scale_k'] = chosen['k']
+            # BOTH pointers, atomically. Setting only k left active_cal_id STALE, so
+            # every later run was stamped with the identity of a calibration it was
+            # not computed under -- corrupted provenance that looks perfectly healthy.
+            # Audit finding, reproduced by the auditor.
+            store['active_cal_id'] = chosen.get('cal_id')
             save(store)
             print(f'\nactive k set to {store["odom_scale_k"]:.4f} '
-                  f'(calibration {args.use_calibration})')
+                  f'(calibration {args.use_calibration}, '
+                  f'cal_id {store["active_cal_id"]})')
+            if store['active_cal_id'] is None:
+                print('  NOTE: this calibration predates cal_id. Runs recorded under it')
+                print('  cannot be provenance-matched; prefer a fresh --calibrate.')
         return 0
 
     if args.fit:

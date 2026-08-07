@@ -56,8 +56,12 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WS = os.path.join(REPO, 'yahboomcar_ws')
-SIM_DOMAIN = 66          # the car lives on 20; keep them apart
-CAR_DOMAIN = 20
+sys.path.insert(0, os.path.join(REPO, 'tools'))
+# ONE definition of the car's domain, shared with every guarded tool. Two copies of
+# this number would eventually disagree, and the one that was wrong would be the
+# structural refusal.
+from _cmd_vel_safety import CAR_DOMAIN                          # noqa: E402
+SIM_DOMAIN = 66          # the car lives on CAR_DOMAIN; keep them apart
 
 # Things that COMMAND MOTION. These must be silenced before zeroing, or they simply
 # republish over the zeros -- measured: a patrol kept commanding 0.18 m/s straight
@@ -229,9 +233,16 @@ def cmd_start(args):
 
     print(f'=== simctl start  (backend {args.backend}, ROS_DOMAIN_ID={dom}) ===')
 
-    # sim_target polls with the asymmetric dwell -- a single node_names() look here was
-    # the fail-open version: a car whose discovery took longer than one probe was
-    # invisible, and the simulator started on its domain. Audit finding.
+    # STRUCTURAL FIRST: the car's domain is refused by constant comparison, before any
+    # discovery. A discovery dwell races -- an audit reproduced a car surfacing at
+    # 7.5 s sliding straight past the 6 s dwell -- and a timer cannot prove hardware is
+    # absent. An invariant can: simulators are simply never started on the car's domain.
+    if dom == CAR_DOMAIN:
+        print(f'REFUSED: domain {dom} is the CAR\'S domain, structurally off-limits')
+        print(f'  to simulators. The simulator belongs on {SIM_DOMAIN}.')
+        return 2
+
+    # Discovery remains as the SECOND layer, for a car provisioned onto another domain.
     print('  checking who is on this domain (up to ~15 s)...')
     target = sim_target(dom)
     if target == 'hardware':
@@ -558,6 +569,12 @@ def cmd_teleop(args):
     forwarder -- so it publishes /cmd_vel directly, which is the bare vendor behaviour.
     """
     print(f'=== simctl teleop  (domain {args.domain}) ===')
+    # Structural refusal first; discovery second. See cmd_start for why.
+    if args.domain == CAR_DOMAIN:
+        print(f'REFUSED: domain {args.domain} is the CAR\'S domain, structurally')
+        print('  off-limits to simulator teleop. For hardware use the governed launch:')
+        print('    ros2 launch yahboomcar_safety safe_teleop_launch.py')
+        return 2
     target = sim_target(args.domain)
     if target == 'hardware':
         print('REFUSED: YB_Car_Node is on this domain -- this is the REAL robot.')

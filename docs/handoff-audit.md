@@ -478,3 +478,57 @@ Alex's hardware session, per docs/first-floor-procedure.md — a tool cannot pro
 Unchanged, and correctly so: stopping distance unmeasured, gyro undetermined, hardware
 braking store empty. This round removed fail-open paths in the tooling; it produced no
 new evidence about the robot.
+
+
+---
+
+# Fifth audit (commit `94139e6`) — verdict NO-GO, six findings, all verified
+
+Rounds 4 and 5 form a pattern worth naming: **round 5's two critical findings are round
+4's two critical fixes, each failing one level deeper.**
+
+| # | Finding | Fixed? |
+|---|---|---|
+| 1 | The 6 s dwell just lengthens the race — a car at 7.5 s still classified 'simulator' | ✅ **structural**: the car's domain (20) is refused by constant comparison before any discovery, in `forbid_car_domain()`, `simctl start`, `simctl teleop`. One `CAR_DOMAIN` definition, imported everywhere |
+| 2 | "/cmd_vel quiet" declared success — but THIS FIRMWARE LATCHES THE LAST COMMAND, so silence means still driving; and a timed-out send leaves an uncancellable goal | ✅ cancel → Nav2-quiet → **explicit zero burst** → **observed** `/odom_raw` ≤ 0.03 or scream; zero-UUID cancel-all when there is no handle |
+| 3 | `active_calibration()` still selects by float; `--use-calibration` sets k but not `active_cal_id`, stamping later runs with the WRONG identity | ✅ selection by id (dangling pointer → None, never guess-by-value); both pointers set atomically; **4 regression tests** |
+| 4 | No persistent live twin | ⬜ open — feature work, unchanged from round 4 |
+| 5 | Hardware evidence absent | ⬜ open — needs the car, unchanged from round 4 |
+| 6 | `test_failsafe` case 2 spawns a governor without refusing a pre-existing one — killing its own leaves the survivor forwarding, so the crash never happens and the report records confounded evidence | ✅ refuses when any governor already runs; exactly one, and it must be the test's own |
+
+## The lesson of rounds 4→5, stated so it stops repeating
+
+**Round 4 fixed the race by making the timer longer. A timer cannot prove absence.**
+The auditor beat the 6 s dwell with a 7.5 s car, and would have beaten a 60 s dwell with
+a 61 s car. The fix that holds is an *invariant*, not an observation: simulators are
+never started on the car's domain, therefore simulator-driving tools have no business
+there under any circumstances — a constant comparison that cannot race. Verified instant
+refusal on an EMPTY domain 20, the exact case every timer loses. The discovery dwell
+remains as the second layer for a car provisioned onto some other domain — and that
+residual case is real: **the structural rule is only as good as `CAR_DOMAIN` matching
+what is actually burned into the board.**
+
+**Round 4 verified the Nav2 stop by silence. On this firmware silence is the hazard.**
+The ESP32 retains the last nonzero command indefinitely — measured, three ways, the
+founding fact of this entire safety effort — and I wrote a stop-verifier that treated a
+quiet `/cmd_vel` as a stopped robot. The correct sequence publishes explicit zeros and
+then *observes* `/odom_raw` at rest; no observation, no verdict.
+
+**Round 4 fixed run-matching by float and missed the selector and the switcher.** The
+audit reproduced `--use-calibration` silently corrupting provenance: k updated, id
+stale, every subsequent run stamped with a calibration it was not computed under. Fixing
+one instance of a defect class is not fixing the class — this round grepped for the
+remaining float comparisons and added regression tests so the class stays dead.
+
+Also corrected: the README's colcon figure (121 → ~125; the number drifts between runs,
+so the docs now state the *invariant* — every failure is vendor lint/copyright/style,
+zero functional — rather than leaning on the count).
+
+## Still NO-GO
+
+Unchanged and correct: gyro undetermined, calibrations refused (rightly), zero accepted
+braking runs, fail-safe report awaiting a controlled rerun. The audit's sequencing
+stands: rotate-by-hand gyro PASS → motors-off ≥1.5 m calibration → elevated fail-safe
+rerun with exactly one governor → `first_floor_launch.py` preflight → supervised
+0.05 m/s session. All tooling for that chain now exists and refuses to certify what it
+does not witness.

@@ -40,6 +40,41 @@ import time
 REAL_ROBOT_NODE = 'YB_Car_Node'
 SIMULATOR_NODE = 'fake_robot'
 
+# THE CAR'S DOMAIN. Single definition; simctl imports it from here. It must match the
+# ROS_DOMAIN_ID provisioned onto the board (tools/provision_board.py; currently 20, per
+# CLAUDE.md). If the board is ever re-provisioned onto a different domain, change it
+# HERE, in one place -- a stale value here turns the structural refusal below into a
+# refusal of the wrong domain.
+CAR_DOMAIN = 20
+
+
+def forbid_car_domain(what='This tool'):
+    """Refuse to run on the car's domain AT ALL, before any discovery.
+
+    STRUCTURAL, NOT OBSERVATIONAL -- and that distinction is the whole fix. Discovery
+    based checks race: DDS discovery is incremental with no upper bound, and an audit
+    reproduced a car surfacing at 7.5 s being classified 'simulator' at 7 s, straight
+    through the 6 s confirmation dwell. Lengthening the timer just lengthens the race.
+    A TIMER CANNOT PROVE THAT HARDWARE IS ABSENT.
+
+    What a timer cannot do, an invariant can: simulators are never started on the car's
+    domain (simctl refuses that too), so a simulator-driving tool has no business there
+    under any circumstances -- not even if discovery currently shows nothing. This check
+    is a constant comparison. It cannot race, cannot time out, and cannot be beaten by
+    slow discovery.
+
+    The dwell-based discovery check in target_of() remains as the SECOND layer, for the
+    case a car is ever provisioned onto some other domain.
+    """
+    dom = int(os.environ.get('ROS_DOMAIN_ID', 0) or 0)
+    if dom == CAR_DOMAIN:
+        print(f'REFUSED: ROS_DOMAIN_ID={dom} is the CAR\'S domain.', flush=True)
+        print(f'  {what} drives simulators and is prohibited there STRUCTURALLY -- no', flush=True)
+        print('  discovery check is consulted, because discovery races and a timer', flush=True)
+        print('  cannot prove the car is absent. Simulators live on 66; the car on '
+              f'{CAR_DOMAIN}.', flush=True)
+        sys.exit(2)
+
 
 # A topic the real firmware CANNOT publish. Both simulators do, precisely so tests can
 # score themselves against truth, and its presence is therefore positive evidence of a
@@ -112,6 +147,7 @@ def require_simulator(node, what='This tool', seconds=15.0):
     which let a patrol drive whenever a simulator happened to share the domain with the
     car -- the one case where you are most likely to believe you are safe.
     """
+    forbid_car_domain(what)
     t = target_of(node, seconds)
     if t == 'simulator':
         return

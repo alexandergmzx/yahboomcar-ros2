@@ -305,6 +305,25 @@ def main():
     # ------------------------------------------------------ 2. governor SIGKILL
     say('')
     say('=== case 2: governor SIGKILLed mid-motion ===')
+    # EXACTLY ONE governor, and it must be OURS. If a governor is already running --
+    # say the floor safety launch is up -- this case spawns a second one, kills it, and
+    # the survivor keeps forwarding /cmd_vel_raw: the "governor crashed" scenario was
+    # never actually created, and the report records a stop the surviving governor
+    # produced. Confounded evidence that looks like a pass. Audit finding.
+    pre_existing = [f'{ns.rstrip("/")}/{n}'.replace('//', '/')
+                    for n, ns in node.get_node_names_and_namespaces()
+                    if n == 'cmd_vel_governor']
+    if pre_existing:
+        say(f'  REFUSED: a governor is already running: {pre_existing}')
+        say('  This case must own the ONLY governor, or killing its own proves nothing')
+        say('  -- the survivor keeps forwarding and the crash never happens. Stop the')
+        say('  existing safety launch first, then rerun.')
+        results['cases']['governor_sigkill'] = {
+            'stopped': None, 'detail': 'refused: pre-existing governor would confound'}
+        hard_stop()
+        with open(report_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        return 2
     gov_env = dict(os.environ)
     # Permissive distances on purpose: this case tests the CRASH path, not the obstacle
     # logic, and the car is elevated under a desk where the lidar sees walls at < 0.35 m.
