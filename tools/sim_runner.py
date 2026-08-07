@@ -433,6 +433,12 @@ class RosBridge:
                     ('Imu', 'isaacsim.ros2.bridge.ROS2PublishImu'),
                     ('BattTick', 'omni.graph.action.OnImpulseEvent'),
                     ('Batt', 'isaacsim.ros2.bridge.ROS2Publisher'),
+                    # GROUND TRUTH, on a topic the firmware does not have. It exists so
+                    # a test can score odometry against what actually happened -- the
+                    # 2D simulator publishes the same topic for the same reason. It is
+                    # NOT part of the contract and nothing in the stack subscribes.
+                    ('TruthTick', 'omni.graph.action.OnImpulseEvent'),
+                    ('Truth', 'isaacsim.ros2.bridge.ROS2PublishOdometry'),
                 ],
                 keys.SET_VALUES: [
                     ('Ctx.inputs:domain_id', int(domain_id)),
@@ -462,6 +468,9 @@ class RosBridge:
                     ('Batt.inputs:messagePackage', 'std_msgs'),
                     ('Batt.inputs:messageSubfolder', 'msg'),
                     ('Batt.inputs:messageName', 'UInt16'),
+                    ('Truth.inputs:topicName', 'sim/ground_truth'),
+                    ('Truth.inputs:odomFrameId', 'world'),
+                    ('Truth.inputs:chassisFrameId', 'base_link_truth'),
                 ],
                 keys.CONNECT: [
                     ('Tick.outputs:tick', 'Scan.inputs:execIn'),
@@ -469,17 +478,23 @@ class RosBridge:
                     ('OdomTick.outputs:execOut', 'Odom.inputs:execIn'),
                     ('ImuTick.outputs:execOut', 'Imu.inputs:execIn'),
                     ('BattTick.outputs:execOut', 'Batt.inputs:execIn'),
+                    ('TruthTick.outputs:execOut', 'Truth.inputs:execIn'),
                     ('Ctx.outputs:context', 'Scan.inputs:context'),
                     ('Ctx.outputs:context', 'CmdVel.inputs:context'),
                     ('Ctx.outputs:context', 'Odom.inputs:context'),
                     ('Ctx.outputs:context', 'Imu.inputs:context'),
                     ('Ctx.outputs:context', 'Batt.inputs:context'),
+                    ('Ctx.outputs:context', 'Truth.inputs:context'),
                 ],
             },
         )
         self.rng = __import__('numpy').random.default_rng(0)
-        self._counts = {'scan': 0, 'odom': 0, 'imu': 0, 'batt': 0}
-        self._prev_pose = sim.pose()
+        self._counts = {'scan': 0, 'odom': 0, 'imu': 0, 'batt': 0, 'truth': 0}
+        # Encoder-integrated pose, starting at the origin exactly as the firmware's does.
+        # It is deliberately NOT seeded from ground truth: the whole point is that it
+        # drifts away from the world.
+        self._odom = (0.0, 0.0, 0.0)
+        self._prev_true_yaw = sim.pose()[2]
         self._prev_t = 0.0
         say(f'  graph built on ROS_DOMAIN_ID={domain_id}')
 
@@ -527,6 +542,49 @@ class RosBridge:
             self.og.Controller.attribute('/World/ROS/CmdVel.outputs:angularVelocity'))
         return float(lin[0]), float(ang[2])
 
+    def wheel_odometry(self, dt):
+        """Integrate WHEEL ROTATION into a pose, the way encoders do. -> (x, y, yaw, v, w)
+
+        THIS IS THE POINT, and it is not a detail. /odom_raw on the real robot is
+        ENCODER-DERIVED: it measures how far the wheels turned, not how far the robot
+        went. Those differ whenever the wheels slip, and on this robot's stand they
+        differ by 92% -- the wheels claimed 1.602 m while the lidar saw 0.128 m. That
+        disagreement between wheels and world is the single thing the whole localisation
+        and fusion effort here exists to study.
+
+        This used to derive /odom_raw from the physics engine's GROUND TRUTH chassis
+        displacement, which silently deleted exactly that: perfect odometry, no slip
+        anywhere, so an EKF or a scan matcher tested against it never saw the error it
+        was built to detect. It also used hypot(), so REVERSE motion was published as a
+        POSITIVE velocity. Audit finding.
+
+        Reading the articulation's joint velocities instead means slip appears for free:
+        PhysX can spin a wheel against a floor it cannot grip, and the encoders here
+        report that spin exactly as the real ones would.
+        """
+        import numpy as np
+        jv = self.sim.art.get_joint_velocities()
+        left = [float(jv[i]) for i, n in enumerate(self.sim.dof) if n in LEFT]
+        right = [float(jv[i]) for i, n in enumerate(self.sim.dof) if n in RIGHT]
+        if not left or not right:
+            return self._odom + (0.0, 0.0)
+        wl = float(np.mean(left))
+        # The URDF mirrors the right wheels, so a positive joint velocity spins them
+        # the opposite way in world terms -- the same MIRROR_RIGHT convention drive() uses.
+        wr = -float(np.mean(right)) if MIRROR_RIGHT else float(np.mean(right))
+
+        # Differential kinematics, the exact inverse of drive(). WHEEL_R is the measured
+        # effective rolling radius, not the geometric one; see the constant's note.
+        v = (wl + wr) * 0.5 * WHEEL_R
+        w = (wr - wl) * WHEEL_R / (2.0 * LY)
+
+        x, y, yaw = self._odom
+        yaw = norm(yaw + w * dt)
+        x += v * math.cos(yaw) * dt
+        y += v * math.sin(yaw) * dt
+        self._odom = (x, y, yaw)
+        return x, y, yaw, v, w
+
     def _fire(self, node):
         self.og.Controller.set(
             self.og.Controller.attribute(f'/World/ROS/{node}.state:enableImpulse'), True)
@@ -534,31 +592,34 @@ class RosBridge:
     def publish(self, t, dt):
         """Fire each publisher at its own contract rate."""
         og = self.og
-        x, y, yaw = self.sim.pose()
+        # Encoder-derived pose, integrated every step so slip accumulates properly
+        # rather than being sampled at the publish rate.
+        ox, oy, oyaw, ov, ow = self.wheel_odometry(dt)
+        # The BODY's true yaw rate, for the IMU. The IMU is bolted to the chassis, so it
+        # measures the body -- which is why it disagrees with the wheels under slip, and
+        # why publishing the wheel-derived rate here would have hidden that too.
+        _, _, tyaw = self.sim.pose()
+        body_w = norm(tyaw - self._prev_true_yaw) / max(1e-6, t - self._prev_t)
+        self._prev_true_yaw = tyaw
+        self._prev_t = t
 
         if self._due('odom', t, ODOM_HZ):
-            px, py, pyaw = self._prev_pose
-            span = max(1e-6, t - self._prev_t)
-            vx = math.hypot(x - px, y - py) / span
-            wz = norm(yaw - pyaw) / span
             og.Controller.set(og.Controller.attribute('/World/ROS/Odom.inputs:position'),
-                              [x, y, 0.0])
+                              [ox, oy, 0.0])
             og.Controller.set(
                 og.Controller.attribute('/World/ROS/Odom.inputs:orientation'),
-                [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)])
+                [0.0, 0.0, math.sin(oyaw / 2.0), math.cos(oyaw / 2.0)])
+            # SIGNED. hypot() made reverse motion read as positive.
             og.Controller.set(
                 og.Controller.attribute('/World/ROS/Odom.inputs:linearVelocity'),
-                [vx, 0.0, 0.0])
+                [ov, 0.0, 0.0])
             og.Controller.set(
                 og.Controller.attribute('/World/ROS/Odom.inputs:angularVelocity'),
-                [0.0, 0.0, wz])
+                [0.0, 0.0, ow])
             self._fire('OdomTick')
-            self._prev_pose = (x, y, yaw)
-            self._prev_t = t
-            self._wz_now = wz
 
         if self._due('imu', t, IMU_HZ):
-            wz = getattr(self, '_wz_now', 0.0)
+            wz = body_w
             og.Controller.set(
                 og.Controller.attribute('/World/ROS/Imu.inputs:angularVelocity'),
                 [0.0, 0.0, float(wz)])
@@ -572,6 +633,16 @@ class RosBridge:
                  float(self.rng.normal(GRAVITY, ACCEL_NOISE))])
             self._fire('ImuTick')
 
+        # Ground truth at the odometry rate, so the two are directly comparable.
+        if self._due('truth', t, ODOM_HZ):
+            tx, ty, tyw = self.sim.pose()
+            og.Controller.set(og.Controller.attribute('/World/ROS/Truth.inputs:position'),
+                              [tx, ty, 0.0])
+            og.Controller.set(
+                og.Controller.attribute('/World/ROS/Truth.inputs:orientation'),
+                [0.0, 0.0, math.sin(tyw / 2.0), math.cos(tyw / 2.0)])
+            self._fire('TruthTick')
+
         if self._due('batt', t, BATTERY_HZ):
             og.Controller.set(og.Controller.attribute('/World/ROS/Batt.inputs:data'),
                               int(round(BATTERY_VOLTS * 10)))
@@ -582,6 +653,10 @@ def run_ros(sim, app, args, say):
     """Drive Isaac from /cmd_vel and publish the firmware contract. Runs until killed.
 
     SCAN RATE: UNRESOLVED, and the reason tools/simctl still refuses --backend isaac.
+
+    /odom_raw is ENCODER-DERIVED (see wheel_odometry), so it slips and drifts like the
+    real thing and reverse reads negative. It was ground-truth-derived via hypot() until
+    an audit caught it: perfect odometry with no slip, and reverse reported positive.
 
     Everything else matches the contract exactly, measured by an external subscriber:
     /scan is 360 beams at 1.0000 deg spanning -180.0..179.0 deg over 0.120-8.000 m in

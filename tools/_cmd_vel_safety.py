@@ -41,22 +41,41 @@ REAL_ROBOT_NODE = 'YB_Car_Node'
 SIMULATOR_NODE = 'fake_robot'
 
 
+# A topic the real firmware CANNOT publish. Both simulators do, precisely so tests can
+# score themselves against truth, and its presence is therefore positive evidence of a
+# simulator rather than the mere absence of evidence of a robot.
+SIMULATOR_TOPIC = '/sim/ground_truth'
+
+
 def target_of(node, seconds=15.0):
     """-> 'hardware' | 'simulator' | 'both' | 'nothing'.
 
     POLLS rather than looking once. Discovery is not instant: a single look 2 s in once
-    reported "no simulator" while the simulator was demonstrably running, and a guard that
-    reports 'nothing' when the car is actually there is worse than no guard at all.
+    reported "no simulator" while the simulator was demonstrably running, and a guard
+    that reports 'nothing' when the car is actually there is worse than no guard at all.
+
+    A simulator is recognised by POSITIVE evidence, two ways, because the two backends
+    present differently:
+
+      * the 2D sim runs a node called `fake_robot`;
+      * the ISAAC backend advertises NO ROS NODES AT ALL -- its isaacsim.ros2.bridge
+        OmniGraph publishes without creating discoverable named nodes, so a node-name
+        check simply cannot see it. It is identified by /sim/ground_truth instead.
+
+    Never by absence. "I did not find the car" is not evidence that the car is not
+    there -- discovery may just be slow -- and a guard built on that would fail open.
     """
     deadline = time.time() + seconds
-    names = []
+    names, topics = [], []
     while time.time() < deadline:
         time.sleep(1.0)
         names = [n for n, _ in node.get_node_names_and_namespaces()]
-        if SIMULATOR_NODE in names or REAL_ROBOT_NODE in names:
+        topics = [t for t, _ in node.get_topic_names_and_types()]
+        if (SIMULATOR_NODE in names or REAL_ROBOT_NODE in names
+                or SIMULATOR_TOPIC in topics):
             break
     real = REAL_ROBOT_NODE in names
-    sim = SIMULATOR_NODE in names
+    sim = SIMULATOR_NODE in names or SIMULATOR_TOPIC in topics
     if real and sim:
         return 'both'
     if real:

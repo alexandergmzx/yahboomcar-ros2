@@ -65,6 +65,31 @@ GIMBAL_YAW = 'jq1_Joint'    # driven by /servo_s1, limit +/-1.57 rad
 GIMBAL_PITCH = 'jq2_Joint'  # driven by /servo_s2, limit +/-1.57 rad
 
 
+def wheel_rates(vx, vy, wz, r, ly, lxy, mecanum=False):
+    """Body twist -> four wheel angular rates, in rad/s. ROS-free so it can be tested.
+
+    Differential (skid-steer) by default. MEASURED, not assumed: commanding a pure
+    strafe (0, +/-0.15, 0) produced EXACTLY zero on every axis of /odom_raw -- the motors
+    never ran -- while forward and yaw both tracked their commands. The firmware ignores
+    linear.y entirely.
+
+    The mecanum branch is kept for the Mcnamu/X3 chassis variant the vendor package also
+    supports, but it is off by default because this board's firmware is not it.
+    """
+    if r <= 0.0:
+        raise ValueError('wheel_radius must be > 0')
+    if mecanum:
+        return {
+            WHEEL_LF: (vx - vy - lxy * wz) / r,
+            WHEEL_RF: (vx + vy + lxy * wz) / r,
+            WHEEL_RR: (vx - vy + lxy * wz) / r,
+            WHEEL_LR: (vx + vy - lxy * wz) / r,
+        }
+    left = (vx - wz * ly) / r
+    right = (vx + wz * ly) / r
+    return {WHEEL_LF: left, WHEEL_LR: left, WHEEL_RF: right, WHEEL_RR: right}
+
+
 class JointStateBridge(Node):
     def __init__(self):
         super().__init__('twin_joint_state_bridge')
@@ -145,29 +170,9 @@ class JointStateBridge(Node):
         self.gimbal[GIMBAL_PITCH] = math.radians(float(msg.data))
 
     def _wheel_rates(self):
-        """Body twist -> four wheel angular rates.
-
-        Differential (skid-steer) by default. This was measured, not assumed: commanding
-        a pure strafe (0, +/-0.15, 0) produced *exactly* zero on every axis of
-        /odom_raw -- the motors never ran -- while forward and yaw both tracked their
-        commands. The firmware ignores linear.y.
-
-        The mecanum branch is kept for the Mcnamu/X3 chassis variant the vendor package
-        also supports, but it is off by default because this board's firmware is not it.
-        """
+        """Thin wrapper over the module-level wheel_rates(), which carries the maths."""
         vx, vy, wz = self.twist
-        if self.mecanum:
-            k = self.lxy
-            return {
-                WHEEL_LF: (vx - vy - k * wz) / self.r,
-                WHEEL_RF: (vx + vy + k * wz) / self.r,
-                WHEEL_RR: (vx - vy + k * wz) / self.r,
-                WHEEL_LR: (vx + vy - k * wz) / self.r,
-            }
-        # Differential: only vx and wz have any effect; both wheels on a side match.
-        left = (vx - wz * self.ly) / self.r
-        right = (vx + wz * self.ly) / self.r
-        return {WHEEL_LF: left, WHEEL_LR: left, WHEEL_RF: right, WHEEL_RR: right}
+        return wheel_rates(vx, vy, wz, self.r, self.ly, self.lxy, self.mecanum)
 
     def _tick(self):
         now = self.get_clock().now()

@@ -155,7 +155,9 @@ def test_short_calibration_is_rejected():
 
 
 def test_curved_calibration_is_rejected():
-    bad = {'odom_m': 1.8, 'k': 1.004, 'yaw_change_rad': math.radians(12)}
+    # gyro_span present, so the yaw figure means something and straightness is judgeable.
+    bad = {'odom_m': 1.8, 'k': 1.004, 'yaw_change_rad': math.radians(12),
+           'abs_yaw_rad': math.radians(12), 'gyro_span_rad_s': 0.5}
     assert any('curved' in p for p in mb.calibration_problems(bad))
 
 
@@ -165,5 +167,80 @@ def test_implausible_k_is_rejected():
 
 
 def test_a_good_calibration_passes():
-    good = {'odom_m': 1.83, 'k': 1.004, 'yaw_change_rad': math.radians(0.8)}
+    good = {'odom_m': 1.83, 'k': 1.004, 'yaw_change_rad': math.radians(0.8),
+            'abs_yaw_rad': math.radians(1.2), 'gyro_span_rad_s': 0.08}
     assert mb.calibration_problems(good) == []
+
+
+# ---- the gyro gate ---------------------------------------------------------------
+# These exist because a DEAD gyro produced the best-looking calibration the tool could
+# make: it publishes exactly 0.000000 on all three axes when it fails -- confirmed in 3
+# of 5 informative bags -- so it integrates to a flawless zero yaw, which the old gate
+# read as a perfectly straight push. Audit finding.
+def test_dead_gyro_is_not_mistaken_for_a_straight_push():
+    dead = {'odom_m': 1.83, 'k': 1.02, 'yaw_change_rad': 0.0,
+            'abs_yaw_rad': 0.0, 'gyro_span_rad_s': 0.0}
+    probs = mb.calibration_problems(dead)
+    assert any('flat' in p or 'failure signature' in p for p in probs), probs
+
+
+def test_calibration_without_gyro_evidence_is_refused():
+    """Pre-dates gyro_span_rad_s. A dead gyro and a straight push are indistinguishable
+    in such a record, so it cannot certify anything -- which correctly invalidates the
+    five calibrations recorded before the field existed."""
+    old = {'odom_m': 1.83, 'k': 1.02, 'yaw_change_rad': 0.0}
+    assert any('gyro-span' in p for p in mb.calibration_problems(old))
+
+
+def test_s_shaped_push_is_rejected_though_net_yaw_is_zero():
+    """Two opposite turns cancel to ~0 net while the wheels trace two arcs and the tape
+    measures a chord. Net yaw alone can never see this."""
+    snake = {'odom_m': 1.83, 'k': 1.02, 'yaw_change_rad': math.radians(1),
+             'abs_yaw_rad': math.radians(40), 'gyro_span_rad_s': 0.9}
+    assert any('snaked' in p for p in mb.calibration_problems(snake))
+
+
+# ---- grouping and the envelope ---------------------------------------------------
+def test_runs_group_by_commanded_speed_not_measured():
+    """Physically exact data: d = T*v + v^2/(2a), T=0.25, a=1.5. Grouping on the MEASURED
+    speed made 15 runs into 9 "speeds" of one run each, so enough_runs_per_speed could
+    never pass on real data -- the fit recovered the right answer and refused it."""
+    T, a = 0.25, 1.5
+    runs = []
+    for cmd, meas in ((0.05, (0.049, 0.050, 0.051, 0.0505, 0.0495)),
+                      (0.10, (0.099, 0.100, 0.101, 0.1005, 0.0995)),
+                      (0.20, (0.199, 0.200, 0.201, 0.2005, 0.1995))):
+        for v in meas:
+            runs.append({'commanded_speed_m_s': cmd, 'measured_speed_m_s': v,
+                         'stop_distance_m': T * v + v * v / (2 * a)})
+    f = mb.fit(runs, n_boot=200)
+    assert f['distinct_speeds'] == [0.05, 0.10, 0.20]
+    assert f['identifiable'], f['failed_checks']
+    assert f['T_stop_s'] == pytest.approx(T, abs=0.01)
+    assert f['decel_m_s2'] == pytest.approx(a, rel=0.05)
+
+
+def test_envelope_refuses_when_the_bias_sweep_turns_unphysical():
+    """A negative T_stop under 1 mm of assumed bias means the T_stop/`a` split is not
+    determined by this data. That was SKIPPED, making the envelope 'the worst of the
+    results that happened to be physical'."""
+    T, a = 0.25, 1.5
+    runs = [{'commanded_speed_m_s': c, 'measured_speed_m_s': c,
+             'stop_distance_m': T * c + c * c / (2 * a)}
+            for c in (0.05, 0.05, 0.05, 0.10, 0.10, 0.10, 0.20, 0.20, 0.20)]
+    f = mb.fit(runs, n_boot=200)
+    assert mb.envelope(f, 0.10) is not None
+    f['bias_sweep'][0]['T_stop_s'] = -0.295
+    assert mb.envelope(f, 0.10) is None
+
+
+def test_runs_from_another_calibration_are_excluded():
+    store = {'odom_scale_k': 1.02, 'calibrations': [{'k': 1.02}], 'runs': [
+        {'odom_scale_k': 1.02, 'stop_distance_m': 0.02},
+        {'odom_scale_k': 0.94, 'stop_distance_m': 0.05},
+        {'stop_distance_m': 0.06},
+    ]}
+    keep, skip, k = mb.runs_for_active_calibration(store)
+    assert k == 1.02
+    assert len(keep) == 1
+    assert len(skip) == 2, 'a run with no k recorded is foreign, not assumed compatible' 
