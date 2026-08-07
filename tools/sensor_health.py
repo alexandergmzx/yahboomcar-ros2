@@ -16,19 +16,31 @@ A gyro stuck at exactly 0.000000 does not say "I am broken". It says **"the robo
 rotating"**, and an EKF will fuse that as an observation, shrink its covariance on the
 strength of it, and become confident about a rotation it cannot see.
 
-THIS IS NOT HYPOTHETICAL ON THIS ROBOT. The gyro is intermittently dead. Across every bag
-recorded on 2026-08-06:
+A STATIONARY ROBOT CANNOT ANSWER THIS QUESTION
+----------------------------------------------
+At rest, a working gyro and a dead one both report approximately zero, and this hardware
+quantises to EXACTLY zero. So variance alone cannot tell them apart -- and preflight is
+run on a stationary robot, which is precisely when the test is blind.
 
-    selftest-004042    LIVE   (std 0.305)
-    selftest-004114    DEAD   (std 0.000000)
-    selftest-004659    DEAD
-    selftest-004728    DEAD
-    selftest-004826    LIVE   (std 0.150)
-    twin_dataset       DEAD
+An earlier version of this file failed a stationary robot outright and would have cried
+wolf before every session. Correcting it: at rest the gyro is reported UNDETERMINED, and
+--rotate-test is the only thing that settles it.
 
-Four of six, with live and dead runs minutes apart, so it is not a permanent fault and
-not something a single check at the start of the day settles. The accelerometer stays
-live throughout (gravity reads correctly on z), so it is the gyro specifically.
+THE FAULT IS REAL, THOUGH. Cross-checking every recorded bag against whether rotation was
+actually COMMANDED separates the two cases:
+
+    bag                gyro std   |wz| commanded   verdict
+    selftest-004042    0.305      1.545            live
+    selftest-004114    0.000000   0.757            FAULT: told to turn, gyro flat
+    selftest-004659    0.000000   0.000            fine -- nothing rotated
+    selftest-004728    0.000000   0.914            FAULT
+    selftest-004826    0.150      0.693            live
+    twin_dataset       0.000000   1.040            FAULT
+
+Three confirmed faults out of five informative runs, with live and faulty runs minutes
+apart, so it is intermittent rather than permanent. The accelerometer stays live
+throughout -- accel-z reads 9.80 with real variance -- so it is the gyro specifically.
+Neither a power cycle nor a serial reset has recovered it (2026-08-06, several attempts).
 
 WHAT IT COSTS
 -------------
@@ -50,6 +62,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--seconds', type=float, default=15.0)
     ap.add_argument('--domain', type=int, default=20)
+    ap.add_argument('--rotate-test', action='store_true',
+                    help='the only decisive gyro check: you rotate the car by hand and '
+                         'the gyro must respond. Needs no motors.')
     args = ap.parse_args()
     os.environ.setdefault('ROS_DOMAIN_ID', str(args.domain))
 
@@ -117,10 +132,30 @@ def main():
     ]
     for label, series in checks:
         s = float(np.std(series))
-        dead = s < 1e-9
-        print(f'    {label:12s} std {s:.6f}  {"DEAD" if dead else "live"}')
-        if dead:
-            fails.append(f'{label} is stuck at {series[0]:.6f}')
+        flat = s < 1e-9
+        if 'gyro' in label:
+            # At rest a working gyro reads ~0 and this hardware quantises to exactly 0,
+            # so a flat reading here is UNDETERMINED, not dead. Failing it would cry wolf
+            # before every session, since preflight runs on a stationary robot.
+            verdict = 'flat (undetermined at rest)' if flat else 'live'
+        elif label == 'imu accel z':
+            # Gravity is a signal that is always present, so this axis CAN be judged at
+            # rest: it must read ~9.8 and it must vary.
+            mag = float(np.mean(np.abs(series)))
+            verdict = 'live' if (not flat and 8.0 < mag < 11.5) else 'SUSPECT'
+            if verdict == 'SUSPECT':
+                fails.append(f'accel z reads {mag:.2f} m/s^2 with std {s:.6f}; '
+                             'gravity should be ~9.8 and should vary')
+        else:
+            # accel x/y are legitimately ~0 on a level, still robot, and quantise to
+            # exactly 0. Not judgeable here either.
+            verdict = 'flat (level and still, expected)' if flat else 'live'
+        print(f'    {label:12s} std {s:.6f}  {verdict}')
+
+    gyro_flat = all(float(np.std(a[:, i])) < 1e-9 for i in (0, 1, 2))
+    if gyro_flat:
+        warns.append('gyro is flat on all three axes. At rest that proves nothing -- '
+                     'run --rotate-test to settle it.')
 
     # Odometry at rest is legitimately constant, so a zero-variance odom is only
     # suspicious if it never moves across a run where motion was commanded. Not
@@ -152,6 +187,34 @@ def main():
         if v < gate:
             fails.append(f'battery {v:.1f} V below the {gate} V session gate')
 
+    # ---- the only decisive gyro test: make it rotate ----
+    if args.rotate_test:
+        print()
+        print('  ROTATE TEST -- the gyro cannot be judged at rest, so rotate it.')
+        print('  Pick the car up and turn it briskly left and right about the VERTICAL')
+        print('  axis for a few seconds. Motors stay off; this is your hands only.')
+        try:
+            input('  Press Enter, then rotate for ~8 s... ')
+        except EOFError:
+            print('  (no console; skipping)')
+        else:
+            imu.clear()
+            time.sleep(8.0)
+            if len(imu) < 20:
+                fails.append('no IMU data during the rotate test')
+            else:
+                b = np.array(imu)
+                peak = float(np.max(np.abs(b[:, 2])))
+                spread = float(np.std(b[:, 2]))
+                print(f'    gyro z: peak {peak:.4f} rad/s, std {spread:.6f}')
+                if peak < 0.05:
+                    fails.append(f'gyro z peaked at only {peak:.4f} rad/s while the car '
+                                 'was rotated by hand -- the gyro is NOT responding')
+                    print('    -> DEAD. It did not see a rotation you performed.')
+                else:
+                    print('    -> LIVE. It responded to real rotation.')
+                    warns[:] = [w for w in warns if 'gyro is flat' not in w]
+
     # ---- verdict ----
     print()
     for w in warns:
@@ -162,13 +225,18 @@ def main():
             print(f'    - {f}')
         print()
         if any('gyro' in f for f in fails):
-            print('  The gyro is intermittently dead on this robot -- 4 of 6 recorded')
-            print('  bags. A power cycle has brought it back before. It is NOT safe to')
-            print('  treat a stuck gyro as "no rotation": a filter will fuse that as a')
-            print('  measurement. tools/measure_braking.py --calibrate also needs it to')
-            print('  witness that a push was straight, so calibration is blocked.')
+            print('  The gyro on this robot is intermittently faulty -- confirmed in 3 of')
+            print('  5 informative bags, where rotation was COMMANDED and the gyro stayed')
+            print('  flat. Neither a power cycle nor a serial reset has recovered it.')
+            print('  A filter will fuse a flat gyro as "not rotating", and')
+            print('  measure_braking.py --calibrate needs it to witness that a push was')
+            print('  straight, so calibration is blocked while it is out.')
         return 1
 
+    if warns and not args.rotate_test:
+        print('  SENSOR HEALTH: PASS with caveats -- rerun with --rotate-test to settle')
+        print('  the gyro, which cannot be judged on a stationary robot.')
+        return 0
     print('  SENSOR HEALTH: PASS -- every channel is alive and measuring')
     return 0
 

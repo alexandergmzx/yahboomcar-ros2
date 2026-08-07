@@ -233,20 +233,28 @@ rather than with the safety filter. Until it is designed, the operating rule sta
 
 ## The gyro is intermittently dead
 
-Measured across every bag recorded on 2026-08-06 — **dead in 4 of 6**, live in two, with
-live and dead runs minutes apart:
+A flat gyro only means something if the robot was actually asked to turn. Cross-checking
+each 2026-08-06 bag against the commanded yaw separates fault from coincidence:
 
-| bag | gyro-z std | |
-|---|---|---|
-| `selftest-004042` | 0.305 | live |
-| `selftest-004114` | **0.000000** | **dead** |
-| `selftest-004659` | **0.000000** | **dead** |
-| `selftest-004728` | **0.000000** | **dead** |
-| `selftest-004826` | 0.150 | live |
-| `twin_dataset` | **0.000000** | **dead** |
+| bag | gyro-z std | \|wz\| commanded | verdict |
+|---|---|---|---|
+| `selftest-004042` | 0.305 | 1.545 | live |
+| `selftest-004114` | **0.000000** | **0.757** | **fault** |
+| `selftest-004659` | 0.000000 | 0.000 | fine — nothing rotated |
+| `selftest-004728` | **0.000000** | **0.914** | **fault** |
+| `selftest-004826` | 0.150 | 0.693 | live |
+| `twin_dataset` | **0.000000** | **1.040** | **fault** |
 
-The accelerometer stays live throughout, so it is the gyro specifically, and a power
-cycle has recovered it before.
+**Three confirmed faults in five informative runs**, live and faulty minutes apart. An
+earlier version of this section said "4 of 6 dead"; one of those was a stationary run
+where a zero gyro is correct, and the claim is corrected here.
+
+The accelerometer stays live throughout — accel-z reads 9.80 with real variance — so it is
+the gyro specifically. **Neither a power cycle nor a serial reset recovers it.**
+
+**A stationary robot cannot answer this**, which matters because preflight runs on a
+stationary robot: at rest a working gyro and a broken one both read exactly 0.000000.
+`tools/sensor_health.py --rotate-test` is the only decisive check.
 
 **A stuck channel is worse than a silent one.** A topic that stops publishing fails
 loudly; a gyro pinned at exactly zero publishes at full rate and reads as *"the robot is
