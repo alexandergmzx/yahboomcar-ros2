@@ -374,6 +374,26 @@ TESTS = {
 # transferring to the real robot.
 SCAN_HZ, ODOM_HZ, IMU_HZ, BATTERY_HZ = 12.0, 11.0, 25.0, 1.0
 BATTERY_VOLTS = 8.3
+
+# MEASURED, AND UNEXPLAINED. ROS2RtxLidarHelper emits a fixed 72 LaserScan messages per
+# second of RENDER time, and the scanRateBaseHz=12 authored on the prim -- verified by
+# readback in build_arena.py -- does not set it. Two render steps, both fitting
+# `messages/s = 72 x renders/s x rendering_dt` exactly:
+#
+#     rendering_dt   renders/s   render-time per wall second   /scan Hz
+#     1/60 (default)     12              0.200                   14.4
+#     1/12               12              1.000                   72.0
+#
+# Two explanations were tested and eliminated: fullScan=True changed the rate by nothing
+# (its "point cloud type only" note is accurate, and each message carries 286/360 finite
+# returns, so these are whole revolutions and not partials), and pinning rendering_dt to
+# the scan period made it six times worse.
+#
+# So the render cadence is CALIBRATED against this constant rather than derived from the
+# sensor's own configured rate. That is a compromise, taken deliberately: it lands /scan
+# on the contract, but it encodes a number nobody has explained, and it will drift if
+# anything changes render timing. run_ros() prints that caveat at startup, every run.
+LIDAR_MSGS_PER_RENDER_SECOND = 72.0
 # Measured from three at-rest selftest bags -- see yahboomcar_sim.physics.imu_sample,
 # which owns these numbers and explains why the gyro is deliberately noiseless.
 GRAVITY, ACCEL_NOISE = 9.799, 0.013
@@ -585,6 +605,23 @@ class RosBridge:
         self._odom = (x, y, yaw)
         return x, y, yaw, v, w
 
+    def _stamp(self, node):
+        """Set inputs:timeStamp before firing. It DEFAULTS TO 0.0.
+
+        A zero stamp is not cosmetic. imu_filter_madgwick refuses to update orientation
+        at all -- "The IMU message time stamp is zero, and the parameter constant_dt is
+        not set" -- so the EKF gets no fused attitude, and TF ends up at time 0. The 2D
+        simulator has always stamped its messages; the Isaac backend did not, and it
+        showed up only in the bringup log.
+
+        WALL CLOCK, because nothing in this stack sets use_sim_time -- by design, so
+        that swapping the simulator for the car changes nothing.
+        """
+        import time as _t
+        self.og.Controller.set(
+            self.og.Controller.attribute(f'/World/ROS/{node}.inputs:timeStamp'),
+            float(_t.time()))
+
     def _fire(self, node):
         self.og.Controller.set(
             self.og.Controller.attribute(f'/World/ROS/{node}.state:enableImpulse'), True)
@@ -616,6 +653,7 @@ class RosBridge:
             og.Controller.set(
                 og.Controller.attribute('/World/ROS/Odom.inputs:angularVelocity'),
                 [0.0, 0.0, ow])
+            self._stamp('Odom')
             self._fire('OdomTick')
 
         if self._due('imu', t, IMU_HZ):
@@ -631,6 +669,7 @@ class RosBridge:
                 [float(self.rng.normal(0.0, ACCEL_NOISE)),
                  float(self.rng.normal(0.0, ACCEL_NOISE)),
                  float(self.rng.normal(GRAVITY, ACCEL_NOISE))])
+            self._stamp('Imu')
             self._fire('ImuTick')
 
         # Ground truth at the odometry rate, so the two are directly comparable.
@@ -641,6 +680,7 @@ class RosBridge:
             og.Controller.set(
                 og.Controller.attribute('/World/ROS/Truth.inputs:orientation'),
                 [0.0, 0.0, math.sin(tyw / 2.0), math.cos(tyw / 2.0)])
+            self._stamp('Truth')
             self._fire('TruthTick')
 
         if self._due('batt', t, BATTERY_HZ):
@@ -693,11 +733,15 @@ def run_ros(sim, app, args, say):
         the rate six times WORSE, per the formula above.
 
     What is left is that the RTX lidar's rotation rate simply does not follow
-    scanRateBaseHz in this configuration. Rendering at 10 Hz instead of 12 would land
-    on exactly 12 Hz, and the formula fits well enough across a 5x change to make that
-    reliable -- but it encodes an unexplained 72 rather than fixing it, and would drift
-    with anything affecting render timing. A backend that half-satisfies the contract
-    is worse than no backend, so simctl keeps refusing until the 72 is understood.
+    scanRateBaseHz in this configuration.
+
+    SO THE RENDER CADENCE IS CALIBRATED against the measured 72, rather than derived
+    from the sensor's configured rate: render_hz = SCAN_HZ / (72 * rendering_dt), which
+    at the default rendering_dt of 1/60 means rendering 10 times a second to get 12
+    scans. That is a COMPROMISE and is announced at startup on every run. It lands
+    /scan on the contract; it does not explain the 72, and it will drift if anything
+    changes render timing. The alternative was leaving the backend unusable over a 20%
+    rate error, which costs the physics, collisions and appearance Isaac exists for.
     """
     import time as _time
     domain = os.environ.get('ROS_DOMAIN_ID', '0')
@@ -705,9 +749,27 @@ def run_ros(sim, app, args, say):
     bridge = RosBridge(sim, app, domain, say)
 
     dt = sim.dt()
-    say(f'  physics {1/dt:.0f} Hz')
+    try:
+        rdt = float(sim.sim.get_rendering_dt())
+    except Exception:
+        rdt = dt
+    if rdt <= 0:
+        rdt = dt
+    # renders/s such that 72 * renders/s * rendering_dt == SCAN_HZ
+    render_hz = SCAN_HZ / (LIDAR_MSGS_PER_RENDER_SECOND * rdt)
+    say(f'  physics {1/dt:.0f} Hz, rendering_dt {rdt:.5f} s')
     say(f'  /scan {SCAN_HZ:.0f}  /odom_raw {ODOM_HZ:.0f}  /imu {IMU_HZ:.0f}  '
         f'/battery {BATTERY_HZ:.0f} Hz   <- /cmd_vel')
+    say('')
+    say('  *** /scan RATE IS CALIBRATED, NOT DERIVED ***')
+    say(f'  The RTX lidar emits a measured {LIDAR_MSGS_PER_RENDER_SECOND:.0f} messages '
+        'per second of RENDER time and')
+    say('  ignores the scanRateBaseHz=12 authored on its prim. Nobody has explained')
+    say(f'  that number. Rendering {render_hz:.1f} times a second is what lands /scan on')
+    say(f'  {SCAN_HZ:.0f} Hz given it -- so the rate is right, for a reason that is not')
+    say('  understood, and it will drift if anything changes render timing.')
+    say('  Verify with:  ./tools/check_isaac_contract.py')
+    say('')
     say('  NO COMMAND WATCHDOG, as on the real firmware: a commanded speed is held')
     say('  indefinitely. Modelled on purpose.')
     say('')
@@ -725,17 +787,12 @@ def run_ros(sim, app, args, say):
             t = _time.time() - t0
             vx, wz = bridge.read_cmd_vel()
             sim.drive(vx, wz)
-            # Render ONLY when a scan is due, and gate that on SIM time rather than
-            # wall time. ROS2RtxLidarHelper publishes on every render tick, so:
-            #   * rendering every frame pinned /scan to the frame rate (34.6 Hz) and
-            #     ate the whole frame budget;
-            #   * gating on WALL time gave 14.4 Hz, because the lidar's rotation is
-            #     driven by SIM time at scanRateBaseHz while the renders came on a
-            #     wall-clock cadence, and the two beat -- roughly one render in five
-            #     found two completed rotations buffered and published both.
-            # dt is 1/60 and 1/SCAN_HZ is 1/12, so this is exactly every 5th step:
-            # one rotation, one render, one message.
-            render = (sim_t - last_render) >= (1.0 / SCAN_HZ) - 1e-9
+            # Render ONLY when a scan is due, gated on SIM time and paced at render_hz,
+            # which is CALIBRATED against the measured 72-per-render-second emission
+            # rate rather than derived from the sensor's configured rate. Rendering
+            # every frame instead pinned /scan to the frame rate (34.6 Hz measured) and
+            # ate the whole frame budget.
+            render = (sim_t - last_render) >= (1.0 / render_hz) - 1e-9
             if render:
                 last_render = sim_t
                 bridge._counts['scan'] += 1

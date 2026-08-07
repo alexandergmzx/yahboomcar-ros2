@@ -2,7 +2,18 @@
 """Start and stop the simulation. One command each.
 
     ./tools/simctl start                 # full stack + RViz + patrol, 2D backend
+    ./tools/simctl start --backend isaac # the same stack on Isaac physics, with a window
     ./tools/simctl stop                  # stop the robots, then tear down
+
+WHICH BACKEND YOU GET, AND WHY `start` ALONE IS NOT ISAAC
+---------------------------------------------------------
+`--backend` defaults to `2d`, so plain `simctl start` has never launched Isaac. That is
+deliberate: the 2D robot starts in ~40 s, needs no GPU, has no physics at all, and is
+what the whole stack was developed against. Isaac takes ~90 s, wants the GPU, and gives
+you real contact physics, collisions and a window to watch.
+
+Both replace only the FIRMWARE. Everything above -- bringup, the EKF, the governor, SLAM,
+Nav2, RViz -- is identical and cannot tell them apart.
     ./tools/simctl status                # what is running, and where
     ./tools/simctl patrol                # drive an already-running simulation
     ./tools/simctl estop --domain 20     # zero a named domain, explicitly
@@ -67,7 +78,7 @@ SIM_PROCS = [
     'async_slam_toolbox_node', 'lifecycle_manager', 'laser_odometry',
     'ekf_node', 'imu_filter_madgwick_node', 'robot_state_publisher',
     'joint_state_publisher', 'static_transform_publisher', 'rviz2',
-    'sim_runner.py', 'component_container_isolated',
+    'sim_runner.py', 'component_container_isolated', 'env_isaaclab',
 ]
 
 
@@ -176,8 +187,37 @@ def running(patterns, domain=None):
     return pids
 
 
+def _mapped_shm_files():
+    """Every /dev/shm file currently mapped by a live process."""
+    live = set()
+    for maps in glob.glob('/proc/[0-9]*/maps'):
+        try:
+            with open(maps) as f:
+                for line in f:
+                    i = line.find('/dev/shm/')
+                    if i != -1:
+                        live.add(line[i:].strip())
+        except OSError:
+            continue          # process exited, or not ours to read
+    return live
+
+
 def stale_segments():
-    return glob.glob('/dev/shm/fastrtps*') + glob.glob('/dev/shm/sem.fastrtps*')
+    """Segments NO live process is using. The word 'stale' has to be earned.
+
+    This used to glob every /dev/shm/fastrtps* unconditionally, so `simctl stop` deleted
+    the shared memory of simulations it was not stopping. Demonstrated: with Isaac
+    running on domain 66, `simctl stop --domain 67` removed 147 segments and Isaac's
+    /scan went from 12.9 Hz to SILENT while its process stayed alive -- DDS transport
+    destroyed under a running participant, with nothing logged anywhere.
+
+    That is the same defect the domain-scoped kill was added to fix: an operation whose
+    blast radius exceeds its stated scope. Scoping the kills and leaving this global just
+    moved the problem somewhere quieter.
+    """
+    all_segs = glob.glob('/dev/shm/fastrtps*') + glob.glob('/dev/shm/sem.fastrtps*')
+    live = _mapped_shm_files()
+    return [s for s in all_segs if s not in live]
 
 
 # ------------------------------------------------------------------------ start
@@ -202,20 +242,34 @@ def cmd_start(args):
 
     # 1. the robot, plus the REAL bringup stack on top of it
     if args.backend == 'isaac':
-        # Refuse loudly rather than start something that cannot satisfy the contract.
-        # A backend that half-satisfies it is worse than no backend, because every
-        # result taken from it stops transferring to the real robot without saying so.
-        print('The Isaac backend is close but OFF-CONTRACT on /scan.')
-        print('  It publishes /scan, /odom_raw, /imu and /battery and drives from')
-        print('  /cmd_vel -- run it directly with:')
-        print('    ~/isaac/env_isaaclab/bin/python tools/sim_runner.py --ros')
-        print('  Measured: scan geometry exact (360 beams, 1.000 deg, 0.12-8.0 m),')
-        print('  /odom_raw 11.0, /imu 25.0, /battery 1.0 Hz, realtime x1.00.')
-        print('  BUT /scan arrives at 14.4 Hz against a 12 Hz contract: the RTX lidar')
-        print('  rotates on the renderer clock at a fixed 72 Hz, ignoring the')
-        print('  scanRateBaseHz=12 authored on the prim. See run_ros() in sim_runner.py.')
-        print('  Use the 2D backend meanwhile: ./tools/simctl start')
-        return 2
+        # Isaac replaces ONLY the firmware, exactly as fake_robot does -- so the real
+        # bringup goes on top of it unchanged, and everything above that cannot tell
+        # the two backends apart.
+        print('  [1/6] Isaac Sim (~90 s to start; a window will open)...')
+        print('        NOTE /scan lands on 12 Hz by CALIBRATION against a measured but')
+        print('        unexplained 72-messages-per-render-second emission rate, not by')
+        print('        the sensor honouring its configured rate. Verify any session with')
+        print('        ./tools/check_isaac_contract.py before trusting a timing result.')
+        if args.slip:
+            print(f'        (--slip {args.slip} is a 2D-simulator knob and is IGNORED '
+                  'here: Isaac')
+            print('        has real contact physics, so slip is whatever the floor gives '
+                  'you)')
+        isaac_py = os.path.expanduser('~/isaac/env_isaaclab/bin/python')
+        if not os.path.exists(isaac_py):
+            print(f'  Isaac python not found at {isaac_py}')
+            return 2
+        gui = '' if args.no_isaac_gui else ' --gui'
+        sh(f'{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}', dom,
+           log=os.path.join(log, 'simctl-isaac.log'))
+        # Isaac is slow to start and the bringup below needs /odom_raw to exist, so the
+        # firmware side is given its own wait before the stack goes on top.
+        # 240 s was not enough with the GUI on: Isaac reached 'graph built' and
+        # published everything, but only after the wait had already expired.
+        print('        waiting for Isaac to publish (up to 420 s with the GUI)...')
+        sh('ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py', dom,
+           log=os.path.join(log, 'simctl-bringup.log'))
+        deadline = time.time() + 420
     else:
         print('  [1/6] simulated firmware + real bringup...')
         sh(f'ros2 launch yahboomcar_sim sim_bringup_launch.py slip:={args.slip}', dom,
@@ -464,7 +518,10 @@ def main():
     sub = ap.add_subparsers(dest='cmd', required=True)
 
     s = sub.add_parser('start', help='bring up a simulation')
-    s.add_argument('--backend', choices=['2d', 'isaac'], default='2d')
+    s.add_argument('--backend', choices=['2d', 'isaac'], default='2d',
+                   help='2d is instant and has no physics; isaac has real\n                         contact physics and collisions, takes ~90 s, and\n                         needs the GPU')
+    s.add_argument('--no-isaac-gui', action='store_true',
+                   help='run Isaac headless. Without this a window opens --\n                         seeing it is most of why you would pick Isaac.')
     s.add_argument('--domain', type=int, default=SIM_DOMAIN)
     s.add_argument('--slip', type=float, default=0.0)
     s.add_argument('--no-rviz', dest='rviz', action='store_false')
