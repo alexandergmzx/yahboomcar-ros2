@@ -70,11 +70,18 @@ class FakeRobot(Node):
         self.declare_parameter('start_yaw', 0.0)
         self.declare_parameter('battery_volts', 8.3)
         self.declare_parameter('publish_ground_truth', True)
+        # TEST FIXTURE, not a model of this robot -- see physics.py. Default 0 keeps the
+        # honest no-physics behaviour; set it only to check a measurement tool against
+        # KNOWN values.
+        self.declare_parameter('decel', 0.0)
+        self.declare_parameter('dead_time', 0.0)
 
         self.slip = float(self.get_parameter('slip').value)
         self.scan_noise = float(self.get_parameter('scan_noise').value)
         self.dropout = float(self.get_parameter('dropout').value)
         self.battery = float(self.get_parameter('battery_volts').value)
+        self.decel = float(self.get_parameter('decel').value)
+        self.dead_time = float(self.get_parameter('dead_time').value)
 
         self.segs = default_arena()
         self.state = RobotState(
@@ -105,6 +112,14 @@ class FakeRobot(Node):
             self.pub_truth = self.create_publisher(Odometry, '/sim/ground_truth', 10)
 
         self.create_timer(1.0 / PHYSICS_HZ, self._tick_physics)
+        # Ground truth is a DEBUG channel, not part of the firmware contract, so it is
+        # published at physics rate rather than the firmware's 11 Hz. At 11 Hz a "tape"
+        # reading taken from it is up to one sample period stale, which adds an error
+        # PROPORTIONAL TO SPEED -- and a linear-in-v error is indistinguishable from dead
+        # time, so it lands in T_stop and steals from the quadratic term. Measured: it
+        # inflated T_stop by 47 ms (half a sample period) and dragged the recovered
+        # deceleration from a true 1.5 to 0.54 m/s^2.
+        self.create_timer(1.0 / PHYSICS_HZ, self._tick_truth)
         self.create_timer(1.0 / SCAN_HZ, self._tick_scan)
         self.create_timer(1.0 / ODOM_HZ, self._tick_odom)
         self.create_timer(1.0 / IMU_HZ, self._tick_imu)
@@ -119,6 +134,12 @@ class FakeRobot(Node):
         self.get_logger().warn(
             'NO COMMAND WATCHDOG, as on the real firmware: a commanded speed is held '
             'indefinitely. This is modelled on purpose.')
+        if self.decel > 0:
+            self.get_logger().warn(
+                f'BRAKING TEST FIXTURE ACTIVE: decel={self.decel} m/s^2, '
+                f'dead_time={self.dead_time} s. These are ARBITRARY KNOWN VALUES for '
+                'checking a measurement tool. They are not a model of the real car, '
+                'whose braking has never been measured.')
 
     def _on_cmd(self, msg: Twist):
         # vy discarded: differential chassis, measured to produce exactly zero.
@@ -131,7 +152,9 @@ class FakeRobot(Node):
         if dt <= 0 or dt > 0.5:
             return
         vx, wz = self.cmd
-        self.state, self._vx, self._wz = step(self.state, vx, wz, dt, slip=self.slip)
+        self.state, self._vx, self._wz = step(
+            self.state, vx, wz, dt, slip=self.slip,
+            decel=self.decel, dead_time=self.dead_time)
 
     def _stamp(self):
         return self.get_clock().now().to_msg()
@@ -169,15 +192,18 @@ class FakeRobot(Node):
         m.twist.twist.angular.z = self._wz
         self.pub_odom.publish(m)
 
-        if self.pub_truth is not None:
-            t = Odometry()
-            t.header.stamp = m.header.stamp
-            t.header.frame_id = 'map'
-            t.child_frame_id = 'base_footprint_truth'
-            t.pose.pose.position.x = self.state.x
-            t.pose.pose.position.y = self.state.y
-            t.pose.pose.orientation = _quat(self.state.yaw)
-            self.pub_truth.publish(t)
+    def _tick_truth(self):
+        if self.pub_truth is None:
+            return
+        t = Odometry()
+        t.header.stamp = self._stamp()
+        t.header.frame_id = 'map'
+        t.child_frame_id = 'base_footprint_truth'
+        t.pose.pose.position.x = self.state.x
+        t.pose.pose.position.y = self.state.y
+        t.pose.pose.orientation = _quat(self.state.yaw)
+        t.twist.twist.linear.x = self._vx
+        self.pub_truth.publish(t)
 
     def _tick_imu(self):
         m = Imu()

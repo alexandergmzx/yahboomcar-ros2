@@ -28,6 +28,20 @@ Wheel dynamics, motor spin-up, inertia, traction limits, latency. There is no ph
 here at all -- just kinematics. So this simulator can say whether the navigation stack
 WORKS; it can say nothing whatever about how the robot BEHAVES. Stopping distance,
 odometry accuracy and braking are floor measurements and this cannot substitute for them.
+
+THE ONE EXCEPTION, AND IT IS A TEST FIXTURE
+-------------------------------------------
+`decel` and `dead_time` below give the simulated robot a FINITE braking response instead
+of stopping dead. They are NOT a model of this car -- nobody has measured how it brakes,
+which is the entire point of the floor session.
+
+They exist so that tools/measure_braking.py can be run end to end against KNOWN values
+and checked for whether it recovers them. That tool has never executed its full chain --
+calibrate, drive, measure, subtract the run-up, fit, envelope -- and a bug anywhere in it
+would otherwise be discovered on the floor, wasting the session it was meant to serve.
+
+Numbers produced this way describe the fixture, never the robot. Any figure derived from
+them must be reported as a check on the INSTRUMENT.
 """
 import math
 from dataclasses import dataclass
@@ -42,37 +56,69 @@ class RobotState:
     odom_x: float = 0.0
     odom_y: float = 0.0
     odom_yaw: float = 0.0
+    # Test-fixture braking state: the speed actually being executed, and how long is left
+    # of the dead time before the current command takes effect at all.
+    exec_vx: float = 0.0
+    exec_wz: float = 0.0
+    pending: float = 0.0
+    cmd_vx: float = 0.0        # the last command SEEN, so dead time starts on a change
 
 
 def wrap(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
-def step(state, vx, wz, dt, slip=0.0):
+def step(state, vx, wz, dt, slip=0.0, decel=0.0, dead_time=0.0):
     """Advance one tick. Returns (new_state, reported_vx, reported_wz).
 
     `slip` in [0, 1] is the fraction of commanded motion the wheels turn through WITHOUT
     the body moving: 0 is perfect traction, 1 is the car on its stand. The encoders report
     the full commanded motion regardless, which is exactly why slip is invisible to them
     and visible to the lidar.
+
+    `decel` (m/s^2) and `dead_time` (s) are a TEST FIXTURE, not a model of this robot --
+    see the module docstring. With decel = 0 the command takes effect instantly, which is
+    the default and the honest behaviour for a simulator with no physics.
     """
     s = RobotState(state.x, state.y, state.yaw,
-                   state.odom_x, state.odom_y, state.odom_yaw)
+                   state.odom_x, state.odom_y, state.odom_yaw,
+                   state.exec_vx, state.exec_wz, state.pending, state.cmd_vx)
+
+    if decel <= 0.0:
+        s.exec_vx, s.exec_wz = vx, wz          # no fixture: instant, as before
+    else:
+        # Dead time starts when the COMMAND CHANGES -- not whenever the executed speed
+        # happens to differ from it. Comparing against exec_vx re-armed the timer on
+        # every tick while the robot was still catching up, so it never expired and the
+        # robot never moved at all. Found by running the protocol end to end.
+        if abs(vx - s.cmd_vx) > 1e-9:
+            s.pending = dead_time
+            s.cmd_vx = vx
+        if s.pending > 0.0:
+            s.pending = max(0.0, s.pending - dt)
+        else:
+            # Then approach the commanded speed at a bounded rate.
+            dv = vx - s.exec_vx
+            step_v = decel * dt
+            s.exec_vx += math.copysign(min(abs(dv), step_v), dv) if dv else 0.0
+            s.exec_wz = wz
+
+    ex, ew = s.exec_vx, s.exec_wz
 
     # True motion: what the body actually does.
-    real_vx = vx * (1.0 - slip)
-    real_wz = wz * (1.0 - slip)
+    real_vx = ex * (1.0 - slip)
+    real_wz = ew * (1.0 - slip)
     s.x += real_vx * math.cos(s.yaw) * dt
     s.y += real_vx * math.sin(s.yaw) * dt
     s.yaw = wrap(s.yaw + real_wz * dt)
 
     # Wheel-derived motion: what the encoders think happened. Slip never appears here --
     # a wheel cannot tell that the ground moved past it rather than under it.
-    s.odom_x += vx * math.cos(s.odom_yaw) * dt
-    s.odom_y += vx * math.sin(s.odom_yaw) * dt
-    s.odom_yaw = wrap(s.odom_yaw + wz * dt)
+    s.odom_x += ex * math.cos(s.odom_yaw) * dt
+    s.odom_y += ex * math.sin(s.odom_yaw) * dt
+    s.odom_yaw = wrap(s.odom_yaw + ew * dt)
 
-    return s, vx, wz
+    return s, ex, ew
 
 
 def apply_command(vx, vy, wz, max_speed=0.35, max_yaw=1.5):

@@ -92,7 +92,15 @@ from datetime import datetime
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
-DATA = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety', 'braking_runs.json')
+# Hardware and simulator results live in SEPARATE stores. They shared one file, and a
+# simulator dry run wrote synthetic calibrations and runs into the hardware evidence --
+# the same class of mistake that had already put a simulated fail-safe result where a
+# hardware one belonged. Separation is structural now, not a matter of remembering.
+DATA_HW = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
+                       'braking_runs.json')
+DATA_SIM = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
+                        'braking_runs_sim.json')
+DATA = DATA_HW          # rebound in main() once --sim-tape is known
 
 AT_REST = 0.02
 N_REST = 3
@@ -396,7 +404,14 @@ def main():
                     help='show every recorded calibration and which one is active')
     ap.add_argument('--use-calibration', type=int, metavar='N',
                     help='make calibration N active (see --list-calibrations)')
+    ap.add_argument('--sim-tape', action='store_true',
+                    help='SIMULATION ONLY: take the "tape" measurement from the '
+                         'simulator ground truth instead of prompting. Refuses to run '
+                         'against real hardware.')
     args = ap.parse_args()
+
+    global DATA
+    DATA = DATA_SIM if args.sim_tape else DATA_HW
 
     store = load()
 
@@ -518,12 +533,17 @@ def main():
         Odometry, '/odom_raw',
         lambda m: samples.append((time.time(), m.twist.twist.linear.x)),
         qos_profile_sensor_data)
+    truth = []        # simulator ground truth, only present when a simulator is running
     imu = []          # (t, accel_x, gyro_z)
     node.create_subscription(
         Imu, '/imu',
         lambda m: imu.append((time.time(), m.linear_acceleration.x,
                               m.angular_velocity.z)),
         qos_profile_sensor_data)
+    if args.sim_tape:
+        node.create_subscription(
+            Odometry, '/sim/ground_truth',
+            lambda m: truth.append((m.pose.pose.position.x, m.pose.pose.position.y)), 10)
     topic = '/cmd_vel' if args.direct else '/cmd_vel_raw'
     pub = node.create_publisher(Twist, topic, 10)
 
@@ -532,10 +552,24 @@ def main():
     threading.Thread(target=ex.spin, daemon=True).start()
 
     stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-    time.sleep(2.0)
+    time.sleep(2.5)
     if not samples:
         print('FAIL: no /odom_raw. Car powered? Right domain? Agent up?')
         return 2
+
+    if args.sim_tape:
+        # Ground truth only exists in simulation. Refusing without it stops --sim-tape
+        # ever being pointed at hardware, where there is nothing to substitute for a
+        # tape measure and a fabricated one would be indistinguishable from a real one.
+        names = [n for n, _ in node.get_node_names_and_namespaces()]
+        if 'YB_Car_Node' in names or not truth:
+            print('REFUSED: --sim-tape needs /sim/ground_truth from the simulator, and '
+                  'must never run against hardware.')
+            print('On the real robot the tape measure IS the ground truth; there is no '
+                  'substitute, and a fabricated one would look exactly like a real one.')
+            return 2
+        print('*** --sim-tape: "tape" readings come from SIMULATOR GROUND TRUTH. ***')
+        print('*** Results check the TOOL, and say nothing about any real robot.  ***')
 
     def imu_bias(t_from, t_to):
         """Mean accel-x and gyro-z while stationary: removes static tilt and gyro drift."""
@@ -564,8 +598,44 @@ def main():
         return dv, d, dyaw
 
     def integrate(t_from, t_to=None):
-        seg = [s for s in samples if s[0] >= t_from and (t_to is None or s[0] <= t_to)]
-        return sum(abs(a[1]) * (b[0] - a[0]) for a, b in zip(seg, seg[1:]))
+        """Integrate |vx| over [t_from, t_to], INTERPOLATING at both boundaries.
+
+        Taking only whole samples inside the window loses up to one sample period at each
+        end, and /odom_raw runs at 11 Hz -- so the error is up to 90 ms of travel, which
+        is PROPORTIONAL TO SPEED. A linear-in-v error is indistinguishable from dead time,
+        so it lands in T_stop and steals from the quadratic term.
+
+        Measured in the simulator dry run against known values (decel 1.5, dead time
+        0.25): whole-sample integration over-reported stopping distance by +5, +8 and
+        +17 mm at 0.05, 0.10 and 0.15 m/s. Interpolating the ends removes a bias that
+        would otherwise corrupt the floor measurement in exactly the same way.
+        """
+        if t_to is None:
+            t_to = samples[-1][0] if samples else t_from
+        seg = [s for s in samples if t_from <= s[0] <= t_to]
+        total = sum(abs(a[1]) * (b[0] - a[0]) for a, b in zip(seg, seg[1:]))
+
+        def v_at(t):
+            """Linear interpolation of |vx| at an arbitrary time."""
+            before = [s for s in samples if s[0] <= t]
+            after = [s for s in samples if s[0] >= t]
+            if not before or not after:
+                return None
+            a, b = before[-1], after[0]
+            if b[0] == a[0]:
+                return abs(a[1])
+            f = (t - a[0]) / (b[0] - a[0])
+            return abs(a[1]) + f * (abs(b[1]) - abs(a[1]))
+
+        # The partial slivers the whole-sample sum missed, at each end.
+        if seg:
+            v0, v1 = v_at(t_from), v_at(seg[0][0])
+            if v0 is not None and v1 is not None:
+                total += 0.5 * (v0 + v1) * (seg[0][0] - t_from)
+            v0, v1 = v_at(seg[-1][0]), v_at(t_to)
+            if v0 is not None and v1 is not None:
+                total += 0.5 * (v0 + v1) * (t_to - seg[-1][0])
+        return total
 
     # ------------------------------------------------------------- calibration
     if args.calibrate:
@@ -643,16 +713,18 @@ def main():
         for i in range(args.runs):
             say('')
             say(f'--- run {i+1}/{args.runs} ---')
-            try:
-                input('  Car at the START mark, then press Enter... ')
-            except EOFError:
-                pass
+            if not args.sim_tape:
+                try:
+                    input('  Car at the START mark, then press Enter... ')
+                except EOFError:
+                    pass
 
             # Stationary window first: removes static tilt from accel-x and gyro drift.
             t_bias0 = time.time()
             time.sleep(1.5)
             ab, gb = imu_bias(t_bias0, time.time())
 
+            truth_start = truth[-1] if truth else (0.0, 0.0)
             t_start = time.time()
             t = Twist()
             t.linear.x = float(args.speed)
@@ -714,13 +786,21 @@ def main():
                 say('  IMU: no data (is /imu publishing?)')
 
             total = None
-            try:
-                raw = input('  tape: START mark to final rest, in mm '
-                            '(blank to discard): ')
-                if raw.strip():
-                    total = float(raw.strip()) / 1000.0
-            except (EOFError, ValueError):
-                pass
+            if args.sim_tape:
+                # Straight-line distance from where the run began to where it ended --
+                # exactly what a tape between the two marks would read.
+                if len(truth) > 2:
+                    total = math.hypot(truth[-1][0] - truth_start[0],
+                                       truth[-1][1] - truth_start[1])
+                    say(f'  sim ground-truth total: {total*1000:.0f} mm')
+            else:
+                try:
+                    raw = input('  tape: START mark to final rest, in mm '
+                                '(blank to discard): ')
+                    if raw.strip():
+                        total = float(raw.strip()) / 1000.0
+                except (EOFError, ValueError):
+                    pass
             if total is None or v_meas is None:
                 say('  run discarded')
                 hard_stop()

@@ -140,3 +140,44 @@ def test_zero_command_stops_it():
         s, vx, _ = step(s, 0.0, 0.0, 0.01)
         assert vx == 0.0
     assert s.odom_x == pytest.approx(moved, abs=1e-12)
+
+
+# ------------------------------------------- braking test fixture (known values)
+def test_fixture_off_by_default_is_instant():
+    """decel=0 must keep the honest no-physics behaviour."""
+    s = RobotState()
+    s, vx, _ = step(s, 0.15, 0.0, 0.01)
+    assert vx == 0.15
+
+
+def test_dead_time_expires_and_the_robot_actually_moves():
+    """Regression: comparing the command against the EXECUTED speed re-armed the dead
+    timer every tick, so it never expired and the robot never moved. The whole braking
+    dry run reported 0 mm stopping distances before this was found."""
+    s = RobotState()
+    for _ in range(300):                 # 3 s at 100 Hz, dead time 0.25 s
+        s, vx, _ = step(s, 0.15, 0.0, 0.01, decel=1.5, dead_time=0.25)
+    assert vx == pytest.approx(0.15, abs=1e-6), 'never reached commanded speed'
+    assert s.x > 0.3, f'barely moved: {s.x:.3f} m'
+
+
+def test_dead_time_is_actually_honoured():
+    s = RobotState()
+    for _ in range(20):                  # 0.2 s, inside a 0.25 s dead time
+        s, vx, _ = step(s, 0.15, 0.0, 0.01, decel=1.5, dead_time=0.25)
+    assert vx == 0.0, 'moved before the dead time elapsed'
+
+
+def test_braking_distance_matches_the_known_fixture_values():
+    """With dead time T and deceleration a, stopping from v should take
+    v*T + v^2/(2a). This is the ground truth the measurement tool must recover."""
+    T, A, v = 0.25, 1.5, 0.15
+    s = RobotState()
+    for _ in range(400):                 # get up to speed
+        s, _, _ = step(s, v, 0.0, 0.01, decel=A, dead_time=T)
+    x0 = s.x
+    for _ in range(400):                 # command zero and coast to rest
+        s, _, _ = step(s, 0.0, 0.0, 0.01, decel=A, dead_time=T)
+    expected = v * T + v * v / (2 * A)
+    assert (s.x - x0) == pytest.approx(expected, rel=0.05), \
+        f'stopped in {(s.x-x0)*1000:.0f} mm, expected {expected*1000:.0f} mm'

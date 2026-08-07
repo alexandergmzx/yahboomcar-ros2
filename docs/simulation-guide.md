@@ -145,6 +145,48 @@ after the four in [`porting-notes.md`](porting-notes.md).
 | **Nav2 reaches a goal** | (0.05, −0.05) → (0.62, 0.00) against a goal of (0.80, 0.00): 177 mm error, peak 0.26 m/s |
 | The smoke test can fail | exits 2 with the reason named when Nav2 is absent |
 
+## The braking tool, dry-run end to end before the floor
+
+`tools/measure_braking.py` had never executed its full chain — calibrate, drive, measure,
+subtract the run-up, fit, envelope. Its fit was unit-tested against synthetic numbers, but
+a bug anywhere else would have surfaced *on the floor*, spending the session it was meant
+to serve.
+
+So the simulator was given a **known** braking response — `decel: 1.5 m/s²`,
+`dead_time: 0.25 s`, an explicitly-labelled test fixture in `physics.py`, not a model of
+this car — and the whole protocol was run against it with `--sim-tape` substituting
+ground truth for a tape measure.
+
+**It found two real bugs and one measurement bias:**
+
+1. **The dead timer re-armed every tick**, so it never expired and the robot never moved.
+   The entire first dry run reported 0 mm stopping distances. Caught in the fixture, not
+   the tool, but it would have looked exactly like a tool failure.
+
+2. **`integrate()` summed only whole samples inside the window.** `/odom_raw` is 11 Hz, so
+   including or excluding one sample at each end costs up to 90 ms of travel — an error
+   **proportional to speed**. This one matters on the floor too: odom is 11 Hz there as
+   well. Fixed by interpolating at both boundaries.
+
+3. Ground truth was published at the firmware's 11 Hz, adding the same speed-proportional
+   error to the "tape". Moved to physics rate — it is a debug channel, not part of the
+   contract.
+
+**The lesson worth carrying to the floor:** a linear-in-speed measurement bias is
+*indistinguishable from dead time*. It lands in `T_stop` and is stolen from the quadratic
+term, so a few millimetres of bias wrecks the deceleration estimate:
+
+| | `T_stop` (truth 250 ms) | `a` (truth 1.5 m/s²) |
+|---|---|---|
+| whole-sample integration | 297 ms | **0.54** |
+| boundary-interpolated | 283 ms | **1.14**, 90% CI [0.93, 1.48] |
+
+Same data, same fit, one integration fix — and `a` moves by more than a factor of two. On
+the floor the analogous bias is calibration error in `k`, which multiplies a run-up far
+longer than the stop. It is why the calibration gate is strict.
+
+Simulator results live in `braking_runs_sim.json`, never the hardware store.
+
 ## Honest limits
 
 - **Nav2 tuned here will need retuning on the floor.** No wheel dynamics, no latency. What
