@@ -231,6 +231,31 @@ arbiter. That is a **command-arbitration** problem, and it belongs with sensor f
 rather than with the safety filter. Until it is designed, the operating rule stands:
 **only run governed launch files, and watch the log for BYPASSED.**
 
+## The gyro is intermittently dead
+
+Measured across every bag recorded on 2026-08-06 — **dead in 4 of 6**, live in two, with
+live and dead runs minutes apart:
+
+| bag | gyro-z std | |
+|---|---|---|
+| `selftest-004042` | 0.305 | live |
+| `selftest-004114` | **0.000000** | **dead** |
+| `selftest-004659` | **0.000000** | **dead** |
+| `selftest-004728` | **0.000000** | **dead** |
+| `selftest-004826` | 0.150 | live |
+| `twin_dataset` | **0.000000** | **dead** |
+
+The accelerometer stays live throughout, so it is the gyro specifically, and a power
+cycle has recovered it before.
+
+**A stuck channel is worse than a silent one.** A topic that stops publishing fails
+loudly; a gyro pinned at exactly zero publishes at full rate and reads as *"the robot is
+not rotating"*. `robot_localization` will fuse that as an observation and shrink its
+covariance on the strength of it. The consequence is a filter that is confident about a
+rotation it cannot see.
+
+`tools/sensor_health.py` detects it and exits nonzero. Run it before every session.
+
 ## What has actually been tested
 
 | Claim | Evidence |
