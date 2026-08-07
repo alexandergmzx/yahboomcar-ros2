@@ -362,13 +362,22 @@ def main():
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             say('  SIGKILL sent to the governor process group at t=0')
             time.sleep(args.stop_timeout + 0.5)
-            # POST-CONDITION, the check that cannot race: after the kill the graph must
-            # contain NO governor at all. A survivor here -- however it got here, and
-            # however slowly it was discovered -- means the crash scenario never
-            # actually existed and any observed stop is ITS work, not evidence about
-            # the firmware. The pre-poll narrows the window; this closes it.
-            survivors = [n for n, _ in node.get_node_names_and_namespaces()
-                         if n == 'cmd_vel_governor']
+            # POST-CONDITION: after the kill the graph must contain NO governor. A
+            # survivor -- however it got here -- means the crash scenario never
+            # existed and any observed stop is ITS work. POLLED over a window, not a
+            # snapshot: an audit pointed out (correctly, for the third time in this
+            # class) that one graph look can miss a slowly-discovered survivor. A
+            # window is still discovery-bound -- DDS offers nothing absolute -- but a
+            # live governor keeps publishing and announcing itself, so several seconds
+            # of watching is the strongest witness available from software.
+            survivors = []
+            post_end = time.time() + 8.0
+            while time.time() < post_end:
+                survivors = [n for n, _ in node.get_node_names_and_namespaces()
+                             if n == 'cmd_vel_governor']
+                if survivors:
+                    break
+                time.sleep(1.0)
             br = find_rest(mon.samples, t_ref, args.stop_timeout)
             if survivors:
                 say(f'  INVALID: a governor SURVIVED the kill ({survivors}) -- the')

@@ -213,11 +213,17 @@ def main():
         lambda m: odom_twist.append((time.time(), m.twist.twist.linear.x,
                                      m.twist.twist.angular.z)), 10)
     # Body witness, present only in simulation; the real firmware cannot publish it.
+    # Position AND yaw: an x/y-only witness passed a robot SPINNING IN PLACE as
+    # stationary. Audit finding.
     truth_pose = []
-    node.create_subscription(
-        Odometry, '/sim/ground_truth',
-        lambda m: truth_pose.append((time.time(), m.pose.pose.position.x,
-                                     m.pose.pose.position.y)), 10)
+
+    def _on_truth(m):
+        q = m.pose.pose.orientation
+        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
+                         1 - 2 * (q.y * q.y + q.z * q.z))
+        truth_pose.append((time.time(), m.pose.pose.position.x,
+                           m.pose.pose.position.y, yaw))
+    node.create_subscription(Odometry, '/sim/ground_truth', _on_truth, 10)
 
     def cancel_and_verify(handle, why):
         """Cancel, CHECK the response, publish EXPLICIT ZEROS, then OBSERVE at rest.
@@ -268,28 +274,43 @@ def main():
                 from action_msgs.srv import CancelGoal
                 cli = node.create_client(CancelGoal,
                                          '/navigate_to_pose/_action/cancel_goal')
+                # STATUS-DRIVEN, not time-driven: a fixed repeat window guesses at
+                # how late a goal can be accepted, and there is no proven bound. The
+                # action's own status array is the witness -- repeat cancel-all until
+                # it shows no ACCEPTED/EXECUTING/CANCELING goal, or a hard cap trips.
+                from action_msgs.msg import GoalStatusArray
+                live_status = {'active': None}
+
+                def _on_status(msg):
+                    live_status['active'] = sum(
+                        1 for g in msg.status_list
+                        if g.status in (GoalStatus.STATUS_ACCEPTED,
+                                        GoalStatus.STATUS_EXECUTING,
+                                        GoalStatus.STATUS_CANCELING))
+                node.create_subscription(GoalStatusArray,
+                                         '/navigate_to_pose/_action/status',
+                                         _on_status, 10)
                 if cli.wait_for_service(timeout_sec=5.0):
                     rounds = 0
-                    end_ca = time.time() + 12.0
-                    while time.time() < end_ca:
+                    hard_cap = time.time() + 60.0
+                    while time.time() < hard_cap:
                         fut = cli.call_async(CancelGoal.Request())   # zero UUID = all
                         tc = time.time()
                         while not fut.done() and time.time() - tc < 5.0:
                             time.sleep(0.1)
                         rounds += 1
                         resp = fut.result() if fut.done() else None
-                        if resp is not None:
-                            n_cancel = len(resp.goals_canceling)
-                            code = resp.return_code
-                            if n_cancel:
-                                say(f'  round {rounds}: cancelling {n_cancel} goal(s)')
-                            elif code == 0:
-                                acked = True     # nothing running -- the goal state
-                            else:
-                                say(f'  round {rounds}: server return_code {code}')
+                        if resp is not None and resp.goals_canceling:
+                            say(f'  round {rounds}: cancelling '
+                                f'{len(resp.goals_canceling)} goal(s)')
                         time.sleep(2.0)
-                    say(f'  cancel-all repeated {rounds}x over 12 s; final state: '
-                        + ('no goals running' if acked else 'UNCONFIRMED'))
+                        if live_status['active'] == 0:
+                            acked = True
+                            break
+                    say(f'  cancel-all: {rounds} round(s); status array shows '
+                        + ('NO live goals' if acked else
+                           f'{live_status["active"]} live/unknown -- UNCONFIRMED, '
+                           'kill the nav launch'))
                 else:
                     say('  WARNING: cancel service absent')
             except Exception as e:
@@ -337,11 +358,14 @@ def main():
         tr = [s for s in truth_pose if s[0] > time.time() - 2.5]
         if len(tr) >= 3:
             d = math.hypot(tr[-1][1] - tr[0][1], tr[-1][2] - tr[0][2])
-            if d <= 0.01:
-                say(f'  VERIFIED AT REST (BODY, via ground truth): moved {d*1000:.0f} '
-                    'mm over the window')
+            turn = abs(math.atan2(math.sin(tr[-1][3] - tr[0][3]),
+                                  math.cos(tr[-1][3] - tr[0][3])))
+            if d <= 0.01 and turn <= 0.03:
+                say(f'  VERIFIED AT REST (BODY): moved {d*1000:.0f} mm, turned '
+                    f'{math.degrees(turn):.1f} deg over the window')
                 return acked and nav2_quiet
-            say(f'  *** BODY STILL MOVING: ground truth moved {d*1000:.0f} mm. ***')
+            say(f'  *** BODY STILL MOVING: {d*1000:.0f} mm translation, '
+                f'{math.degrees(turn):.1f} deg rotation. ***')
             return False
         recent = [s for s in odom_twist if s[0] > time.time() - 2.0]
         if not recent:
@@ -392,10 +416,9 @@ def main():
     except Exception:
         cancel_and_verify(handle, 'exception while waiting for the result')
         raise
-    finally:
-        # The goal is settled or being handled; stop intercepting signals.
-        signal.signal(signal.SIGINT, signal.SIG_DFL)
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    # Handlers stay installed: the timeout branch below runs a LONG cancel+verify,
+    # and restoring SIG_DFL first meant a SIGTERM during that window terminated with
+    # the goal live and nothing zeroed. Audit finding. Restored after cleanup.
 
     timed_out = not result_future.done()
     if timed_out:
@@ -404,6 +427,8 @@ def main():
         # moving robot is the worst possible response to a timeout.
         say('')
         cancel_and_verify(handle, f'timed out after {args.timeout:.0f} s')
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     end = pose_in_goal_frame() or start
     err = math.hypot(end[0] - args.x, end[1] - args.y)

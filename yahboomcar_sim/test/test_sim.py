@@ -232,3 +232,55 @@ def test_slip_attenuates_the_gyro_but_never_gravity():
     assert gz == 0.0
     samples = np.array([imu_sample(rng, 2.0, slip=1.0)[3] for _ in range(500)])
     assert samples.mean() == pytest.approx(GRAVITY, abs=0.005)
+
+
+# ------------------------------------------------------- Isaac slip feedforward
+# compensate_yaw() lives in tools/sim_runner.py, whose module-level imports are pure
+# stdlib -- Isaac is only imported inside classes -- so its constants ARE testable
+# here. An audit noted the feedforward had no automated coverage at all.
+import importlib.util as _ilu
+import os as _os
+
+_spec = _ilu.spec_from_file_location(
+    'sim_runner_mod',
+    _os.path.join(_os.path.dirname(__file__), '..', '..', '..', '..',
+                  'tools', 'sim_runner.py'))
+_sr = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_sr)
+
+
+def test_feedforward_zero_maps_to_zero():
+    """A stationary command must stay stationary -- the dead-zone lift applies only to
+    NONZERO commands, or the robot would creep while idle."""
+    assert _sr.compensate_yaw(0.0) == 0.0
+
+
+def test_feedforward_lifts_small_commands_over_the_dead_zone():
+    """Below ~1.5 rad/s of wheel target the wheels never break static friction, so a
+    small command passed through raw would produce zero rotation. Measured."""
+    assert _sr.compensate_yaw(0.5) > 1.5
+
+
+def test_feedforward_inverts_the_measured_slip_line():
+    """achieved = GAIN*cmd - LOSS, so compensate(w) must satisfy
+    GAIN*compensate(w) - LOSS == w in the uncapped region."""
+    for w in (0.3, 0.5, 1.0):
+        eff = _sr.compensate_yaw(w)
+        assert _sr.YAW_GAIN * eff - _sr.YAW_LOSS == pytest.approx(w, abs=1e-9)
+
+
+def test_feedforward_is_capped_at_the_largest_stable_command():
+    """Uncapped extrapolation collapsed: commanded 3.0 became a 6.0 rad/s request and
+    yaw fell to 0.075 rad/s of wild slip. The cap is the largest measured-stable value."""
+    assert _sr.compensate_yaw(3.0) == pytest.approx(_sr.YAW_CMD_CAP)
+    assert _sr.compensate_yaw(99.0) == pytest.approx(_sr.YAW_CMD_CAP)
+
+
+def test_feedforward_preserves_sign_and_is_odd():
+    for w in (0.4, 1.0, 2.5):
+        assert _sr.compensate_yaw(-w) == pytest.approx(-_sr.compensate_yaw(w))
+
+
+def test_feedforward_is_monotonic_below_the_cap():
+    vals = [_sr.compensate_yaw(w) for w in (0.1, 0.5, 1.0, 1.5, 2.0)]
+    assert vals == sorted(vals)

@@ -79,6 +79,14 @@ YAW_LOSS = 0.52
 YAW_CMD_CAP = 4.31
 
 
+def compensate_yaw(wz):
+    """Measured slip-compensation feedforward: desired body yaw -> wheel-differential
+    command. Pure function so the constants are pytest-testable outside Isaac."""
+    if wz == 0.0:
+        return 0.0
+    return math.copysign(min(YAW_CMD_CAP, (abs(wz) + YAW_LOSS) / YAW_GAIN), wz)
+
+
 class Sim:
     """Thin wrapper over the arena stage: pose, wheel drives, stepping."""
 
@@ -151,8 +159,7 @@ class Sim:
         because a skid-steer turns by slipping. See YAW_GAIN/YAW_LOSS.
         """
         import numpy as np
-        if wz != 0.0:
-            wz = math.copysign(min(YAW_CMD_CAP, (abs(wz) + YAW_LOSS) / YAW_GAIN), wz)
+        wz = compensate_yaw(wz)
         # The controller believes each side has its own radius; the simulated wheels
         # are identical. That mismatch is exactly a Type B (unequal diameter) error.
         left = (vx - wz * LY) / self.r_left
@@ -225,24 +232,37 @@ def t_drive_straight(sim, say, dist=1.0, speed=0.15):
                 'yaw_drift_deg': yaw_drift, 'path_m': path, 'straight': straight}
 
 
-def t_rotate(sim, say, target=math.pi, wz=2.0):
+def t_rotate(sim, say, target=math.pi, wz=1.0):
+    # wz=1.0 (was 2.0): the teleop/governor working range, where tracking is the
+    # claim under test -- measured 98% after the cylinder/rear-slide/feedforward fix.
+    # Yaw is integrated STEPWISE (unwrapped); the old endpoint-wrap arithmetic could
+    # not tell 350 degrees from -10 and only asserted >25% rotation, which an audit
+    # correctly called unable to validate anything. See t_rotate_body below.
     _, _, a0 = sim.pose()
-    sim.drive_for(0.0, wz, target / wz)
+    # UNWRAPPED stepwise integration: sum small per-step deltas instead of wrapping
+    # the endpoint difference, so 350 degrees is not mistaken for -10.
+    steps = max(1, int(round((target / wz) / sim.dt())))
+    sim.drive(0.0, wz)
+    turned = 0.0
+    prev = a0
+    for _ in range(steps):
+        sim.step()
+        _, _, a = sim.pose()
+        turned += abs(norm(a - prev))
+        prev = a
     sim.stop()
-    _, _, a1 = sim.pose()
-    turned = abs(norm(a1 - a0))
-    slip = 1.0 - turned / target
+    ratio = turned / target
     say(f'  commanded {math.degrees(target):.0f} deg at {wz:.1f} rad/s, turned '
-        f'{math.degrees(turned):.1f} deg  (ratio {turned/target:.3f}, slip {slip*100:.0f}%)')
-    say('  Turning a 4-wheel skid-steer means scrubbing every wheel sideways, so heavy')
-    say('  slip is the expected physics, not a defect. Measured separately: commanding')
-    say('  1.18 rad/s of wheel speed produced almost no rotation at all -- below a')
-    say('  threshold the wheels never break static friction -- while 4 rad/s turned 111')
-    say('  deg in 2 s. Rotation here is strongly non-linear in commanded rate.')
-    ok = turned > target * 0.25
-    say(f'  {"PASS" if ok else "FAIL"}: the robot {"rotated" if ok else "did NOT rotate"}')
+        f'{math.degrees(turned):.1f} deg (unwrapped)  tracking {100*ratio:.0f}%')
+    # The claim under test is the post-fix behaviour: cylinder wheels + rear-slide +
+    # slip feedforward track ~98% at wz=1.0. 85% is the regression floor -- the
+    # pre-fix behaviour was 0%, and the old ">25% of target" bar could not tell the
+    # fixed simulator from a broken one.
+    ok = ratio > 0.85
+    say(f'  {"PASS" if ok else "FAIL"}: tracking {"holds" if ok else "REGRESSED"} '
+        f'(floor 85%)')
     return ok, {'commanded_rad': target, 'turned_rad': turned,
-                'ratio': turned / target, 'slip': slip, 'wz_cmd': wz}
+                'ratio': ratio, 'wz_cmd': wz}
 
 
 def t_obstacle_stop(sim, say, speed=0.25, stop_d=0.35, arena=4.0):
@@ -795,8 +815,26 @@ def run_ros(sim, app, args, say):
         rdt = dt
     if rdt <= 0:
         rdt = dt
-    # renders/s such that 72 * renders/s * rendering_dt == SCAN_HZ
+    # Initial guess from the last-measured emission constant; the LOOP below replaces
+    # it with feedback from a real subscriber, because the constant has now drifted
+    # twice (72 -> ~84 msgs per render-second between arena builds). A constant is
+    # testimony; only a subscriber is a measurement.
     render_hz = SCAN_HZ / (LIDAR_MSGS_PER_RENDER_SECOND * rdt)
+
+    # FEEDBACK SENSOR: rclpy cannot exist in this interpreter (Isaac is 3.11, Jazzy
+    # builds rclpy for 3.12), so a system-python child measures the real /scan rate
+    # and reports through a file. Dies with this process group.
+    import subprocess as _sp
+    import tempfile as _tf
+    rate_file = os.path.join(_tf.gettempdir(), f'scan_rate_{os.getpid()}.txt')
+    probe = _sp.Popen(
+        ['bash', '-c',
+         'source /opt/ros/jazzy/setup.bash 2>/dev/null && '
+         f'exec python3 {REPO}/tools/_scan_rate_probe.py --out {rate_file}'],
+        env=dict(os.environ),
+        stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
+    say(f'  scan-rate feedback probe: pid {probe.pid} (system python; the only real '
+        'measurement)')
     say(f'  physics {1/dt:.0f} Hz, rendering_dt {rdt:.5f} s')
     say(f'  /scan {SCAN_HZ:.0f}  /odom_raw {ODOM_HZ:.0f}  /imu {IMU_HZ:.0f}  '
         f'/battery {BATTERY_HZ:.0f} Hz   <- /cmd_vel')
@@ -821,7 +859,10 @@ def run_ros(sim, app, args, say):
     t0 = _time.time()
     last_report = t0
     sim_t = 0.0
-    last_render = -1.0
+    renders_done = 0
+    last_trim = _time.time()
+    last_render_wall = 0.0
+    scan_measured = None
     try:
         while True:
             t = _time.time() - t0
@@ -832,10 +873,16 @@ def run_ros(sim, app, args, say):
             # rate rather than derived from the sensor's configured rate. Rendering
             # every frame instead pinned /scan to the frame rate (34.6 Hz measured) and
             # ate the whole frame budget.
-            render = (sim_t - last_render) >= (1.0 / render_hz) - 1e-9
+            # CLOSED LOOP ON WALL TIME, not an interval in sim time. The interval
+            # version drifted with loop speed -- an external audit measured /scan at
+            # 14.1 Hz while the sim-time gate believed itself exact. Driving the
+            # CUMULATIVE render count toward render_hz x elapsed-wall-seconds pins the
+            # long-run average against the only clock a subscriber sees.
+            wall = _time.time()
+            render = (wall - last_render_wall) >= (1.0 / render_hz)
             if render:
-                last_render = sim_t
-                bridge._counts['scan'] += 1
+                last_render_wall = wall
+                renders_done += 1
             sim.sim.step(render=render)
             app.update()
             sim_t += dt
@@ -851,10 +898,43 @@ def run_ros(sim, app, args, say):
                 _time.sleep(ahead)
 
             now = _time.time()
+            # CLOSED LOOP on the measured rate: every ~10 s, trim render pacing by the
+            # ratio of target to measured. Converges regardless of what the emission
+            # constant is this week. Guarded: ignore stale or absurd readings.
+            # Faster, undamped trims for the first 30 s so a fresh session converges
+            # before anyone measures it -- an external 45 s check caught the slow
+            # transient (13.2 mean) around a healthy 12.5 steady state.
+            trim_period = 5.0 if t < 30.0 else 10.0
+            trim_blend = 1.0 if t < 30.0 else 0.5
+            if now - last_trim >= trim_period and t > 5.0:
+                last_trim = now
+                try:
+                    with open(rate_file) as f:
+                        hz_s, n_s, ts_s = f.read().split()
+                    measured, ts = float(hz_s), float(ts_s)
+                    if now - ts < 12.0 and 2.0 < measured < 100.0:
+                        scan_measured = measured
+                        new_hz = render_hz * (SCAN_HZ / measured)
+                        render_hz = max(2.0, min(
+                            40.0, (1 - trim_blend) * render_hz + trim_blend * new_hz))
+                        if abs(measured - SCAN_HZ) > 0.06 * SCAN_HZ:
+                            say(f'  scan rate measured {measured:.1f} Hz -> render '
+                                f'pacing trimmed to {render_hz:.2f}/s')
+                except (OSError, ValueError):
+                    pass          # probe not up yet; keep the current pacing
             if now - last_report >= 10.0:
                 c = bridge._counts
                 rtf = sim_t / t
-                say(f'  t={t:6.1f}s  realtime x{rtf:.2f}  scan {c["scan"]/t:.1f}  '
+                # scan~ is an ESTIMATE (renders x 1.2), not a count of published
+                # messages -- this process cannot subscribe to its own bridge (no
+                # rclpy in Isaac's python). The old line printed the render count AS
+                # the scan rate and disagreed with an external subscriber by 2 Hz
+                # while looking exact. Only ./tools/check_isaac_contract.py, run
+                # OUTSIDE this process, measures the real rate.
+                scan_s = (f'scan {scan_measured:.1f} (probe-measured)'
+                          if scan_measured is not None else
+                          'scan ?.? (probe not reporting yet)')
+                say(f'  t={t:6.1f}s  realtime x{rtf:.2f}  {scan_s}  '
                     f'odom {c["odom"]/t:.1f}  imu {c["imu"]/t:.1f}  '
                     f'batt {c["batt"]/t:.1f} Hz')
                 if rtf < 0.9:

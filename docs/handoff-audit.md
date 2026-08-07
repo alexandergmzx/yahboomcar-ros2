@@ -628,3 +628,34 @@ fixed in three measured steps. The trail matters as much as the fix, because two
   yaw saturates ≈1.2 rad/s. Both inside what teleop and the governor use (1.0 / 1.5).
 - The low-target static-friction dead zone (wheels at 0 % below ≈1.5 rad/s target)
   is bridged by the feedforward, not explained.
+
+
+---
+
+# Seventh audit (commit `f26170f`) — verdict NO-GO, six findings
+
+| # | Finding | Outcome |
+|---|---|---|
+| 1 | Nav2 "at rest" ignored rotation (x/y-only witness passes a spinning robot); cancel-all window was a 12 s guess against unbounded goal acceptance; signal handlers restored *before* the long cleanup | ✅ yaw added to the body witness (≤0.03 rad over the window); cancel-all is now **status-driven** — repeats until the action's own status array shows no live goal (60 s hard cap, screams if unconfirmed); handlers stay installed through the entire cancel+verify |
+| 2 | Physical evidence absent | ⬜ unchanged — Alex's floor session |
+| 3 | Isaac `/scan` measured 14.1 Hz externally while the internal log looked exact — it was counting renders as scans; README claimed calibration "lands on 12" | ✅ **true closed loop**: the first fix (wall-clock render counting) still failed the external check at 14.1, because the "72 msgs/render-second" constant itself had drifted (~84 after the wheel rebuild). A calibration constant is testimony. The runner now spawns a **system-python `/scan` subscriber** (`tools/_scan_rate_probe.py` — rclpy cannot exist in Isaac's 3.11) and trims render pacing against the *measured* rate. External check after convergence: **CONTRACT SATISFIED**, steady state ~12.0–12.5, and the internal log prints the probe's measurement, labelled |
+| 4 | Fail-safe post-condition was itself a single graph snapshot — the discovery race's fourth appearance | ✅ polled over 8 s; the limit is stated honestly: DDS offers nothing absolute, several seconds of watching a self-announcing process is the strongest software witness |
+| 5 | Yaw claims not regression-tested: t_rotate accepted >25 % with wrapped endpoint math; feedforward constants untested | ✅ `compensate_yaw()` extracted pure and covered by 6 pytest cases (zero-maps-to-zero, dead-zone lift, exact inverse of the measured line, cap, oddness, monotonicity); t_rotate now integrates yaw **unwrapped** stepwise and asserts ≥85 % tracking at wz = 1.0 — the pre-fix behaviour was 0 %, so the bar distinguishes fixed from broken, which >25 % could not |
+| 6 | Live twin unfinished | ⬜ unchanged — feature work |
+
+## Pattern notes
+
+**Finding 3 is the calibration warning coming true on schedule.** The `/scan` note said
+the rate "will drift if anything changes render timing" — and it drifted (12.9 → 14.1
+between sessions) while the internal log said 12.0, because the log counted renders, not
+messages. Two lessons compounded: open-loop pacing drifts, and a monitor inside the
+process being monitored is testimony, not evidence. The closed loop pins the long-run
+render rate to the wall clock; the only *measurement* is still the external subscriber.
+
+**Finding 1's rotation-blind witness** is the second time an at-rest verdict was too
+narrow (silence-as-stop was the first). The witness now covers both degrees of freedom
+the robot has.
+
+**Finding 4**: the discovery race keeps reappearing wherever a graph is consulted once.
+Every consult is now a window, and where a window still cannot close the case, the docs
+say so instead of implying it can.
