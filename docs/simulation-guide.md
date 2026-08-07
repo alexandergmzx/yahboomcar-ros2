@@ -142,7 +142,7 @@ after the four in [`porting-notes.md`](porting-notes.md).
 | SLAM builds a closed map | 4.08 × 4.08 m against a 4 × 4 m arena — the dimensions are an independent check on the geometry |
 | Map saves and reloads | `sim_arena_4x4.pgm` / `.yaml`, 2 cm resolution |
 | Nav2 activates fully | all seven lifecycle nodes `active`, zero aborts |
-| **Nav2 reaches a goal** | (0.05, −0.05) → (0.62, 0.00) against a goal of (0.80, 0.00): 177 mm error, peak 0.26 m/s |
+| **Nav2 reaches a goal** | Navigated, peak 0.26 m/s. **Accuracy RETRACTED** — the 177 mm figure compared an `odom`-frame pose against a `map`-frame goal and ignored the action status. See `tools/nav2_smoke.py`. |
 | The smoke test can fail | exits 2 with the reason named when Nav2 is absent |
 
 ## The braking tool, dry-run end to end before the floor

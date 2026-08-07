@@ -18,9 +18,24 @@ found and fixed to get that far -- but configuring is not navigating. A stack ca
 every plugin, accept a goal, publish a plan and still never move, and watching RViz is
 not a test because nothing fails.
 
-So this asserts: the action server exists, the goal is accepted, the robot ENDS UP within
-tolerance of where it was sent, and it did so within a timeout. Anything else exits
-nonzero.
+So this asserts: the action server exists, the goal is accepted, the action reports
+SUCCEEDED, and the robot ENDS UP within tolerance of where it was sent, measured in the
+frame the goal was expressed in. Anything else exits nonzero.
+
+TWO THINGS THIS USED TO GET WRONG, both found by audit, and the reason the previously
+reported "177 mm" figure has been retracted rather than restated:
+
+  * IT COMPARED FRAMES THAT ARE NOT THE SAME FRAME. The goal is in `map`; the position
+    came from /odom, which is in `odom`. They differ by exactly the map->odom transform
+    -- SLAM's running correction for accumulated odometry error, measured in this repo
+    jumping by up to 125 mm (docs/rviz-guide.md). Near the origin of a fresh session the
+    two nearly coincide, which is why the mistake produced a plausible number instead of
+    an obviously wrong one. Position now comes from TF map->base_link.
+
+  * IT NEVER CHECKED THE ACTION STATUS. It waited for the result future to complete and
+    then judged distance alone -- but ABORTED and CANCELED goals also complete. A Nav2
+    that gave up one metre from the goal, having drifted close enough by luck, would have
+    been recorded as a pass.
 
 IT DELIBERATELY DOES NOT RUN THE SAFETY GOVERNOR
 ------------------------------------------------
@@ -51,7 +66,10 @@ def main():
     ap.add_argument('--yaw', type=float, default=0.0)
     ap.add_argument('--tolerance', type=float, default=0.30, help='metres')
     ap.add_argument('--timeout', type=float, default=90.0)
-    ap.add_argument('--domain', type=int, default=55)
+    # 66 is what tools/simctl uses; this defaulted to 55, so the documented
+    # `./tools/nav2_smoke.py --x 0.8` against a simctl simulation found nothing.
+    ap.add_argument('--domain', type=int, default=66)
+    ap.add_argument('--goal-frame', default='map')
     ap.add_argument('--check-only', action='store_true')
     ap.add_argument('--i-accept-driving-unprotected', action='store_true',
                     help='allow this to command a REAL robot. Nav2 bypasses the safety '
@@ -62,12 +80,14 @@ def main():
     os.environ.setdefault('ROS_DOMAIN_ID', str(args.domain))
 
     import rclpy
+    from action_msgs.msg import GoalStatus
     from rclpy.action import ActionClient
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.node import Node
     from geometry_msgs.msg import PoseStamped, Twist
     from nav2_msgs.action import NavigateToPose
     from nav_msgs.msg import Odometry
+    import tf2_ros
 
     lines = []
 
@@ -84,10 +104,25 @@ def main():
     node.create_subscription(
         Twist, '/cmd_vel',
         lambda m: cmds.append((m.linear.x, m.angular.z)), 10)
+    tf_buffer = tf2_ros.Buffer()
+    tf_listener = tf2_ros.TransformListener(tf_buffer, node)      # noqa: F841
     ex = SingleThreadedExecutor()
     ex.add_node(node)
     threading.Thread(target=ex.spin, daemon=True).start()
     time.sleep(3.0)
+
+    def pose_in_goal_frame():
+        """Robot position in the SAME frame the goal is expressed in, or None.
+
+        /odom is in `odom`; the goal is in `map`. Comparing them is comparing two
+        different frames, and they differ by SLAM's live map->odom correction.
+        """
+        try:
+            tr = tf_buffer.lookup_transform(
+                args.goal_frame, 'base_link', rclpy.time.Time())
+            return (tr.transform.translation.x, tr.transform.translation.y)
+        except Exception:
+            return None
 
     say('=== Nav2 smoke test ===')
 
@@ -97,7 +132,18 @@ def main():
         say('  FAIL: no /odom. Is the robot (or the simulator) running?')
         ok = False
     else:
-        say(f'  /odom present, robot at ({poses[-1][0]:+.2f}, {poses[-1][1]:+.2f})')
+        say(f'  /odom present, robot at ({poses[-1][0]:+.2f}, {poses[-1][1]:+.2f}) '
+            f'in odom')
+
+    here = pose_in_goal_frame()
+    if here is None:
+        say(f'  FAIL: no TF {args.goal_frame} -> base_link. SLAM or AMCL is not '
+            f'publishing it, so a goal in {args.goal_frame} cannot be verified. '
+            '(AMCL will not publish map->odom without an initial pose.)')
+        ok = False
+    else:
+        say(f'  TF {args.goal_frame}->base_link present, robot at '
+            f'({here[0]:+.2f}, {here[1]:+.2f}) in {args.goal_frame}')
 
     # WHICH ROBOT? Nav2 on the real car drives with nothing between it and the motors.
     names = [n for n, _ in node.get_node_names_and_namespaces()]
@@ -132,10 +178,10 @@ def main():
         say('  check-only: prerequisites met, commanding nothing')
         return 0
 
-    start = poses[-1]
+    start = pose_in_goal_frame()
     goal = NavigateToPose.Goal()
     goal.pose = PoseStamped()
-    goal.pose.header.frame_id = 'map'
+    goal.pose.header.frame_id = args.goal_frame
     goal.pose.header.stamp = node.get_clock().now().to_msg()
     goal.pose.pose.position.x = args.x
     goal.pose.pose.position.y = args.y
@@ -163,16 +209,42 @@ def main():
     while not result_future.done() and time.time() - t0 < args.timeout:
         time.sleep(0.2)
 
-    end = poses[-1] if poses else start
+    timed_out = not result_future.done()
+    if timed_out:
+        # CANCEL, do not merely return. Returning left Nav2 still driving -- on the real
+        # robot, with no governor and no deadman in that launch, walking away from a
+        # moving robot is the worst possible response to a timeout.
+        say('')
+        say(f'  timed out after {args.timeout:.0f} s -- CANCELLING the goal')
+        try:
+            cancel = handle.cancel_goal_async()
+            tc = time.time()
+            while not cancel.done() and time.time() - tc < 10.0:
+                time.sleep(0.1)
+            say('  cancel acknowledged' if cancel.done() else
+                '  WARNING: cancel not acknowledged; the robot may still be driving')
+        except Exception as e:
+            say(f'  WARNING: cancel failed ({e}); the robot may still be driving')
+
+    end = pose_in_goal_frame() or start
     err = math.hypot(end[0] - args.x, end[1] - args.y)
     travelled = math.hypot(end[0] - start[0], end[1] - start[1])
     peak_v = max((abs(c[0]) for c in cmds), default=0.0)
     peak_w = max((abs(c[1]) for c in cmds), default=0.0)
 
+    status = result_future.result().status if not timed_out else None
+    status_name = {
+        GoalStatus.STATUS_SUCCEEDED: 'SUCCEEDED',
+        GoalStatus.STATUS_ABORTED: 'ABORTED',
+        GoalStatus.STATUS_CANCELED: 'CANCELED',
+        GoalStatus.STATUS_EXECUTING: 'EXECUTING',
+    }.get(status, f'status {status}')
+
     say('')
-    say(f'  start   ({start[0]:+.2f}, {start[1]:+.2f})')
-    say(f'  end     ({end[0]:+.2f}, {end[1]:+.2f})')
+    say(f'  start   ({start[0]:+.2f}, {start[1]:+.2f})  in {args.goal_frame}')
+    say(f'  end     ({end[0]:+.2f}, {end[1]:+.2f})  in {args.goal_frame}')
     say(f'  travelled {travelled:.2f} m, final error {err*1000:.0f} mm')
+    say(f'  action status: {status_name}')
     say(f'  Nav2 commanded up to {peak_v:.2f} m/s and {peak_w:.2f} rad/s '
         f'({len(cmds)} /cmd_vel messages)')
 
@@ -181,9 +253,16 @@ def main():
             'floor the governor would clamp this, so Nav2 would not get the speed it '
             'planned for.')
 
-    if not result_future.done():
+    if timed_out:
         say('')
         say(f'  FAIL: timed out after {args.timeout:.0f} s without a result')
+        return 1
+    # A completed future is NOT success: ABORTED and CANCELED complete too, and a Nav2
+    # that gave up while happening to be near the goal would otherwise have passed.
+    if status != GoalStatus.STATUS_SUCCEEDED:
+        say('')
+        say(f'  FAIL: Nav2 reported {status_name}, not SUCCEEDED. Distance to the goal '
+            f'is {err*1000:.0f} mm, but the navigator did not consider it reached.')
         return 1
     if err > args.tolerance:
         say('')
