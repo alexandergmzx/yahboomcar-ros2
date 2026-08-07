@@ -4,6 +4,10 @@
     ./tools/simctl start                 # full stack + RViz + patrol, 2D backend
     ./tools/simctl start --backend isaac # the same stack on Isaac physics, with a window
     ./tools/simctl stop                  # stop the robots, then tear down
+    ./tools/simctl status                # what is running, and where
+    ./tools/simctl teleop                # drive it yourself: Yahboom's keyboard keys
+    ./tools/simctl patrol                # drive an already-running simulation
+    ./tools/simctl estop --domain 20     # zero a named domain, explicitly
 
 WHICH BACKEND YOU GET, AND WHY `start` ALONE IS NOT ISAAC
 ---------------------------------------------------------
@@ -14,9 +18,6 @@ you real contact physics, collisions and a window to watch.
 
 Both replace only the FIRMWARE. Everything above -- bringup, the EKF, the governor, SLAM,
 Nav2, RViz -- is identical and cannot tell them apart.
-    ./tools/simctl status                # what is running, and where
-    ./tools/simctl patrol                # drive an already-running simulation
-    ./tools/simctl estop --domain 20     # zero a named domain, explicitly
 
 WHY THIS EXISTS
 ---------------
@@ -501,6 +502,75 @@ def cmd_patrol(args):
               args.domain, background=False).returncode
 
 
+def sim_target(domain):
+    """-> 'hardware' | 'simulator' | 'nothing'. Same evidence rules as the shared guard.
+
+    A simulator is recognised by POSITIVE evidence, two ways: the `fake_robot` node
+    (2D backend), or the /sim/ground_truth topic -- because the ISAAC backend advertises
+    no ROS nodes at all, which is how the patrol once refused a healthy simulator while
+    everything else looked fine. Hardware always wins: if YB_Car_Node is present, this is
+    the car's domain no matter what else is on it.
+    """
+    out = ros_eval(
+        'rclpy.init(); n=Node("simctl_target"); time.sleep(2.5)\n'
+        'names=[x for x,_ in n.get_node_names_and_namespaces()]\n'
+        'topics=[t for t,_ in n.get_topic_names_and_types()]\n'
+        'real="YB_Car_Node" in names\n'
+        'sim="fake_robot" in names or "/sim/ground_truth" in topics\n'
+        'print("TARGET", "hardware" if real else "simulator" if sim else "nothing")\n'
+        'sys.stdout.flush(); os._exit(0)\n', domain, timeout=30)
+    return out.split('TARGET')[-1].strip() if 'TARGET' in out else 'nothing'
+
+
+def cmd_teleop(args):
+    """The vendor's own keyboard -- u i o / j k l / m , . -- against the simulator.
+
+    Runs `ros2 run yahboomcar_ctrl yahboom_keyboard` UNMODIFIED, in the foreground with
+    the terminal attached (it reads keys via termios, so it cannot live in the background
+    behind a log file the way everything else simctl starts does).
+
+    If the governor is running on the domain, the keyboard is remapped onto /cmd_vel_raw
+    so the governor stays in the loop, exactly as safe_teleop_launch.py does on the real
+    robot. Without a governor the remap would drive nothing -- /cmd_vel_raw has no
+    forwarder -- so it publishes /cmd_vel directly, which is the bare vendor behaviour.
+    """
+    print(f'=== simctl teleop  (domain {args.domain}) ===')
+    target = sim_target(args.domain)
+    if target == 'hardware':
+        print('REFUSED: YB_Car_Node is on this domain -- this is the REAL robot.')
+        print('  For hardware teleop use the governed launch instead:')
+        print('    ros2 launch yahboomcar_safety safe_teleop_launch.py')
+        return 2
+    if target == 'nothing':
+        print('No simulator on this domain. Start one first:')
+        print('  ./tools/simctl start --no-patrol')
+        return 2
+
+    governed = not args.direct and bool(running(['cmd_vel_governor'],
+                                                domain=args.domain))
+    if governed:
+        print('  governor detected: keys go to /cmd_vel_raw, governed onto /cmd_vel')
+        remap = ' --ros-args -r cmd_vel:=/cmd_vel_raw'
+    else:
+        why = '--direct' if args.direct else 'no governor running'
+        print(f'  publishing /cmd_vel directly ({why}) -- bare vendor behaviour')
+        remap = ''
+    print('  Ctrl+C to stop; the robot is left stationary.')
+    print()
+
+    # Foreground, with the TTY fully inherited: stdin for the keys, stdout for the
+    # vendor's own help text. sh() would swallow both.
+    full = (f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
+            f'export ROS_DOMAIN_ID={args.domain} && '
+            f'ros2 run yahboomcar_ctrl yahboom_keyboard{remap}')
+    rc = subprocess.run(['bash', '-c', full]).returncode
+    # The vendor's finally publishes ONE zero; make the stop stick regardless of what
+    # state the node died in. Zeros only -- same fail-safe direction as everything here.
+    zero_domain(args.domain, seconds=2.0)
+    print('\n  teleop ended; zeros published')
+    return rc
+
+
 def cmd_estop(args):
     """Explicit, so stopping the car is never a side effect of tidying up."""
     print(f'=== simctl estop  (domain {args.domain}) ===')
@@ -539,6 +609,13 @@ def main():
     st = sub.add_parser('status', help='what is running, and where')
     st.add_argument('--domain', type=int, default=SIM_DOMAIN)
     st.set_defaults(func=cmd_status)
+
+    tp = sub.add_parser('teleop',
+                        help="drive the sim with Yahboom's own keyboard (u i o / j k l)")
+    tp.add_argument('--domain', type=int, default=SIM_DOMAIN)
+    tp.add_argument('--direct', action='store_true',
+                    help='publish /cmd_vel even if a governor is running')
+    tp.set_defaults(func=cmd_teleop)
 
     p = sub.add_parser('patrol', help='drive an already-running simulation')
     p.add_argument('--domain', type=int, default=SIM_DOMAIN)
