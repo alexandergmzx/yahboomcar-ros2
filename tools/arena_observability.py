@@ -42,40 +42,22 @@ import numpy as np
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_localization'))
+sys.path.insert(0, os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_sim'))
+
+from yahboomcar_sim.arena import raycast as _raycast          # noqa: E402
+from yahboomcar_sim.arena import segments_box, segments_room   # noqa: E402
 
 
-def segments_room(w, h):
-    hw, hh = w / 2, h / 2
-    return [((-hw, -hh), (hw, -hh)), ((hw, -hh), (hw, hh)),
-            ((hw, hh), (-hw, hh)), ((-hw, hh), (-hw, -hh))]
-
-
-def segments_box(cx, cy, s):
-    h = s / 2
-    c = [(cx - h, cy - h), (cx + h, cy - h), (cx + h, cy + h), (cx - h, cy + h)]
-    return [(c[i], c[(i + 1) % 4]) for i in range(4)]
-
-
+# Geometry lives in yahboomcar_sim.arena so this tool and the simulator describe the SAME
+# room. Two definitions of a 4x4 box is two definitions that drift apart.
 def raycast(origin, segs, n_beams=360, r_max=8.0, r_min=0.12):
-    """Simulate a 360-beam scan. Returns (N, 2) hit points in the sensor frame."""
-    ox, oy = origin
-    angs = np.arange(n_beams) * (2 * math.pi / n_beams)
-    pts = []
-    for a in angs:
-        dx, dy = math.cos(a), math.sin(a)
-        best = None
-        for (x1, y1), (x2, y2) in segs:
-            ex, ey = x2 - x1, y2 - y1
-            den = dx * ey - dy * ex
-            if abs(den) < 1e-12:
-                continue
-            t = ((x1 - ox) * ey - (y1 - oy) * ex) / den      # along the ray
-            u = ((x1 - ox) * dy - (y1 - oy) * dx) / den      # along the segment
-            if t > r_min and 0.0 <= u <= 1.0 and (best is None or t < best):
-                best = t
-        if best is not None and best <= r_max:
-            pts.append((best * dx, best * dy))
-    return np.array(pts) if pts else np.zeros((0, 2))
+    """Scan from `origin`, heading irrelevant: isotropy does not depend on which beam
+    index a return lands in, only on the set of surfaces seen."""
+    r = _raycast(origin, 0.0, segs, n_beams=n_beams, r_min=r_min, r_max=r_max)
+    keep = np.isfinite(r)
+    ang = -np.pi + np.arange(n_beams) * (2 * np.pi / n_beams)
+    return np.column_stack((r[keep] * np.cos(ang[keep]),
+                            r[keep] * np.sin(ang[keep])))
 
 
 def main():

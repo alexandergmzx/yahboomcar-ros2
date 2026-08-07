@@ -1,5 +1,5 @@
 {
-  "timestamp": "20260806-145410",
+  "timestamp": "20260806-182225",
   "speed_m_s": 0.15,
   "stop_timeout_s": 3.0,
   "deadman_active": true,
@@ -12,20 +12,14 @@
     "command_cessation": {
       "title": "commands stop arriving",
       "stopped": true,
-      "time_to_stop_lo_s": 0.6215615272521973,
-      "time_to_stop_hi_s": 0.6926672458648682,
+      "time_to_stop_lo_s": 0.4351963996887207,
+      "time_to_stop_hi_s": 0.5261027812957764,
       "observation": "automatic",
       "detail": ""
     },
     "governor_sigkill": {
-      "title": "governor SIGKILLed",
-      "stopped": true,
-      "time_to_stop_lo_s": 0.6678032875061035,
-      "time_to_stop_hi_s": 0.7617199420928955,
-      "observation": "automatic",
-      "detail": ""
+      "stopped": null,
+      "detail": "no motion through governor"
     }
-  },
-  "stop_bound_s": 0.7617199420928955,
-  "stop_mechanism": "host deadman"
+  }
 }
