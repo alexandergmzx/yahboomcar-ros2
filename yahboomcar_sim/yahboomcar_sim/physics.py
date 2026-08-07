@@ -133,3 +133,44 @@ def apply_command(vx, vy, wz, max_speed=0.35, max_yaw=1.5):
     vx = max(-max_speed, min(max_speed, vx))
     wz = max(-max_yaw, min(max_yaw, wz))
     return vx, wz
+
+
+# ------------------------------------------------------------------------- IMU
+# MEASURED from three at-rest selftest bags (MicroROS-assets/bags/selftest-*):
+#
+#   bag                        accel_z mean   accel_z std   accel_x std   accel_y std
+#   selftest-20260806-004114        9.8005        0.01216       0.01705       0.01216
+#   selftest-20260806-004659        9.7983        0.03072       0.01437       0.01083
+#   selftest-20260806-004728        9.7980        0.01260       0.01451       0.01251
+#
+# Gravity here is 9.799, NOT 9.81 -- that is what this IMU actually reports, and the
+# difference is larger than the noise.
+GRAVITY = 9.799
+ACCEL_NOISE = 0.013
+
+
+def imu_sample(rng, wz, slip=0.0, accel_noise=ACCEL_NOISE, gravity=GRAVITY):
+    """One IMU reading: (gyro_z, accel_x, accel_y, accel_z).
+
+    The accelerometer is NOISY on purpose. A perfectly constant 9.81 is indistinguishable
+    from a dead accelerometer, and tools/sensor_health.py flags a zero-variance channel as
+    stuck -- correctly, since a constant reads downstream as a confident measurement. The
+    simulator failed that check for a real reason before this existed; the fix belonged
+    here, not in the check.
+
+    The GYRO is deliberately noiseless. Every at-rest bag from this robot shows gyro_z std
+    of exactly 0.00000, so there is no measurement of what a healthy gyro does at rest --
+    this one is intermittently faulty. Inventing noise would make the simulated gyro look
+    demonstrably alive while stationary when the real one does not, and would defeat
+    sensor_health.py's rotate window, which exists precisely because a gyro cannot be
+    judged at rest.
+
+    `slip` attenuates the gyro but never the accelerometer: slip means the wheels turn and
+    the body does not, so the BODY's rate is what falls. Gravity is unaffected by it.
+    """
+    return (
+        wz * (1.0 - slip),
+        float(rng.normal(0.0, accel_noise)),
+        float(rng.normal(0.0, accel_noise)),
+        float(rng.normal(gravity, accel_noise)),
+    )

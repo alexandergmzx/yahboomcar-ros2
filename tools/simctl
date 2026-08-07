@@ -2,7 +2,6 @@
 """Start and stop the simulation. One command each.
 
     ./tools/simctl start                 # full stack + RViz + patrol, 2D backend
-    ./tools/simctl start --backend isaac # same stack, Isaac physics underneath
     ./tools/simctl stop                  # stop the robots, then tear down
     ./tools/simctl status                # what is running, and where
     ./tools/simctl patrol                # drive an already-running simulation
@@ -171,11 +170,17 @@ def cmd_start(args):
 
     # 1. the robot, plus the REAL bringup stack on top of it
     if args.backend == 'isaac':
-        print('  [1/6] Isaac backend (~90 s to start)...')
-        sh(f'{os.path.expanduser("~")}/isaac/env_isaaclab/bin/python '
-           f'{REPO}/tools/sim_runner.py --ros', dom,
-           log=os.path.join(log, 'simctl-isaac.log'))
-        deadline = time.time() + 240
+        # Refuse loudly rather than start something that cannot satisfy the contract.
+        # sim_runner.py drives Isaac physics but publishes nothing to ROS, and
+        # build_arena.py has no lidar prim at all -- so an Isaac-backed run would come up
+        # with no /scan, and SLAM, Nav2 and the governor would all sit there silently
+        # waiting. A backend that half-satisfies the firmware contract is worse than no
+        # backend, because every result taken from it stops transferring without saying so.
+        print('The Isaac backend is not wired to ROS yet.')
+        print('  missing: sim_runner.py --ros (publishers), build_arena.py lidar prim')
+        print('  Isaac today runs physics only -- see tools/verify_twin.py.')
+        print('  Use the 2D backend: ./tools/simctl start')
+        return 2
     else:
         print('  [1/6] simulated firmware + real bringup...')
         sh(f'ros2 launch yahboomcar_sim sim_bringup_launch.py slip:={args.slip}', dom,

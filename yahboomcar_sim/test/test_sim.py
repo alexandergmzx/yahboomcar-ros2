@@ -12,7 +12,8 @@ import pytest
 
 from yahboomcar_sim.arena import (LIDAR_RANGE_MAX, default_arena, raycast,
                                   segments_box, segments_room)
-from yahboomcar_sim.physics import RobotState, apply_command, step
+from yahboomcar_sim.physics import (ACCEL_NOISE, GRAVITY, RobotState,
+                                    apply_command, imu_sample, step)
 
 
 # ------------------------------------------------------------------- geometry
@@ -181,3 +182,42 @@ def test_braking_distance_matches_the_known_fixture_values():
     expected = v * T + v * v / (2 * A)
     assert (s.x - x0) == pytest.approx(expected, rel=0.05), \
         f'stopped in {(s.x-x0)*1000:.0f} mm, expected {expected*1000:.0f} mm'
+
+
+# ------------------------------------------------------------------------ IMU
+# These guard a fix that came from the simulator FAILING tools/sensor_health.py: the
+# accelerometer published a constant 9.81, which that tool correctly flags as a stuck
+# channel. Reverting any of this to a constant would silently re-break it.
+def test_accelerometer_is_noisy_because_a_constant_reads_as_dead():
+    rng = np.random.default_rng(1)
+    az = [imu_sample(rng, 0.0)[3] for _ in range(400)]
+    assert np.std(az) > 0.0, 'a zero-variance accelerometer is what a DEAD one looks like'
+    assert np.std(az) == pytest.approx(ACCEL_NOISE, rel=0.25)
+
+
+def test_gravity_is_the_measured_9_799_not_the_textbook_9_81():
+    """The real IMU reads 9.7980-9.8005 at rest. The gap is bigger than the noise."""
+    rng = np.random.default_rng(2)
+    az = np.array([imu_sample(rng, 0.0)[3] for _ in range(2000)])
+    assert az.mean() == pytest.approx(GRAVITY, abs=0.002)
+    assert abs(az.mean() - 9.81) > 3 * ACCEL_NOISE / math.sqrt(len(az))
+
+
+def test_gyro_is_flat_at_rest_exactly_as_the_real_one_is():
+    """Not an oversight. Every at-rest bag shows gyro_z std of exactly 0.00000, so there
+    is no measurement to model, and inventing noise would defeat sensor_health.py's
+    rotate window -- which exists because a gyro cannot be judged while stationary."""
+    rng = np.random.default_rng(3)
+    gz = [imu_sample(rng, 0.0)[0] for _ in range(200)]
+    assert np.std(gz) == 0.0
+    assert set(gz) == {0.0}
+
+
+def test_slip_attenuates_the_gyro_but_never_gravity():
+    """Slip means the wheels turn and the body does not, so the BODY's rate falls.
+    Gravity is not a function of traction."""
+    rng = np.random.default_rng(4)
+    gz, _, _, az = imu_sample(rng, 2.0, slip=1.0)
+    assert gz == 0.0
+    samples = np.array([imu_sample(rng, 2.0, slip=1.0)[3] for _ in range(500)])
+    assert samples.mean() == pytest.approx(GRAVITY, abs=0.005)

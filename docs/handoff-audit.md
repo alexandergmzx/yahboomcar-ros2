@@ -274,6 +274,22 @@ self-consistent, and wrong.**
    38 genuinely turning pairs implied the opposite.
 6. **"transforms3d was the pip install that broke things."** It is apt-installed and was
    not the cause. It *was* broken, for a different reason, and that mattered more.
+7. **"`map_gmapping_launch.py` cannot work on Jazzy — `slam_gmapping` was never ported."**
+   Propagated into four files: `porting-notes.md`, the launch file's own docstring,
+   `slam_toolbox_launch.py`'s docstring, and `tools/test_readme.py`'s rationale — where it
+   was the motivating example for a tool built to stop exactly this. It was never tested.
+   `slam_gmapping` *had* been ported earlier in this same repo, in seven `.h`→`.hpp`
+   include lines, and `porting-notes.md` recorded that a hundred lines below the claim it
+   contradicts. Running it takes 45 s: it scan-matches through 31 map updates and
+   publishes an occupancy grid with 604 occupied cells.
+
+   **This one is different from 1–6 in a way worth naming.** Those were false *positives*
+   — claiming something worked when it did not. This was a false *negative*: writing off a
+   working feature, which no amount of careful verification of working things will ever
+   catch, because nobody tests what they have already declared dead. It was found only
+   because the README suite demanded a tag for every command and this one had no defensible
+   answer for why it was untestable. **"This is broken" needs evidence exactly as much as
+   "this works" does.**
 
 ## Defects found by external audit, not by me
 

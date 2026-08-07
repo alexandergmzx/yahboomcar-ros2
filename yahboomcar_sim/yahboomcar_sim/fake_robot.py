@@ -49,7 +49,8 @@ from std_msgs.msg import UInt16
 
 from yahboomcar_sim.arena import (LIDAR_BEAMS, LIDAR_RANGE_MAX, LIDAR_RANGE_MIN,
                                   default_arena, raycast)
-from yahboomcar_sim.physics import RobotState, apply_command, step
+from yahboomcar_sim.physics import (ACCEL_NOISE, RobotState, apply_command,
+                                    imu_sample, step)
 
 # Measured rates of the real firmware.
 SCAN_HZ = 12.0
@@ -64,6 +65,8 @@ class FakeRobot(Node):
         super().__init__('fake_robot')
         self.declare_parameter('slip', 0.0)
         self.declare_parameter('scan_noise', 0.01)      # m, 1-sigma
+        # m/s^2, 1-sigma. MEASURED: 0.0122-0.0307 across three at-rest selftest bags.
+        self.declare_parameter('accel_noise', ACCEL_NOISE)
         self.declare_parameter('dropout', 0.0)          # fraction of scans withheld
         self.declare_parameter('start_x', 0.0)
         self.declare_parameter('start_y', 0.0)
@@ -78,6 +81,7 @@ class FakeRobot(Node):
 
         self.slip = float(self.get_parameter('slip').value)
         self.scan_noise = float(self.get_parameter('scan_noise').value)
+        self.accel_noise = float(self.get_parameter('accel_noise').value)
         self.dropout = float(self.get_parameter('dropout').value)
         self.battery = float(self.get_parameter('battery_volts').value)
         self.decel = float(self.get_parameter('decel').value)
@@ -216,8 +220,13 @@ class FakeRobot(Node):
         m.orientation_covariance[0] = -1.0
         # The BODY's rate, not the wheels': on a stand this reads ~0 while the encoders
         # report a brisk turn, which is the disagreement the whole fusion work is about.
-        m.angular_velocity.z = self._wz * (1.0 - self.slip)
-        m.linear_acceleration.z = 9.81
+        # Gravity is 9.799 and the accelerometer is noisy -- both measured, both in
+        # physics.imu_sample, which documents why the gyro is left noiseless.
+        gz, ax, ay, az = imu_sample(self.rng, self._wz, self.slip, self.accel_noise)
+        m.angular_velocity.z = gz
+        m.linear_acceleration.x = ax
+        m.linear_acceleration.y = ay
+        m.linear_acceleration.z = az
         self.pub_imu.publish(m)
 
     def _tick_battery(self):
