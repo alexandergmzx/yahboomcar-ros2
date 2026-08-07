@@ -136,11 +136,32 @@ def calibration_problems(cal):
         bad.append(f'push only {cal.get("odom_m", 0)*1000:.0f} mm; a fixed 10 mm tape '
                    f'error is {10.0/max(cal.get("odom_m", 0.01)*1000, 1)*100:.1f}% of it')
     dy = cal.get('yaw_change_rad')
+    span = cal.get('gyro_span_rad_s')
+    abs_yaw = cal.get('abs_yaw_rad')
     if dy is None:
         bad.append('no IMU record, so nobody knows whether the push was straight')
-    elif abs(math.degrees(dy)) > 5.0:
-        bad.append(f'push curved by {math.degrees(dy):+.0f} deg; the wheels traced an arc '
-                   'while the tape measured the chord')
+    else:
+        # A DEAD GYRO IS THE BEST-LOOKING CALIBRATION THIS TOOL CAN PRODUCE, and the old
+        # gate passed it: yaw_change_rad == 0.0 satisfied "not None" and "<= 5 degrees".
+        # This robot's gyro publishes exactly 0.000000 on all three axes when it fails --
+        # confirmed in 3 of 5 informative bags, and CLAUDE.md calls it out as a confident
+        # zero any filter will fuse. Audit finding.
+        if span is None:
+            bad.append('no gyro-span record, so a DEAD gyro cannot be told apart from a '
+                       'straight push -- both integrate to zero yaw. Recalibrate with a '
+                       'build that records gyro_span_rad_s')
+        elif span < 1e-6:
+            bad.append(f'gyro span is {span:.9f} rad/s across the whole push -- exactly '
+                       'flat. That is this robot\'s documented gyro failure signature, '
+                       'not evidence of straightness')
+        elif abs(math.degrees(dy)) > 5.0:
+            bad.append(f'push curved by {math.degrees(dy):+.0f} deg; the wheels traced an '
+                       'arc while the tape measured the chord')
+        elif abs_yaw is not None and math.degrees(abs_yaw) > 12.0:
+            # Net yaw cannot see an S-shape: two opposite turns cancel to zero while the
+            # wheels traced two arcs and the tape measured a chord.
+            bad.append(f'push snaked: {math.degrees(abs_yaw):.0f} deg of TOTAL turning '
+                       f'with only {math.degrees(dy):+.0f} deg net')
     if not 0.8 < cal.get('k', 0) < 1.3:
         bad.append(f'k = {cal.get("k", 0):.3f} is implausible')
     return bad
@@ -579,15 +600,26 @@ def main():
         return (sum(x[0] for x in w) / len(w), sum(x[1] for x in w) / len(w))
 
     def imu_integrate(t_from, t_to, ab, gb):
-        """-> (delta_v, distance, delta_yaw) from IMU over a window, biases removed.
+        """-> (delta_v, distance, delta_yaw, abs_yaw, raw_gyro_span) over a window.
 
         Trapezoidal. /imu runs at 25 Hz, so a 0.3 s event is only ~7 samples and the
         integration itself is coarse; this is a cross-check, not a precision instrument.
+
+        `abs_yaw` integrates |yaw rate|, i.e. TOTAL TURNING regardless of direction. Net
+        yaw cannot see an S-shaped push whose two turns cancel -- that reads as perfectly
+        straight while the wheels traced two arcs and the tape measured a chord.
+
+        `raw_gyro_span` is max-min of the UNCORRECTED gyro over the window. It exists to
+        tell a genuinely straight push apart from a DEAD gyro: this robot's gyro publishes
+        exactly 0.000000 on all three axes when it fails, so a dead one integrates to a
+        flawless zero yaw. Span is measured before bias removal because subtracting a bias
+        computed from the same dead signal would hide it.
         """
         w = [(t, a - ab, g - gb) for t, a, g in imu if t_from <= t <= (t_to or 1e18)]
+        raw = [g for t, _, g in imu if t_from <= t <= (t_to or 1e18)]
         if len(w) < 2:
-            return None, None, None
-        dv = d = dyaw = 0.0
+            return None, None, None, None, None
+        dv = d = dyaw = abs_yaw = 0.0
         v = 0.0
         for (t0, a0, g0), (t1, a1, g1) in zip(w, w[1:]):
             dt = t1 - t0
@@ -595,7 +627,9 @@ def main():
             d += abs(v) * dt + 0.5 * abs(0.5 * (a0 + a1)) * dt * dt
             v += 0.5 * (a0 + a1) * dt
             dyaw += 0.5 * (g0 + g1) * dt
-        return dv, d, dyaw
+            abs_yaw += abs(0.5 * (g0 + g1)) * dt
+        span = (max(raw) - min(raw)) if raw else 0.0
+        return dv, d, dyaw, abs_yaw, span
 
     def integrate(t_from, t_to=None):
         """Integrate |vx| over [t_from, t_to], INTERPOLATING at both boundaries.
@@ -668,18 +702,32 @@ def main():
         # Straightness, from the gyro. A curved push makes the wheels trace an arc while
         # the tape measures the chord; arc/chord ~ 1 + theta^2/24 for small theta, so the
         # odometry reads long and k comes out low.
-        dyaw = None
+        dyaw = abs_yaw = gyro_span = None
         if gb is not None:
-            _, _, dyaw = imu_integrate(t0, t_end, ab or 0.0, gb)
+            _, _, dyaw, abs_yaw, gyro_span = imu_integrate(t0, t_end, ab or 0.0, gb)
         if dyaw is None:
             say('  straightness: NO IMU DATA -- cannot tell whether the push was straight')
         else:
             infl = (dyaw ** 2) / 24.0
-            say(f'  straightness: yaw changed {math.degrees(dyaw):+.1f} deg over the push')
+            say(f'  straightness: net yaw {math.degrees(dyaw):+.1f} deg, '
+                f'TOTAL turning {math.degrees(abs_yaw):.1f} deg')
             say(f'    implied arc-vs-chord inflation of odometry: {infl*100:.2f}%')
-            if abs(math.degrees(dyaw)) > 5.0:
+            say(f'    raw gyro span over the push: {gyro_span:.6f} rad/s')
+            # A DEAD gyro integrates to a flawless zero and would otherwise certify the
+            # most convincing calibration this tool can produce. This robot's gyro
+            # publishes exactly 0.000000 on all three axes when it fails, confirmed in 3
+            # of 5 informative bags. Audit finding: the old gate accepted it.
+            if gyro_span < 1e-6:
+                say('    *** GYRO IS FLAT: span is exactly zero across the whole push.')
+                say('    That is this robot\'s documented failure signature, not a')
+                say('    straight push. A dead gyro cannot witness anything. ***')
+            elif abs(math.degrees(dyaw)) > 5.0:
                 say('    *** the push CURVED. k is biased low; redo it against a '
                     'straight edge. ***')
+            elif abs_yaw is not None and math.degrees(abs_yaw) > 12.0:
+                say(f'    *** the push SNAKED: {math.degrees(abs_yaw):.0f} deg of total '
+                    'turning with little net change. The wheels traced arcs while the '
+                    'tape measured a chord. ***')
         if odo < 1.0:
             say(f'  *** SHORT PUSH ({odo*1000:.0f} mm). A fixed +/-10 mm tape error is '
                 f'{10.0/(odo*1000)*100:.1f}% here. Push at least 1.5 m. ***')
@@ -690,6 +738,10 @@ def main():
         store.setdefault('calibrations', []).append(
             {'timestamp': stamp, 'tape_m': tape, 'odom_m': odo, 'k': k,
              'yaw_change_rad': dyaw,
+             # Both recorded so calibration_problems() can tell a straight push from a
+             # dead gyro and from an S-shape. Net yaw alone cannot distinguish either.
+             'abs_yaw_rad': abs_yaw,
+             'gyro_span_rad_s': gyro_span,
              'arc_chord_inflation': ((dyaw ** 2) / 24.0) if dyaw is not None else None})
         store['odom_scale_k'] = k
         save(store)
@@ -765,7 +817,7 @@ def main():
             dv_imu = d_imu = slip = None
             t_rest = (t_zero + rest_t) if rest_t else None
             if ab is not None and t_rest:
-                dv_imu, d_imu, _ = imu_integrate(t_zero, t_rest, ab, gb)
+                dv_imu, d_imu, _, _, _ = imu_integrate(t_zero, t_rest, ab, gb)
             if dv_imu is not None and v_meas:
                 # Encoders say the wheels lost v_meas. The IMU says the BODY lost
                 # |dv_imu|. A gap between them is slip -- the wheels and the ground

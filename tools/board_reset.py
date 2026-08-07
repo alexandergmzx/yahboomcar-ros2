@@ -61,23 +61,57 @@ def pulse_reset(port, hold=0.15, settle=0.05):
         s.dtr = False
 
 
-def sensor_health(domain, seconds):
-    """-> (exit_code, stdout). 0 means every channel is alive and measuring."""
+def sensor_health(domain, seconds, rotate_window=0.0):
+    """-> (exit_code, stdout). 0 means every channel is alive and measuring.
+
+    exit 0 also covers "PASS with caveats", which is what a stationary robot with a flat
+    gyro gets -- so rc == 0 alone must never be read as "the gyro is fine".
+    """
     env = dict(os.environ, ROS_DOMAIN_ID=str(domain))
+    rot = f' --rotate-window {rotate_window}' if rotate_window > 0 else ''
     cmd = (f'source /opt/ros/jazzy/setup.bash && '
            f'python3 {os.path.join(REPO, "tools", "sensor_health.py")} '
-           f'--seconds {seconds} --domain {domain}')
+           f'--seconds {seconds} --domain {domain}{rot}')
     p = subprocess.run(['bash', '-c', cmd], env=env, capture_output=True, text=True)
     return p.returncode, p.stdout
 
 
 def gyro_state(text):
+    """-> 'live' | 'dead' | 'undetermined' | 'no data'.
+
+    THREE states, not two. This used to return 'live' for any `imu gyro z` line that did
+    not contain the word DEAD -- but sensor_health.py prints
+
+        imu gyro z   std 0.000000  flat (undetermined at rest)
+
+    for a STATIONARY robot, which contains no 'DEAD' and was therefore read as alive. So
+    --until-gyro-live would announce recovery on a robot sitting perfectly still, whose
+    gyro state is genuinely unknown. Audit finding.
+
+    At rest a working gyro and a broken one are indistinguishable: this robot's gyro
+    publishes exactly 0.000000 on all three axes when it fails. Only rotation settles it,
+    which is why sensor_health has --rotate-test and --rotate-window at all.
+    """
     if 'imu gyro z' not in text:
         return 'no data'
+    # A rotation-witnessed verdict, from either rotate path, outranks the channel table.
+    if 'DEAD. The room moved and the gyro did not notice' in text:
+        return 'dead'
+    if 'DEAD. It did not see a rotation you performed' in text:
+        return 'dead'
+    if 'LIVE. It responded to' in text:
+        return 'live'
     for line in text.splitlines():
         if 'imu gyro z' in line:
-            return 'DEAD' if 'DEAD' in line else 'live'
-    return 'unknown'
+            if 'DEAD' in line:
+                return 'dead'
+            if 'flat' in line or 'undetermined' in line:
+                return 'undetermined'
+            if 'live' in line:
+                # Live BY VARIANCE ALONE, i.e. the robot happened to be moving. Real,
+                # but not a rotation-witnessed verdict.
+                return 'live'
+    return 'undetermined'
 
 
 def main():
@@ -89,9 +123,29 @@ def main():
     ap.add_argument('--check-seconds', type=float, default=10.0)
     ap.add_argument('--no-verify', action='store_true')
     ap.add_argument('--until-gyro-live', action='store_true',
-                    help='reset repeatedly until the gyro reports variance')
+                    help='reset repeatedly until the gyro is WITNESSED live. Requires '
+                         '--rotate-window: a stationary robot cannot settle the '
+                         'question, because a working gyro and a dead one both read '
+                         'exactly 0.000000 at rest.')
+    ap.add_argument('--rotate-window', type=float, default=0.0,
+                    help='seconds during which YOU turn the car by hand. The lidar '
+                         'independently witnesses whether it really rotated, which is '
+                         'the only decisive gyro check.')
     ap.add_argument('--max-attempts', type=int, default=5)
     args = ap.parse_args()
+
+    if args.until_gyro_live and args.rotate_window <= 0:
+        print('REFUSED: --until-gyro-live needs --rotate-window.')
+        print()
+        print('  Without rotation there is no verdict to loop on. A working gyro and a')
+        print('  broken one BOTH read exactly 0.000000 on a stationary robot, so the')
+        print('  loop could only ever terminate on a guess -- and it used to, reporting')
+        print('  "every channel alive" for a gyro nobody had tested.')
+        print()
+        print('  Run:  ./tools/board_reset.py --until-gyro-live --rotate-window 75')
+        print('  and turn the car by hand during each window. The lidar witnesses')
+        print('  whether it actually rotated.')
+        return 2
 
     if not os.path.exists(args.port):
         print(f'no such port: {args.port}')
@@ -122,7 +176,8 @@ def main():
         rc, out = 1, ''
         while time.time() < deadline:
             time.sleep(5.0)
-            rc, out = sensor_health(args.domain, args.check_seconds)
+            rc, out = sensor_health(args.domain, args.check_seconds,
+                                    args.rotate_window)
             if 'SILENT' not in out and 'core topics are silent' not in out:
                 break
 
@@ -133,18 +188,33 @@ def main():
                                        'SENSOR HEALTH')):
                 print(f'    {line.strip()}', flush=True)
 
-        if rc == 0:
+        # rc == 0 is NOT enough on its own: sensor_health returns 0 for "PASS with
+        # caveats", which is exactly what a stationary robot with a flat gyro gets. This
+        # tool used to report "every channel alive" on that. Audit finding.
+        if rc == 0 and state == 'live':
             print()
             print('  PASS: every channel alive after a SERIAL RESET -- no power cycle '
                   'needed.')
             return 0
+        if rc == 0 and state == 'undetermined':
+            print()
+            print('  UNDETERMINED: every channel that CAN be judged at rest is fine, but')
+            print('  the gyro was flat and nothing rotated, so its state is unknown.')
+            print('  A working gyro and a dead one are identical on a stationary robot:')
+            print('  both read exactly 0.000000. This is NOT a recovery.')
+            print('  Settle it with:  ./tools/board_reset.py --rotate-window 75')
+            print('  (turn the car by hand during the window; the lidar witnesses it)')
+            return 1
         if state == 'live':
             print()
-            print('  gyro recovered, though another check still failed (see above)')
+            print('  gyro WITNESSED live, though another check still failed (see above)')
             return 1
         if not args.until_gyro_live:
             break
-        print('  gyro still dead; retrying', flush=True)
+        if state == 'undetermined':
+            print('  gyro undetermined (nothing rotated); retrying', flush=True)
+        else:
+            print('  gyro still dead; retrying', flush=True)
 
     print()
     print('  Reset did not revive the gyro.')
