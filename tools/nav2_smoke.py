@@ -29,8 +29,12 @@ plan through a gap -- the robot would stall and this would report a Nav2 failure
 really a governor success. The two need reconciling deliberately rather than discovering
 mid-drive, so this reports the peak speed Nav2 commanded and leaves the decision visible.
 
-ON THE REAL ROBOT that means Nav2 drives UNGOVERNED. Do not run it on the floor until the
-stopping envelope is measured. In simulation there is nothing to hit.
+ON THE REAL ROBOT that means Nav2 drives UNGOVERNED, and this tool REFUSES to run there
+unless the refusal is explicitly overridden. Nav2 publishes straight to /cmd_vel; the
+navigation launch does not start cmd_vel_deadman; and the firmware has no command
+watchdog. The chain of things that would stop a runaway is, on the floor, empty.
+
+In simulation there is nothing to hit, so it runs freely.
 """
 import argparse
 import math
@@ -49,6 +53,10 @@ def main():
     ap.add_argument('--timeout', type=float, default=90.0)
     ap.add_argument('--domain', type=int, default=55)
     ap.add_argument('--check-only', action='store_true')
+    ap.add_argument('--i-accept-driving-unprotected', action='store_true',
+                    help='allow this to command a REAL robot. Nav2 bypasses the safety '
+                         'governor, the nav launch starts no deadman, and the firmware '
+                         'has no watchdog.')
     args = ap.parse_args()
 
     os.environ.setdefault('ROS_DOMAIN_ID', str(args.domain))
@@ -90,6 +98,25 @@ def main():
         ok = False
     else:
         say(f'  /odom present, robot at ({poses[-1][0]:+.2f}, {poses[-1][1]:+.2f})')
+
+    # WHICH ROBOT? Nav2 on the real car drives with nothing between it and the motors.
+    names = [n for n, _ in node.get_node_names_and_namespaces()]
+    real = 'YB_Car_Node' in names
+    sim = 'fake_robot' in names
+    say(f'  target: {"HARDWARE" if real else "simulator" if sim else "unknown"}')
+    if real and not args.i_accept_driving_unprotected:
+        say('')
+        say('  REFUSED: this would drive the REAL robot, and Nav2 drives unprotected.')
+        say('    * Nav2 publishes to /cmd_vel, bypassing cmd_vel_governor entirely')
+        say('    * navigation_dwb_launch.py does not start cmd_vel_deadman')
+        say('    * the firmware has NO command watchdog: a crash leaves it driving')
+        say('  Nothing in that chain would stop a runaway. Measure the stopping')
+        say('  envelope first (docs/first-floor-procedure.md), keep a hand on the power')
+        say('  switch, then pass --i-accept-driving-unprotected if you still mean it.')
+        return 2
+    if real:
+        say('  *** OVERRIDDEN: commanding a REAL robot with no governor and no '
+            'deadman. Hand on the power switch. ***')
 
     client = ActionClient(node, NavigateToPose, 'navigate_to_pose')
     if not client.wait_for_server(timeout_sec=10.0):

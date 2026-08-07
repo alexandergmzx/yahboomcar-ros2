@@ -98,6 +98,8 @@ AT_REST = 0.02
 N_REST = 3
 MIN_SPEEDS = 3          # distinct speeds required before `a` is identifiable
 MIN_SPREAD = 2.5        # max(v)/min(v) below this and the split is untrustworthy
+MIN_RUNS_PER_SPEED = 3  # fewer than this and a per-speed mean means little
+MIN_PHYSICAL_BOOT = 0.9  # fraction of bootstrap samples that must be physical
 MARGIN_C = 0.10         # m: design margin added to the envelope
 
 
@@ -111,6 +113,39 @@ def load():
 def save(store):
     with open(DATA, 'w') as f:
         json.dump(store, f, indent=2)
+
+
+def calibration_problems(cal):
+    """Why this calibration is unfit to derive stopping distances from. [] means fit.
+
+    Warning about a bad calibration is not enough: every braking run subtracts
+    k * run-up from a tape total, so a calibration that is 5% wrong puts 5% of the RUN-UP
+    -- which is far longer than the stop -- straight into the stopping distance. A 1.8 m
+    run-up at 5% is 90 mm of error on a stop of perhaps 50 mm.
+    """
+    bad = []
+    if cal.get('odom_m', 0) < 1.0:
+        bad.append(f'push only {cal.get("odom_m", 0)*1000:.0f} mm; a fixed 10 mm tape '
+                   f'error is {10.0/max(cal.get("odom_m", 0.01)*1000, 1)*100:.1f}% of it')
+    dy = cal.get('yaw_change_rad')
+    if dy is None:
+        bad.append('no IMU record, so nobody knows whether the push was straight')
+    elif abs(math.degrees(dy)) > 5.0:
+        bad.append(f'push curved by {math.degrees(dy):+.0f} deg; the wheels traced an arc '
+                   'while the tape measured the chord')
+    if not 0.8 < cal.get('k', 0) < 1.3:
+        bad.append(f'k = {cal.get("k", 0):.3f} is implausible')
+    return bad
+
+
+def active_calibration(store):
+    k = store.get('odom_scale_k')
+    if k is None:
+        return None
+    for c in store.get('calibrations', []):
+        if abs(c.get('k', -1) - k) < 1e-12:
+            return c
+    return None
 
 
 def _lstsq(v, d):
@@ -144,9 +179,36 @@ def fit(runs, n_boot=2000, seed=0):
         'T_stop_s': t_hat,
         'residual_rms_m': float(np.sqrt(np.mean(res ** 2))),
         'residual_max_m': float(np.max(np.abs(res))),
-        'identifiable': len(speeds) >= MIN_SPEEDS and spread >= MIN_SPREAD,
+        'points': [(float(a), float(b)) for a, b in pts],
     }
     out['decel_m_s2'] = (1.0 / (2.0 * b_hat)) if b_hat > 0 else None
+
+    # PHYSICAL VALIDITY, checked one named condition at a time.
+    #
+    # An earlier version called a fit `identifiable` on the strength of speed count and
+    # spread ALONE, which let it bless data that could not describe any robot. An audit
+    # fed it stopping distances that DECREASED with speed and got identifiable: True with
+    # T_stop = 5.109 s; and a set giving T_stop = -0.295 s, also identifiable: True.
+    # Neither is a hard case -- both are impossible, and the fit had no opinion.
+    per_speed = {sp: [d for vv, d in pts if round(vv, 3) == sp] for sp in speeds}
+    means = [float(np.mean(per_speed[sp])) for sp in speeds]
+
+    checks = {
+        'enough_speeds': len(speeds) >= MIN_SPEEDS,
+        'enough_spread': spread >= MIN_SPREAD,
+        # A per-speed mean from one or two runs is not a mean.
+        'enough_runs_per_speed': all(len(per_speed[sp]) >= MIN_RUNS_PER_SPEED
+                                     for sp in speeds),
+        # Dead time cannot be negative: the robot does not begin stopping before it is
+        # told to.
+        't_stop_positive': t_hat > 0,
+        # Deceleration must be positive and finite, or the model is not a stopping model.
+        'decel_positive': b_hat > 0 and out['decel_m_s2'] is not None,
+        # A faster robot cannot stop in a SHORTER distance. This is the check that
+        # catches wholesale nonsense before any curve is fitted through it.
+        'monotonic_in_speed': all(b >= a - 1e-9 for a, b in zip(means, means[1:])),
+    }
+    out['per_speed_mean_m'] = dict(zip(map(str, speeds), means))
 
     rng = np.random.default_rng(seed)
     boot = []
@@ -162,12 +224,29 @@ def fit(runs, n_boot=2000, seed=0):
         bt = np.array([x[0] for x in boot])
         bb = np.array([x[1] for x in boot])
         out['T_stop_ci'] = [float(np.percentile(bt, 5)), float(np.percentile(bt, 95))]
-        good = bb > 0
-        if good.sum() > 10:
-            a_s = 1.0 / (2.0 * bb[good])
-            out['decel_ci'] = [float(np.percentile(a_s, 5)), float(np.percentile(a_s, 95))]
-            out['decel_ci_frac_positive'] = float(good.mean())
-        out['_boot'] = (bt, bb)
+        # A bootstrap sample with a non-positive coefficient does not describe a robot
+        # that stops. Counting how MANY are unphysical is itself the identifiability
+        # test: if the data cannot pin the sign, the parameter is not determined.
+        physical = (bb > 0) & (bt > 0)
+        out['boot_physical_fraction'] = float(physical.mean())
+        checks['bootstrap_mostly_physical'] = (
+            float(physical.mean()) >= MIN_PHYSICAL_BOOT)
+        if physical.sum() > 10:
+            a_s = 1.0 / (2.0 * bb[physical])
+            out['decel_ci'] = [float(np.percentile(a_s, 5)),
+                               float(np.percentile(a_s, 95))]
+            checks['decel_ci_positive'] = bool(np.percentile(a_s, 5) > 0)
+        else:
+            checks['decel_ci_positive'] = False
+        # Only physical samples may inform an envelope.
+        out['_boot'] = (bt[physical], bb[physical])
+    else:
+        checks['bootstrap_mostly_physical'] = False
+        checks['decel_ci_positive'] = False
+
+    out['checks'] = checks
+    out['identifiable'] = all(checks.values())
+    out['failed_checks'] = [k for k, v in checks.items() if not v]
 
     # Bootstrap cannot see a bias common to every run, which is the failure mode that
     # actually bit here. Refit with a fixed offset on all measurements instead.
@@ -184,13 +263,43 @@ def fit(runs, n_boot=2000, seed=0):
 
 
 def envelope(f, speed, pct=95):
-    """Conservative predicted stopping distance: bootstrap upper bound + margin."""
+    """Conservative predicted stopping distance, or None when the data cannot support one.
+
+    Three defences, because an earlier version had none of them and produced a 33 mm
+    "conservative" envelope at 0.20 m/s from data whose own worst observed stop was
+    50 mm -- predicting a stop shorter than one already measured.
+
+    1. REFUSE an invalid fit outright. A number derived from data that cannot describe a
+       robot is worse than no number, because it will be used.
+    2. Take the worst across the SYSTEMATIC BIAS sweep, not just the nominal fit. The
+       bootstrap cannot see a bias common to every run, and 0.5 mm of it moved fitted `a`
+       from 1.0 to 2.5 in the case that prompted the sweep.
+    3. Floor it at the WORST DISTANCE ACTUALLY OBSERVED at or below this speed. No model
+       may predict a stop shorter than one that has already happened. This is the check
+       that needs no theory and cannot be argued with.
+    """
     import numpy as np
-    if '_boot' not in f:
+    if 'error' in f or not f.get('identifiable'):
         return None
+    if '_boot' not in f or len(f['_boot'][0]) < 10:
+        return None
+
     bt, bb = f['_boot']
     preds = bt * speed + bb * speed ** 2
-    return float(np.percentile(preds, pct)) + MARGIN_C
+    est = float(np.percentile(preds, pct))
+
+    # (2) worst over the bias sweep.
+    for b in f.get('bias_sweep', []):
+        if b.get('decel_m_s2') and b['T_stop_s'] > 0:
+            est = max(est, b['T_stop_s'] * speed
+                      + speed ** 2 / (2.0 * b['decel_m_s2']))
+
+    # (3) never below anything already measured at or below this speed.
+    observed = [d for v, d in f.get('points', []) if v <= speed + 1e-9]
+    if observed:
+        est = max(est, max(observed))
+
+    return est + MARGIN_C
 
 
 def report(f, say):
@@ -214,15 +323,28 @@ def report(f, say):
     else:
         say('  a      = NOT IDENTIFIABLE (fitted quadratic term <= 0)')
 
+    say('')
+    say('  VALIDITY CHECKS')
+    explain = {
+        'enough_speeds': f'at least {MIN_SPEEDS} distinct speeds',
+        'enough_spread': f'speed spread at least {MIN_SPREAD}x',
+        'enough_runs_per_speed': f'at least {MIN_RUNS_PER_SPEED} runs at every speed',
+        't_stop_positive': 'dead time positive (the robot cannot brake before being told)',
+        'decel_positive': 'deceleration positive and finite',
+        'monotonic_in_speed': 'stopping distance rises with speed (faster cannot be shorter)',
+        'bootstrap_mostly_physical': f'at least {MIN_PHYSICAL_BOOT:.0%} of bootstrap fits physical',
+        'decel_ci_positive': 'lower confidence bound on deceleration above zero',
+    }
+    for k, v in f.get('checks', {}).items():
+        say(f'    [{"ok" if v else "FAIL"}] {explain.get(k, k)}')
+
     if not f['identifiable']:
         say('')
-        say(f'  *** `a` IS NOT TRUSTWORTHY FROM THIS DATA ***')
-        if len(f['distinct_speeds']) < MIN_SPEEDS:
-            say(f'      {len(f["distinct_speeds"])} distinct speed(s); '
-                f'{MIN_SPEEDS} needed to separate T_stop from a.')
-        if f['speed_spread'] < MIN_SPREAD:
-            say(f'      speed spread {f["speed_spread"]:.1f}x is below {MIN_SPREAD}x; '
-                'the quadratic term is too small to identify.')
+        say('  *** THIS FIT IS NOT USABLE. No envelope will be produced. ***')
+        say(f'      failed: {", ".join(f["failed_checks"])}')
+        say('      A model fitted to data that cannot describe a robot will still')
+        say('      produce numbers, and they will be used. That is the failure this')
+        say('      refuses.')
 
     if f.get('bias_sweep'):
         say('')
@@ -237,8 +359,12 @@ def report(f, say):
                 'Do not use the point estimate.')
 
     say('')
-    say('  CONSERVATIVE STOPPING ENVELOPE (95th pct of bootstrap + '
-        f'{MARGIN_C*1000:.0f} mm margin):')
+    if not f['identifiable']:
+        say('  STOPPING ENVELOPE: withheld, the fit is not usable (see above).')
+        return
+    say('  CONSERVATIVE STOPPING ENVELOPE')
+    say('    = max(95th pct bootstrap, worst bias-swept fit, worst OBSERVED stop)'
+        f' + {MARGIN_C*1000:.0f} mm')
     tested = f['distinct_speeds']
     for v in (0.05, 0.10, 0.20, 0.30):
         e = envelope(f, v)
@@ -349,6 +475,24 @@ def main():
         print('Without it the run-up distance is unknown, and the stopping distance is')
         print('derived by subtracting the run-up from the tape measurement.')
         return 2
+
+    # A calibration existing is not the same as a calibration being usable. Every run
+    # subtracts k * run-up from a tape total, so error in k lands in the stopping
+    # distance multiplied by a run-up far longer than the stop itself.
+    if not args.calibrate:
+        cal = active_calibration(store)
+        problems = calibration_problems(cal) if cal else ['active k matches no '
+                                                          'recorded calibration']
+        if problems:
+            print('REFUSED: the active calibration is not fit to derive stopping '
+                  'distances from.')
+            for b in problems:
+                print(f'  - {b}')
+            print()
+            print('Run --calibrate again: motors off, push STRAIGHT along a measured')
+            print('edge, at least 1.5 m. The gyro now witnesses whether it was straight.')
+            print('--list-calibrations shows every recorded one and recommends the best.')
+            return 2
 
     if os.environ.get('ROS_DOMAIN_ID') is None:
         os.environ['ROS_DOMAIN_ID'] = str(args.domain)

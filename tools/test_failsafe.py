@@ -66,8 +66,14 @@ from datetime import datetime
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
-REPORT = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
-                      'failsafe_report.json')
+# Hardware and simulator results go to SEPARATE files. They were shared, and a run
+# against the simulator silently overwrote a hardware run -- destroying the evidence for
+# a bound the docs cite. Found by external audit, which noticed the committed report had
+# a null governor case that could not support the documented 762 ms.
+REPORT_HW = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
+                         'failsafe_report.json')
+REPORT_SIM = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
+                          'failsafe_report_sim.json')
 WS = os.path.join(REPO, 'yahboomcar_ws')
 
 MOVING = 0.05      # m/s: above this the wheels are definitely turning
@@ -191,6 +197,25 @@ def main():
     # PROVENANCE. A report showing clean stops is dangerously misleading if it does not
     # say whether the external deadman was doing the stopping -- it reads as firmware
     # protection, which this robot does not have. Audit finding.
+    # WHICH ROBOT is this? A result is meaningless without it, and mixing the two is how
+    # a simulator run came to stand in for hardware evidence.
+    names = [n for n, _ in node.get_node_names_and_namespaces()]
+    if 'fake_robot' in names:
+        target, report_path = 'simulator', REPORT_SIM
+    elif 'YB_Car_Node' in names:
+        target, report_path = 'hardware', REPORT_HW
+    else:
+        target, report_path = 'unknown', REPORT_SIM
+    say(f'target: {target.upper()}')
+    if target == 'simulator':
+        say('  Simulator timings are OPTIMISTIC: there is no Wi-Fi or agent hop, so the')
+        say('  stop is faster here than on the car (measured 435-526 ms vs 693-762 ms).')
+        say(f'  Writing to {os.path.basename(REPORT_SIM)}, NOT the hardware report.')
+    elif target == 'unknown':
+        say('  WARNING: neither fake_robot nor YB_Car_Node found. Treating as simulator '
+            'so a hardware report cannot be overwritten by accident.')
+    say('')
+
     deadman_nodes = [f'{ns.rstrip("/")}/{n}'.replace('//', '/')
                      for n, ns in node.get_node_names_and_namespaces()
                      if n == 'cmd_vel_deadman']
@@ -201,7 +226,7 @@ def main():
         say('  -> stops below would be firmware behaviour. None has ever been observed.')
     say('')
 
-    results = {'timestamp': stamp, 'speed_m_s': args.speed,
+    results = {'timestamp': stamp, 'target': target, 'speed_m_s': args.speed,
                'stop_timeout_s': args.stop_timeout,
                'deadman_active': bool(deadman_nodes),
                'deadman_nodes': deadman_nodes,
@@ -439,11 +464,26 @@ def main():
     log_path = os.path.join(OUT_DIR, f'failsafe-{stamp}.log')
     with open(log_path, 'w') as f:
         f.write('\n'.join(lines) + '\n')
-    with open(REPORT, 'w') as f:
+    # An INCOMPLETE run must not look like a clean one. A case that produced no motion
+    # proves nothing, and a report full of nulls citing a bound is worse than no report.
+    incomplete = [k for k, v in results['cases'].items() if v.get('stopped') is None]
+    if incomplete:
+        results['incomplete_cases'] = incomplete
+        results['valid'] = False
+        results['note'] = (results.get('note', '') + ' INCOMPLETE RUN: '
+                           f'{incomplete} produced no usable motion, so this report does '
+                           'not support any timing bound. Re-run.')
+    else:
+        results['valid'] = True
+
+    with open(report_path, 'w') as f:
         json.dump(results, f, indent=2)
     say('')
+    if incomplete:
+        say(f'  *** INCOMPLETE: {incomplete} produced no motion. This report does NOT')
+        say('      support a timing bound. Re-run before citing it. ***')
     say(f'log:    {log_path}')
-    say(f'report: {REPORT}')
+    say(f'report: {report_path}')
     return code
 
 

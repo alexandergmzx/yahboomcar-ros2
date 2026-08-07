@@ -240,7 +240,7 @@ rather than with the safety filter. Until it is designed, the operating rule sta
 | Stale input stops the robot | bench: output went to 0.000 after commands ceased |
 | Bypass is detected and named | bench: governor logged the offending node |
 | **Firmware retains commands forever** | live car, 3 modes + a 45 s probe: never stops without an explicit zero |
-| **Deadman stops a dead publisher** | live car: 693 ms (publisher ceases), 762 ms (governor SIGKILLed) |
+| **Deadman stops a dead publisher** | live car: 693 ms (publisher ceases), 762 ms (governor SIGKILLed) — evidence is `MicroROS-assets/logs/failsafe-20260806-145410.log`; the JSON was later overwritten by a SIMULATOR run and is marked `needs_rerun` rather than reconstructed |
 | Deadman covers link loss | **NO — measured to fail.** Nothing on this PC can |
 | Stop paths leak no translation | unit test over all 5 stop paths, both axes |
 | Reverse and near-obstacle yaw bounded | unit tests; **never exercised on hardware** |
