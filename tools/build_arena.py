@@ -37,6 +37,114 @@ ROBOT_PRIM = '/World/Robot'
 WHEEL_DROP = 0.045
 SPAWN_CLEARANCE = 0.01
 
+# ----------------------------------------------------------------- the lidar
+# The firmware contract from CLAUDE.md, which the Isaac backend must satisfy exactly:
+# /scan is 360 beams at 1.000 deg over 0.12-8.0 m at ~12 Hz. A backend publishing a
+# differently shaped scan is worse than no backend, because every result taken from it
+# silently stops transferring to the real robot.
+LIDAR_BEAMS = 360
+LIDAR_HZ = 12
+LIDAR_RANGE_MIN = 0.12
+LIDAR_RANGE_MAX = 8.0
+# Offset of laser_frame from base_link.
+LIDAR_XYZ = (-0.0046, 0.0, 0.094)
+
+
+def author_lidar(stage, base_path, Gf, Vt, say, break_it=False):
+    """Create the RTX lidar and author the contract onto it. Returns its prim path.
+
+    THREE TRAPS, each of which looks like success:
+
+    1. `IsaacSensorCreateRtxLidar(config='...')` with an unknown config name returns
+       ok=True and a valid prim. It only carb.log_warn's -- and Isaac's logger swallows
+       output -- then silently gives you a GENERIC 128-channel 3D lidar. So the config
+       name is never trusted here; every parameter is authored explicitly and READ BACK.
+
+    2. The JSON profiles under `profileBaseFolder` are the deprecated camera-based path
+       and are ignored by Isaac 5.1, which drives RTX lidars from `omni:sensor:Core:*`
+       PRIM ATTRIBUTES instead. A JSON config file was written, verified to have no
+       effect whatsoever, and deleted.
+
+    3. `channelId` is 1-BASED. A 0 gives "Malformed model parameter update: channelId 0
+       is either less than 1 or greater than numberOfChannels 1", after which the plugin
+       keeps the previous profile -- so the sensor silently stays 3D.
+
+    And the reason all of that matters: IsaacComputeRTXLidarFlatScan refuses to run at
+    all unless every elevation is zero ("Lidar prim is not a 2D Lidar, and node will not
+    execute"), so a 3D default publishes nothing and looks like a dead topic.
+    """
+    import omni.kit.commands
+    ok, sensor = omni.kit.commands.execute(
+        'IsaacSensorCreateRtxLidar',
+        path='laser_frame_lidar',
+        parent=base_path,
+        translation=Gf.Vec3d(*LIDAR_XYZ),
+        orientation=Gf.Quatd(1.0, 0.0, 0.0, 0.0),
+    )
+    if not sensor:
+        say('  FAIL: could not create the lidar prim')
+        return None
+    lidar = stage.GetPrimAtPath(str(sensor.GetPath()))
+
+    P = 'omni:sensor:Core:'
+    E = P + 'emitterState:s001:'
+    wanted = {
+        E + 'azimuthDeg': Vt.FloatArray([0.0]),
+        E + 'elevationDeg': Vt.FloatArray([0.0]),   # zero, or FlatScan refuses to run
+        E + 'channelId': Vt.UIntArray([1]),         # 1-based
+        E + 'fireTimeNs': Vt.UIntArray([0]),
+        P + 'numberOfChannels': 1,
+        P + 'numberOfEmitters': 1,
+        P + 'scanRateBaseHz': LIDAR_HZ,
+        # Firings per second / rotations per second = beams per revolution. This, not
+        # any explicit resolution field, is what sets the 1.000 deg increment.
+        P + 'reportRateBaseHz': LIDAR_BEAMS * LIDAR_HZ,
+        P + 'nearRangeM': LIDAR_RANGE_MIN,
+        P + 'farRangeM': LIDAR_RANGE_MAX,
+        P + 'maxReturns': 1,
+        # ROS LaserScan sweeps upward from angle_min, i.e. counter-clockwise.
+        P + 'rotationDirection': 'CCW',
+        P + 'scanType': 'ROTARY',
+        P + 'rayType': 'IDEALIZED',
+    }
+    for name, val in wanted.items():
+        a = lidar.GetAttribute(name)
+        if not a or not a.IsValid():
+            say(f'  FAIL: lidar attribute missing: {name}')
+            return None
+        a.Set(val)
+
+    if break_it:
+        # NEGATIVE TEST: leave the sensor 3D, which is exactly the state the default
+        # config lands in and the state that makes FlatScan refuse to run. The readback
+        # below must catch it; a check that has never failed is not known to work.
+        say('  !! --break-lidar: restoring a nonzero elevation (negative test)')
+        lidar.GetAttribute(E + 'elevationDeg').Set(Vt.FloatArray([-15.0]))
+
+    bad = []
+    for name, val in wanted.items():
+        got = lidar.GetAttribute(name).Get()
+        g = list(got) if hasattr(got, '__len__') and not isinstance(got, str) else got
+        w = list(val) if hasattr(val, '__len__') and not isinstance(val, str) else val
+        # float32 storage: 0.12 reads back as 0.11999999731779099.
+        if isinstance(w, float) and isinstance(g, float):
+            same = abs(g - w) < 1e-5
+        else:
+            same = (g == w)
+        if not same:
+            bad.append(f'{name.split(":")[-1]} = {g!r}, wanted {w!r}')
+    if bad:
+        say('  FAIL: lidar parameters did not stick:')
+        for b in bad:
+            say(f'    {b}')
+        return None
+
+    say(f'  lidar: {lidar.GetPath()}')
+    say(f'    {LIDAR_BEAMS} beams at {360/LIDAR_BEAMS:.3f} deg, '
+        f'{LIDAR_RANGE_MIN}-{LIDAR_RANGE_MAX} m, {LIDAR_HZ} Hz  '
+        f'(all {len(wanted)} parameters read back)')
+    return str(lidar.GetPath())
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -47,6 +155,13 @@ def main():
     ap.add_argument('--gui', action='store_true')
     ap.add_argument('--no-verify', dest='verify', action='store_false', default=True)
     ap.add_argument('--verify-seconds', type=float, default=10.0)
+    ap.add_argument('--no-lidar', dest='lidar', action='store_false', default=True,
+                    help='omit the RTX lidar. Without it the arena cannot feed SLAM, '
+                         'Nav2 or the governor -- they all wait on /scan, silently.')
+    ap.add_argument('--break-lidar', action='store_true',
+                    help='NEGATIVE TEST: author the lidar with a nonzero elevation, to '
+                         'prove the parameter readback actually catches a sensor that '
+                         'is not on the contract.')
     ap.add_argument('--break-floor', action='store_true',
                     help='NEGATIVE TEST: author the floor with no collider, to prove '
                          'the fall detector actually detects a fall. A check that has '
@@ -175,6 +290,31 @@ def main():
         # would collide with the existing stack. XformCommonAPI edits in place instead.
         UsdGeom.XformCommonAPI(robot.GetPrim()).SetTranslate(
             Gf.Vec3d(0.0, 0.0, spawn_z))
+
+        # The lidar, parented under base_link so it rides with the chassis. It is
+        # authored into the arena rather than at run time so `arena.usd` is complete on
+        # its own and anything opening it gets a sensor already on the contract.
+        if args.lidar:
+            from pxr import Vt
+            from isaacsim.core.utils.extensions import enable_extension
+            # Without this the OmniLidar prim type is unknown and creation fails.
+            enable_extension('isaacsim.sensors.rtx')
+            app.update()
+            base_for_lidar = None
+            for prim in Usd.PrimRange(stage.GetPrimAtPath(ROBOT_PRIM)):
+                if prim.GetName() == 'base_link' and prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                    base_for_lidar = prim
+                    break
+            if base_for_lidar is None:
+                say('  FAIL: no base_link to attach the lidar to')
+                return 1
+            if author_lidar(stage, str(base_for_lidar.GetPath()), Gf, Vt, say,
+                            break_it=args.break_lidar) is None:
+                say('\nRESULT: FAIL (lidar)')
+                return 1
+        else:
+            say('  no lidar (--no-lidar): SLAM, Nav2 and the governor will all '
+                'wait on /scan forever')
 
         os.makedirs(USD_DIR, exist_ok=True)
         stage.Export(ARENA_USD)
