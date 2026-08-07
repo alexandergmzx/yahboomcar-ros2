@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Start and stop the simulation. One command each.
+
+    ./tools/simctl start                 # full stack + RViz + patrol, 2D backend
+    ./tools/simctl start --backend isaac # same stack, Isaac physics underneath
+    ./tools/simctl stop                  # stop the robots, then tear down
+    ./tools/simctl status                # what is running, and where
+    ./tools/simctl patrol                # drive an already-running simulation
+    ./tools/simctl estop --domain 20     # zero a named domain, explicitly
+
+WHY THIS EXISTS
+---------------
+Starting the stack by hand is six commands with waits between them. Stopping it by hand is
+worse, because the obvious way is wrong in a way that bites:
+
+  * `pkill` sends SIGTERM, which killed a patrol process before its cleanup could publish
+    a zero. The firmware retains commands indefinitely -- measured, and the simulator
+    models it -- so the robot kept going and ended up 12 m outside a 4 m room.
+  * Killing ROS nodes leaves stale /dev/shm/fastrtps* segments behind, and those silently
+    block new DDS participants: nodes simply fail to appear, with no error. 410 of them
+    accumulated in one session.
+  * The ros2 daemon then caches a stale node list, reporting nodes that are gone and
+    missing nodes that are running.
+  * RViz instances pile up, and the old ones show frozen data.
+
+THE ORDERING RULE, WHICH IS THE WHOLE POINT OF `stop`
+-----------------------------------------------------
+STOP THE ROBOT BEFORE KILLING WHAT IS DRIVING IT. Every other order leaves a latched
+command running on a robot with no watchdog. This is not a tidiness preference; it is the
+difference between a stopped robot and one crossing the room.
+
+WHAT `stop` DOES TO THE REAL CAR
+--------------------------------
+It publishes ZEROS to the car's domain, and nothing else. It does not kill the micro-ROS
+agent or any hardware node. Stopping a robot is the fail-safe direction; killing its agent
+is not -- that container runs with --rm, so stopping it deletes it and the link is lost.
+"""
+import argparse
+import glob
+import os
+import signal
+import subprocess
+import sys
+import time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WS = os.path.join(REPO, 'yahboomcar_ws')
+SIM_DOMAIN = 66          # the car lives on 20; keep them apart
+CAR_DOMAIN = 20
+
+# Things that COMMAND MOTION. These must be silenced before zeroing, or they simply
+# republish over the zeros -- measured: a patrol kept commanding 0.18 m/s straight
+# through the stop step, and the robot only halted when it was killed a step later,
+# which is the exact accident this ordering exists to prevent.
+#
+# The governor and deadman are NOT here on purpose. They are the opposite of a command
+# source: with the drivers gone, the governor's stale-command rule zeroes the output
+# within 0.3 s and holds it there. Keeping them alive makes the stop happen sooner.
+COMMAND_SOURCES = [
+    'sim_patrol', 'yahboom_keyboard', 'yahboom_joy', 'teleop_twist_keyboard',
+    'controller_server', 'bt_navigator', 'nav2_smoke', 'measure_braking',
+    'twin_motion_sequence', 'component_container_isolated',
+]
+
+# Everything simctl is allowed to kill. The micro-ROS agent is deliberately absent.
+SIM_PROCS = [
+    'sim_patrol', 'fake_robot', 'cmd_vel_governor', 'cmd_vel_deadman',
+    'async_slam_toolbox_node', 'lifecycle_manager', 'laser_odometry',
+    'ekf_node', 'imu_filter_madgwick_node', 'robot_state_publisher',
+    'joint_state_publisher', 'static_transform_publisher', 'rviz2',
+    'sim_runner.py', 'component_container_isolated',
+]
+
+
+def sh(cmd, domain, background=True, log=None):
+    """Run a command with ROS sourced, in its own process group."""
+    full = (f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
+            f'export ROS_DOMAIN_ID={domain} && {cmd}')
+    out = open(log, 'w') if log else subprocess.DEVNULL
+    p = subprocess.Popen(['bash', '-c', full], start_new_session=True,
+                         stdout=out, stderr=subprocess.STDOUT)
+    if not background:
+        p.wait()
+    return p
+
+
+def ros_eval(snippet, domain, timeout=40):
+    """Run a small rclpy snippet and return its stdout. Keeps ROS out of this file."""
+    code = ('import os,sys,time,threading\n'
+            f'os.environ["ROS_DOMAIN_ID"]="{domain}"\n'
+            'import rclpy\n'
+            'from rclpy.node import Node\n'
+            'from rclpy.executors import SingleThreadedExecutor\n'
+            'from rclpy.qos import qos_profile_sensor_data\n'
+            + snippet)
+    full = f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && python3 -'
+    try:
+        r = subprocess.run(['bash', '-c', full], input=code, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.stdout
+    except subprocess.TimeoutExpired:
+        return ''
+
+
+def node_names(domain):
+    out = ros_eval(
+        'rclpy.init(); n=Node("simctl_probe"); time.sleep(2.5)\n'
+        'print("|".join(sorted(x for x,_ in n.get_node_names_and_namespaces())))\n'
+        'sys.stdout.flush(); os._exit(0)\n', domain, timeout=30)
+    return [x for x in out.strip().split('|') if x]
+
+
+def zero_domain(domain, seconds=2.5):
+    """Publish zeros to /cmd_vel and /cmd_vel_raw, then report the observed speed."""
+    return ros_eval(
+        'from geometry_msgs.msg import Twist\n'
+        'from nav_msgs.msg import Odometry\n'
+        'rclpy.init(); n=Node("simctl_stop"); v=[]\n'
+        'n.create_subscription(Odometry,"/odom_raw",lambda m: v.append(m.twist.twist.linear.x), qos_profile_sensor_data)\n'
+        'a=n.create_publisher(Twist,"/cmd_vel",10); b=n.create_publisher(Twist,"/cmd_vel_raw",10)\n'
+        'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
+        'time.sleep(1.0)\n'
+        f'end=time.time()+{seconds}\n'
+        'while time.time()<end:\n'
+        '    a.publish(Twist()); b.publish(Twist()); time.sleep(0.04)\n'
+        'time.sleep(0.6)\n'
+        'print("VX", v[-1] if v else "nodata")\n'
+        'sys.stdout.flush(); os._exit(0)\n', domain, timeout=30)
+
+
+def running(patterns):
+    """PIDs whose command line matches any pattern. Never matches simctl itself."""
+    me = os.getpid()
+    out = subprocess.run(['ps', '-eo', 'pid,args'], capture_output=True, text=True).stdout
+    pids = []
+    for line in out.splitlines()[1:]:
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        pid, args = int(parts[0]), parts[1]
+        if pid == me or 'simctl' in args or 'micro_ros_agent' in args:
+            continue
+        if any(pat in args for pat in patterns):
+            pids.append(pid)
+    return pids
+
+
+def stale_segments():
+    return glob.glob('/dev/shm/fastrtps*') + glob.glob('/dev/shm/sem.fastrtps*')
+
+
+# ------------------------------------------------------------------------ start
+def cmd_start(args):
+    dom = args.domain
+    log = os.path.join(REPO, 'MicroROS-assets', 'logs')
+    os.makedirs(log, exist_ok=True)
+
+    print(f'=== simctl start  (backend {args.backend}, ROS_DOMAIN_ID={dom}) ===')
+
+    names = node_names(dom)
+    if 'YB_Car_Node' in names:
+        print(f'REFUSED: the REAL ROBOT is on domain {dom}.')
+        print('  Starting a simulator here would put two robots on one graph, and the')
+        print('  patrol would drive the physical car. The simulator belongs on '
+              f'{SIM_DOMAIN}; the car is on {CAR_DOMAIN}.')
+        return 2
+    if 'fake_robot' in names:
+        print(f'A simulation is already running on domain {dom}. Stop it first:')
+        print('  ./tools/simctl stop')
+        return 2
+
+    # 1. the robot, plus the REAL bringup stack on top of it
+    if args.backend == 'isaac':
+        print('  [1/6] Isaac backend (~90 s to start)...')
+        sh(f'{os.path.expanduser("~")}/isaac/env_isaaclab/bin/python '
+           f'{REPO}/tools/sim_runner.py --ros', dom,
+           log=os.path.join(log, 'simctl-isaac.log'))
+        deadline = time.time() + 240
+    else:
+        print('  [1/6] simulated firmware + real bringup...')
+        sh(f'ros2 launch yahboomcar_sim sim_bringup_launch.py slip:={args.slip}', dom,
+           log=os.path.join(log, 'simctl-sim.log'))
+        deadline = time.time() + 90
+
+    # Wait on EVIDENCE, never on a fixed sleep: a sleep is why SLAM once appeared to
+    # start and then silently did nothing at all.
+    print('        waiting for /scan and /odom...')
+    while time.time() < deadline:
+        time.sleep(5)
+        out = ros_eval(
+            'from sensor_msgs.msg import LaserScan\n'
+            'from nav_msgs.msg import Odometry\n'
+            'rclpy.init(); n=Node("simctl_wait"); c={"s":0,"o":0}\n'
+            'n.create_subscription(LaserScan,"/scan",lambda m: c.__setitem__("s",c["s"]+1), qos_profile_sensor_data)\n'
+            'n.create_subscription(Odometry,"/odom",lambda m: c.__setitem__("o",c["o"]+1),10)\n'
+            'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
+            'time.sleep(4)\n'
+            'print("READY" if c["s"]>10 and c["o"]>10 else "WAIT", c["s"], c["o"])\n'
+            'sys.stdout.flush(); os._exit(0)\n', dom, timeout=30)
+        if 'READY' in out:
+            print(f'        {out.strip()}')
+            break
+    else:
+        print('  FAILED: no /scan and /odom. See MicroROS-assets/logs/simctl-*.log')
+        return 1
+
+    if args.safety:
+        print('  [2/6] safety governor + deadman...')
+        sh('ros2 launch yahboomcar_safety safety_launch.py', dom,
+           log=os.path.join(log, 'simctl-safety.log'))
+        time.sleep(8)
+
+    print('  [3/6] lidar odometry...')
+    sh('ros2 run yahboomcar_localization laser_odometry', dom,
+       log=os.path.join(log, 'simctl-laserodom.log'))
+
+    if args.slam:
+        print('  [4/6] SLAM...')
+        sh('ros2 launch yahboomcar_nav slam_toolbox_launch.py', dom,
+           log=os.path.join(log, 'simctl-slam.log'))
+        # slam_toolbox is a LIFECYCLE node on Jazzy: it starts unconfigured and, without
+        # the lifecycle manager driving it, reads its params and then silently does
+        # nothing forever. So readiness has to be checked -- but NOT with
+        # `ros2 lifecycle get`, which reported "Node not found" on this machine while
+        # SLAM was demonstrably publishing a 4.04 x 4.04 m map. The CLI depends on the
+        # ros2 daemon, and the daemon is unreliable here after processes churn.
+        #
+        # Wait for /map instead. It is the output that matters, it cannot be stale, and
+        # it proves more than `active` does: a node can be active and still produce
+        # nothing.
+        print('        waiting for /map (checking output, not status)...')
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            time.sleep(6)
+            out = ros_eval(
+                'from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy\n'
+                'from nav_msgs.msg import OccupancyGrid\n'
+                'rclpy.init(); n=Node("simctl_map"); g=[]\n'
+                'q=QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,'
+                ' reliability=QoSReliabilityPolicy.RELIABLE)\n'
+                'n.create_subscription(OccupancyGrid,"/map",lambda m: g.append(m), q)\n'
+                'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
+                'time.sleep(5)\n'
+                'print("MAP", len(g), ("%.2f" % (g[-1].info.width*g[-1].info.resolution)) if g else 0)\n'
+                'sys.stdout.flush(); os._exit(0)\n', dom, timeout=30)
+            if 'MAP' in out and out.split('MAP')[-1].split()[0] != '0':
+                n, size = out.split('MAP')[-1].split()[:2]
+                print(f'        map publishing: {n} updates, {size} m across')
+                break
+        else:
+            print('        WARNING: no /map after 120 s. SLAM is not producing output.')
+
+    if args.rviz:
+        print('  [5/6] RViz...')
+        env = dict(os.environ)
+        env.setdefault('DISPLAY', ':0')
+        subprocess.Popen(
+            ['bash', '-c',
+             f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
+             f'export ROS_DOMAIN_ID={dom} && '
+             f'rviz2 -d {WS}/src/yahboomcar_nav/rviz/nav2_debug.rviz'],
+            start_new_session=True, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(8)
+
+    if args.patrol:
+        # sim_patrol publishes /cmd_vel_raw so the governor stays in the loop, exactly as
+        # it would on the floor. With --no-safety there is no governor, so NOTHING
+        # forwards /cmd_vel_raw to /cmd_vel and the robot never moves -- measured: peak
+        # velocity 0.000 m/s, looking for all the world like a broken simulator.
+        # Without a governor the patrol must publish directly.
+        if args.safety:
+            print('  [6/6] governed patrol (via /cmd_vel_raw)...')
+            extra = ''
+        else:
+            print('  [6/6] patrol, UNGOVERNED (--no-safety, so publishing /cmd_vel '
+                  'directly)...')
+            extra = ' --direct'
+        sh(f'python3 {REPO}/tools/sim_patrol.py --domain {dom}{extra}', dom,
+           log=os.path.join(log, 'simctl-patrol.log'))
+        time.sleep(6)
+
+    print()
+    print('  up. ./tools/simctl status   to inspect,   ./tools/simctl stop   to tear down')
+    return 0
+
+
+# ------------------------------------------------------------------------- stop
+def cmd_stop(args):
+    print('=== simctl stop ===')
+
+    # STEP 1: silence whatever is COMMANDING motion. Zeroing first does not work -- a
+    # driver republishing at 20 Hz just overrides the zeros. Measured: the stop step
+    # reported vx = 0.18 because the patrol was still commanding, and the robot only
+    # halted when it was killed afterwards, which is precisely the accident this
+    # ordering is meant to prevent.
+    print('  [1/5] silencing command sources (they would republish over the zeros)')
+    src = running(COMMAND_SOURCES)
+    for p in src:
+        try:
+            os.kill(p, signal.SIGTERM)          # SIGTERM first: sim_patrol zeroes on it
+        except ProcessLookupError:
+            pass
+    time.sleep(2.5)
+    for p in running(COMMAND_SOURCES):
+        try:
+            os.kill(p, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    print(f'        {len(src)} command source(s) stopped')
+
+    # STEP 2: now the zeros can actually land, and the governor (still alive) holds them.
+    print('  [2/5] stopping the robots, and verifying they are at rest')
+    for dom, label in ((args.domain, 'simulation'), (CAR_DOMAIN, 'real car')):
+        if dom == CAR_DOMAIN and args.no_car:
+            print(f'        domain {dom} ({label}): skipped (--no-car)')
+            continue
+        out = zero_domain(dom, seconds=3.0)
+        vx = out.split('VX')[-1].strip() if 'VX' in out else 'no response'
+        try:
+            moving = abs(float(vx)) > 0.02
+        except ValueError:
+            moving = False
+        state = 'STILL MOVING' if moving else 'at rest'
+        print(f'        domain {dom} ({label}): vx = {vx}  -> {state}')
+        if moving:
+            print('        *** retrying: something is still commanding motion ***')
+            out = zero_domain(dom, seconds=4.0)
+            vx = out.split('VX')[-1].strip() if 'VX' in out else '?'
+            print(f'        domain {dom} ({label}): vx = {vx} after retry')
+    if not args.no_car:
+        print('        (the car gets ZEROS ONLY -- its agent and nodes are never killed)')
+
+    print('  [3/5] killing simulation processes')
+    pids = running(SIM_PROCS)
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    time.sleep(3)
+    left = running(SIM_PROCS)
+    for p in left:
+        try:
+            os.kill(p, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    time.sleep(1)
+    print(f'        {len(pids)} terminated, {len(running(SIM_PROCS))} remaining')
+
+    # Stale segments silently block new DDS participants: nodes just never appear.
+    print('  [4/5] clearing stale DDS shared memory')
+    seg = stale_segments()
+    for f in seg:
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+    print(f'        {len(seg)} segments removed, {len(stale_segments())} left')
+
+    print('  [5/5] resetting the ros2 daemon (it caches a stale node list)')
+    subprocess.run(['bash', '-c',
+                    'source /opt/ros/jazzy/setup.bash && ros2 daemon stop'],
+                   capture_output=True)
+    print()
+    print('  stopped.')
+    return 0
+
+
+# ----------------------------------------------------------------------- status
+def cmd_status(args):
+    print('=== simctl status ===')
+    for dom, label in ((args.domain, 'simulation'), (CAR_DOMAIN, 'real car')):
+        names = node_names(dom)
+        kind = ('SIMULATOR' if 'fake_robot' in names else
+                'REAL ROBOT' if 'YB_Car_Node' in names else 'nothing')
+        print(f'  domain {dom} ({label}): {kind}, {len(names)} nodes')
+        for want, why in (('cmd_vel_governor', 'speed/obstacle limiting'),
+                          ('cmd_vel_deadman', 'catches a dead publisher'),
+                          ('slam_toolbox', 'mapping'),
+                          ('laser_odometry', 'lidar odometry'),
+                          ('ekf_filter_node', 'sensor fusion')):
+            if want in names:
+                print(f'      {want:20s} up   ({why})')
+    print(f'  rviz2 instances: {len(running(["rviz2"]))}')
+    print(f'  stale DDS segments: {len(stale_segments())}')
+    out = ros_eval(
+        'from nav_msgs.msg import Odometry\n'
+        'rclpy.init(); n=Node("simctl_status"); p=[]\n'
+        'n.create_subscription(Odometry,"/odom",lambda m: p.append((m.pose.pose.position.x,m.pose.pose.position.y)),10)\n'
+        'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
+        'time.sleep(3)\n'
+        'print("POSE", ("%.2f %.2f" % p[-1]) if p else "none")\n'
+        'sys.stdout.flush(); os._exit(0)\n', args.domain, timeout=30)
+    if 'POSE' in out:
+        print(f'  robot pose (/odom): {out.split("POSE")[-1].strip()}')
+    return 0
+
+
+def cmd_patrol(args):
+    return sh(f'python3 {REPO}/tools/sim_patrol.py --domain {args.domain}',
+              args.domain, background=False).returncode
+
+
+def cmd_estop(args):
+    """Explicit, so stopping the car is never a side effect of tidying up."""
+    print(f'=== simctl estop  (domain {args.domain}) ===')
+    out = zero_domain(args.domain, seconds=4.0)
+    vx = out.split('VX')[-1].strip() if 'VX' in out else 'no response'
+    print(f'  zeros sent, vx = {vx}')
+    print('  NOTE: this stops a robot that is listening. It cannot stop one whose link')
+    print('  is down -- the firmware has no watchdog, so the power switch is the only')
+    print('  stop that always works.')
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
+    sub = ap.add_subparsers(dest='cmd', required=True)
+
+    s = sub.add_parser('start', help='bring up a simulation')
+    s.add_argument('--backend', choices=['2d', 'isaac'], default='2d')
+    s.add_argument('--domain', type=int, default=SIM_DOMAIN)
+    s.add_argument('--slip', type=float, default=0.0)
+    s.add_argument('--no-rviz', dest='rviz', action='store_false')
+    s.add_argument('--no-slam', dest='slam', action='store_false')
+    s.add_argument('--no-safety', dest='safety', action='store_false')
+    s.add_argument('--no-patrol', dest='patrol', action='store_false')
+    s.set_defaults(func=cmd_start)
+
+    t = sub.add_parser('stop', help='stop robots, then tear the simulation down')
+    t.add_argument('--domain', type=int, default=SIM_DOMAIN)
+    t.add_argument('--no-car', action='store_true',
+                   help='do not send stop-zeros to the real car')
+    t.set_defaults(func=cmd_stop)
+
+    st = sub.add_parser('status', help='what is running, and where')
+    st.add_argument('--domain', type=int, default=SIM_DOMAIN)
+    st.set_defaults(func=cmd_status)
+
+    p = sub.add_parser('patrol', help='drive an already-running simulation')
+    p.add_argument('--domain', type=int, default=SIM_DOMAIN)
+    p.set_defaults(func=cmd_patrol)
+
+    e = sub.add_parser('estop', help='publish zeros to a domain, explicitly')
+    e.add_argument('--domain', type=int, default=CAR_DOMAIN)
+    e.set_defaults(func=cmd_estop)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == '__main__':
+    code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)
