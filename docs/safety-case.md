@@ -231,6 +231,32 @@ arbiter. That is a **command-arbitration** problem, and it belongs with sensor f
 rather than with the safety filter. Until it is designed, the operating rule stands:
 **only run governed launch files, and watch the log for BYPASSED.**
 
+## An accidental demonstration of the no-watchdog hazard
+
+While driving the simulator for a demo, a patrol process was stopped with `pkill`. SIGTERM
+terminated it before its cleanup could publish a zero, the last command stayed latched, and
+**the robot drove 12 m out of a 4 m room** before anyone intervened.
+
+That is not a simulator quirk. It is the firmware's measured behaviour, faithfully
+reproduced — and it happened with no governor and no deadman running, which is exactly
+what an unprotected floor session looks like.
+
+Repeating it with the safety stack up:
+
+| | outcome |
+|---|---|
+| no governor, no deadman, SIGTERM | **12 m** past the walls |
+| governor running, **SIGKILL** (uncatchable) | **47 mm**, then stopped |
+
+The governor's stale-command path caught it, not the deadman — correct, since the patrol
+was publishing through `/cmd_vel_raw`. The deadman remains the backstop for a publisher
+that writes to `/cmd_vel` directly, or for the governor itself dying.
+
+**The transferable lesson is not "handle SIGTERM".** It is that no publisher can be relied
+on to clean up after itself, because SIGKILL cannot be caught at all. Which is the entire
+argument for a separate watchdog process — and for the power switch, since even that
+watchdog cannot survive the Wi-Fi dropping.
+
 ## The gyro is intermittently dead
 
 A flat gyro only means something if the robot was actually asked to turn. Cross-checking
@@ -289,6 +315,8 @@ rotation it cannot see.
 | Deadman covers link loss | **NO — measured to fail.** Nothing on this PC can |
 | Stop paths leak no translation | unit test over all 5 stop paths, both axes |
 | Reverse and near-obstacle yaw bounded | unit tests; **never exercised on hardware** |
+| It slows for obstacles, moving robot | simulator: `slowed to 0.48 at 0.61 m` while patrolling — the taper acting on a robot in motion, not a bench |
+| Stale command stops a moving robot | simulator: patrol **SIGKILLed** mid-leg, robot travelled **47 mm** and stopped (0.26 s at 0.18 m/s, matching the 0.30 s `cmd_timeout`). Unprotected, the same kill ran it **12 m** out of a 4 m room |
 | It stops before contact | **simulation only**, 0.394 m from a wall |
 | Scan interval, governor loop | measured, live car, 2 runs; load-independent so they transfer |
 | Command→motion latency | measured **elevated only**; a lower bound on the floor value |
