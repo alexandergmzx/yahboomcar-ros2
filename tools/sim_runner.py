@@ -43,15 +43,14 @@ ROBOT_PRIM = '/World/Robot'
 # from the imported mesh's world bbox (0.0502 diameter).
 WHEEL_R_GEOMETRIC = 0.0245
 
-# EFFECTIVE rolling radius, measured in-sim: commanding 6.25 rad/s yields an achieved
-# 6.007 rad/s and a body speed of 0.2750 m/s, so v/omega = 0.0458 -- 1.83x the geometry.
-#
-# UNEXPLAINED. A driven wheel cannot propel a body faster than pure rolling, so this
-# points at an angular-unit or contact-radius mismatch somewhere between
-# apply_action(joint_velocities=...) and the PhysX drive rather than at real physics.
-# The controller uses the measured value because that makes commanded speed match
-# reality, which is what the tests need; the discrepancy is recorded here rather than
-# hidden, and --calibrate re-measures it on demand.
+# EFFECTIVE rolling radius as seen through the joint-velocity API: 0.0458, i.e. 1.9x
+# the geometry. SHARPENED 2026-08-08: the anomaly SURVIVED replacing the faceted hull
+# colliders with analytic cylinders of EXACTLY r=0.024 -- commanded 0.2 m/s through
+# this constant yields a measured 0.210 m/s ground-truth speed on wheels whose true
+# radius is beyond doubt. A real contact cannot roll at twice its radius, so this is a
+# UNITS/CONVENTION factor of ~2.0 between apply_action/get_joint_velocities and the
+# physical angular velocity, not contact geometry. Where the 2 comes from is still
+# unexplained; the constant compensates it exactly, and --calibrate re-measures.
 WHEEL_R = 0.0458
 LY = 0.0675            # half-track from the URDF joint origins
 LEFT = ['zq_Joint', 'zh_Joint']
@@ -59,6 +58,25 @@ RIGHT = ['yq_Joint', 'yh_Joint']
 # The URDF mirrors the right wheels (axis 0,-1,0) against the left (0,1,0), so a
 # positive joint velocity spins them opposite ways in world terms.
 MIRROR_RIGHT = True
+
+# SKID-STEER SLIP COMPENSATION, measured on the cylinder-wheel arena (2026-08-08).
+# Even with clean cylinder colliders and low-friction rear wheels, achieved yaw tracks
+# commanded yaw as roughly
+#       achieved = YAW_GAIN * commanded - YAW_LOSS        (zero below the breakaway)
+# because turning a skid-steer IS controlled slip -- the lateral friction the front
+# wheels need for drive also resists the turn. Real skid-steer firmware compensates
+# with exactly this kind of feedforward. Measured points: wz 2.0 -> 0.645, 3.0 -> 1.23;
+# below ~1.5 rad/s of wheel-speed target the wheels do not break static friction at
+# all, so small commanded yaws are lifted to the working region rather than dropped.
+YAW_GAIN = 0.585
+YAW_LOSS = 0.52
+# The compensated command is CAPPED at the largest value measured stable. Uncapped
+# extrapolation collapsed: a commanded 3.0 rad/s became a 6.0 rad/s wheel-differential
+# request and yaw fell to 0.075 rad/s (wild slip), while 4.31 -- the compensated form
+# of a commanded 2.0 -- still yielded 1.225. So the achievable body yaw tops out around
+# 1.2 rad/s; the vendor keyboard's default turn is 1.0 and the governor caps at 1.5,
+# both inside the working range.
+YAW_CMD_CAP = 4.31
 
 
 class Sim:
@@ -126,8 +144,15 @@ class Sim:
         return float(t[0]), float(t[1]), float(yaw)
 
     def drive(self, vx, wz):
-        """Differential IK -> per-wheel angular velocity targets."""
+        """Differential IK -> per-wheel angular velocity targets.
+
+        wz passes through the measured slip-compensation feedforward: the wheel
+        DIFFERENTIAL needed for a desired body yaw is larger than kinematics says,
+        because a skid-steer turns by slipping. See YAW_GAIN/YAW_LOSS.
+        """
         import numpy as np
+        if wz != 0.0:
+            wz = math.copysign(min(YAW_CMD_CAP, (abs(wz) + YAW_LOSS) / YAW_GAIN), wz)
         # The controller believes each side has its own radius; the simulated wheels
         # are identical. That mismatch is exactly a Type B (unequal diameter) error.
         left = (vx - wz * LY) / self.r_left

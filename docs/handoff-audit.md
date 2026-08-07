@@ -566,3 +566,65 @@ running" tells you nothing about session health; only data rates do.
 
 Also corrected: README/porting-notes test totals (165 → 170) and the twin row, which
 overstated fixture results as live tracking.
+
+
+---
+
+# Isaac wheel dynamics: the "barely rotates" investigation (2026-08-08)
+
+Field report: teleop on Isaac at "0.05 m/s or less, barely rotates". Quantified, then
+fixed in three measured steps. The trail matters as much as the fix, because two early
+"trials" were invisibly inert.
+
+## The measurements, in order
+
+| stage | linear (0.2 m/s) | yaw at wz=1.0 | yaw at wz=2.0 |
+|---|---|---|---|
+| baseline (hull colliders) | 89 % | 0 % | 2 % |
+| + analytic cylinder wheels | 105 % | 0 % | 15 % |
+| + low-friction rear pair | 105 % | 0 % | 32 % |
+| + slip feedforward (capped) | 105 % | **98 %** | 58 % (saturates ≈1.2 rad/s) |
+
+## What was actually wrong
+
+1. **The wheels were faceted convex hulls** of the visual meshes (the importer's
+   default), pressing flats 0–4 mm into the floor under the 1 kg mass. Twisting a
+   loaded flat is a parking brake: wheels could not even reach commanded speed during
+   turns (66 % of target). Analytic cylinders (r = 0.024, from the STL): wheels
+   105–109 % of target, linear to 105 %, and the mysterious ~0.5 m straight-drive veer
+   disappeared.
+2. **Uniform-μ skid-steer cannot be helped by friction tuning** — drive moment and
+   lateral resistance both scale with μ, and PhysX has no anisotropic friction (real
+   rubber does). Low-friction rear wheels (μ 0.1) approximate a differential + casters:
+   turn response doubled. A modelling choice, stated in `build_arena.py`.
+3. **Turning a skid-steer is controlled slip**, so achieved yaw tracks commanded as
+   ~0.585·wz − 0.52 with a static-friction dead zone below it. `sim_runner.drive()` now
+   carries the measured inverse as feedforward — what real skid-steer firmware does —
+   capped at the largest measured-stable command (uncapped extrapolation collapsed:
+   commanded 3.0 → 0.075 rad/s of wild slip).
+
+## Dead ends, named so they stay dead
+
+- **Post-init USD edits are INERT.** Both the first damping trial (×100, "no effect")
+  and the first two friction sweeps (perfectly flat) were editing a stage PhysX had
+  already consumed. Every physics edit must be authored and SAVED before
+  `SimulationContext` initialises. Two sessions were spent concluding falsehoods from
+  inert experiments.
+- **Chassis drag**: disproved by measurement — 10.2 mm clearance.
+- **Drive force/damping**: maxForce was already FLT_MAX; damping ×10 (properly, pre-init)
+  changed nothing at low targets.
+- **Plain `PrimRange` cannot see the imported colliders** — they live inside
+  instanceable prims (`TraverseInstanceProxies` or de-instance first). A "0 colliders
+  found" result made one whole trial a no-op that *looked* like a physics conclusion.
+
+## Sharpened, still open
+
+- **The 1.87× wheel-radius anomaly is a units factor of ~2.0**, proven by cylinders of
+  exact radius: commanded 0.2 m/s through `WHEEL_R = 0.0458` gives 0.210 m/s on wheels
+  that are 0.024 by construction. A contact cannot roll at twice its radius — the
+  factor lives between `apply_action`/`get_joint_velocities` and physical angular
+  velocity. Compensated exactly; origin unknown.
+- Linear at 1.0 m/s achieves 66 % (front-drive-only traction at high wheel speeds);
+  yaw saturates ≈1.2 rad/s. Both inside what teleop and the governor use (1.0 / 1.5).
+- The low-target static-friction dead zone (wheels at 0 % below ≈1.5 rad/s target)
+  is bridged by the feedforward, not explained.

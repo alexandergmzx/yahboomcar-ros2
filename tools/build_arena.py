@@ -158,6 +158,11 @@ def main():
     ap.add_argument('--box-mass', type=float, default=0.12,
                     help='kg per cardboard box. An empty ~30 cm box is ~0.1-0.15 kg; '
                          'the old 0.4 outweighed the robot.')
+    ap.add_argument('--rear-wheel-friction', type=float, default=0.1,
+                    help='mu for the REAR wheel cylinders. Low on purpose: PhysX has '
+                         'no anisotropic friction, and rear-slide approximates a '
+                         'differential+caster so the skid-steer can actually turn. '
+                         'A modelling choice, measured, not physics of the real car.')
     ap.add_argument('--robot-mass', type=float, default=1.0,
                     help='kg, TOTAL for the robot. Estimate from holding the real car '
                          '("like a kilogram"); the URDF inertials total only 0.355 kg. '
@@ -335,6 +340,59 @@ def main():
         else:
             say(f'  robot mass left at URDF inertials (~{urdf_total} kg): '
                 f'--robot-mass {args.robot_mass} does not exceed them')
+
+        # ---- WHEEL CONTACT, measured into shape ---------------------------------
+        # The importer gave every wheel a FACETED CONVEX HULL of its visual mesh -- a
+        # polygon prism that pressed flats into the floor (0-4 mm penetration under
+        # 1 kg). Twisting a loaded flat is a parking brake: measured, the wheels could
+        # not even reach commanded speed during turns (66% of target) and the body
+        # turned at 2-3% of command, which in the field read as "barely rotates".
+        #
+        # Two authored changes, each MEASURED against a turn ladder:
+        #   1. Smooth analytic CYLINDER colliders (r=0.024, w=0.0215, from the STL)
+        #      replace the hulls: wheels 66% -> 105-109% of target, linear 83-89% ->
+        #      93-105%.
+        #   2. LOW-FRICTION REAR wheels (mu 0.1 vs 0.6 front). A uniform-mu skid-steer
+        #      cannot be helped by friction tuning -- drive moment and lateral
+        #      resistance both scale with mu -- and PhysX has no anisotropic friction,
+        #      which is what real rubber has. Rear-slide approximates a differential
+        #      drive with casters: turn response doubled again (15% -> 32-41%).
+        #      MODELLING CHOICE, stated: the real car is 4WD skid-steer.
+        #
+        # Residual, also measured: below ~1.5 rad/s of commanded wheel speed the
+        # wheels do not break static friction at all (0%), and above it the achieved
+        # yaw is ~0.585*wz - 0.52. sim_runner.drive() carries the measured inverse as
+        # slip-compensation feedforward -- which is what real skid-steer firmware does.
+        for w in ('zq_Link', 'yq_Link', 'yh_Link', 'zh_Link'):
+            link = stage.GetPrimAtPath(f'{ROBOT_PRIM}/{w}')
+            if not link or not link.IsValid():
+                say(f'  FAIL: wheel link {w} missing')
+                return 1
+            for prim in Usd.PrimRange(link, Usd.TraverseInstanceProxies()):
+                if prim.IsInstanceable():
+                    prim.SetInstanceable(False)
+            disabled = 0
+            for prim in Usd.PrimRange(link):
+                if prim.HasAPI(UsdPhysics.CollisionAPI):
+                    UsdPhysics.CollisionAPI(prim).CreateCollisionEnabledAttr(False)
+                    disabled += 1
+            cyl = UsdGeom.Cylinder.Define(stage, f'{ROBOT_PRIM}/{w}/wheel_cyl')
+            cyl.CreateAxisAttr('Y')                 # wheel axis is local Y (URDF)
+            cyl.CreateRadiusAttr(0.024)
+            cyl.CreateHeightAttr(0.0215)
+            cyl.CreatePurposeAttr(UsdGeom.Tokens.guide)   # collider, not a visual
+            UsdPhysics.CollisionAPI.Apply(cyl.GetPrim())
+            is_rear = w in ('yh_Link', 'zh_Link')
+            mu = args.rear_wheel_friction if is_rear else args.friction
+            wmat = UsdShade.Material.Define(stage, f'/World/PhysicsMaterials/Wheel_{w}')
+            wapi = UsdPhysics.MaterialAPI.Apply(wmat.GetPrim())
+            wapi.CreateStaticFrictionAttr().Set(mu)
+            wapi.CreateDynamicFrictionAttr().Set(max(0.05, mu - 0.1))
+            wapi.CreateRestitutionAttr().Set(0.0)
+            UsdShade.MaterialBindingAPI.Apply(cyl.GetPrim()).Bind(
+                wmat, materialPurpose='physics')
+            say(f'  {w}: {disabled} hull collider(s) off, cylinder on, mu={mu}'
+                f'{" (rear/slide)" if is_rear else ""}')
 
         # The lidar, parented under base_link so it rides with the chassis. It is
         # authored into the arena rather than at run time so `arena.usd` is complete on
