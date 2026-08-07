@@ -177,6 +177,28 @@ def active_calibration(store):
     return None
 
 
+def runs_for_active_calibration(store):
+    """-> (runs, skipped, k). Only runs computed under the CURRENT calibration.
+
+    Every run stores `stop_distance_m = tape - k * runup`, so k is baked into the answer
+    at record time. Runs taken under different calibrations therefore carry different
+    systematic corrections, and fitting them together produces a model that looks
+    perfectly plausible and describes nothing -- the fit had no way to know, because it
+    was handed `store['runs']` wholesale. Audit finding.
+
+    Runs predating the per-run `odom_scale_k` field are treated as foreign: it cannot be
+    established what correction they carry, and guessing is how bad evidence survives.
+    """
+    k = store.get('odom_scale_k')
+    if k is None:
+        return [], list(store.get('runs', [])), None
+    keep, skip = [], []
+    for r in store.get('runs', []):
+        rk = r.get('odom_scale_k')
+        (keep if rk is not None and abs(rk - k) < 1e-9 else skip).append(r)
+    return keep, skip, k
+
+
 def _lstsq(v, d):
     import numpy as np
     A = np.vstack([v, v ** 2]).T
@@ -185,9 +207,24 @@ def _lstsq(v, d):
 
 
 def fit(runs, n_boot=2000, seed=0):
-    """Fit d = T_stop*v + v^2/(2a) with bootstrap CIs and a bias sweep."""
+    """Fit d = T_stop*v + v^2/(2a) with bootstrap CIs and a bias sweep.
+
+    RUNS ARE GROUPED BY COMMANDED SPEED, regressed on MEASURED speed.
+
+    Grouping used to key on `round(measured_speed, 3)`, which is an identity no two real
+    runs ever share: 0.049, 0.050 and 0.051 m/s became three separate "speeds" of one run
+    each, so `enough_runs_per_speed` could never pass on floor data. Reproduced with a
+    physically exact dataset (T_stop 0.25 s, a 1.5 m/s^2, 5 runs at each of 3 commanded
+    speeds): the fit recovered 250 ms and 1.50 exactly and still reported
+    identifiable=False over 9 spurious speeds. Audit finding.
+
+    The commanded speed is the experimental STAGE and is already recorded on every run;
+    the measured speed is the measurement and belongs on the x-axis, not in the key.
+    """
     import numpy as np
-    pts = [(r['measured_speed_m_s'], r['stop_distance_m']) for r in runs
+    pts = [(r['measured_speed_m_s'], r['stop_distance_m'],
+            r.get('commanded_speed_m_s'))
+           for r in runs
            if r.get('stop_distance_m') is not None
            and r.get('measured_speed_m_s')]
     if len(pts) < 2:
@@ -195,7 +232,11 @@ def fit(runs, n_boot=2000, seed=0):
 
     v = np.array([p[0] for p in pts])
     d = np.array([p[1] for p in pts])
-    speeds = sorted({round(x, 3) for x in v})
+    # Runs predating commanded_speed_m_s fall back to the measured value, which restores
+    # the old (broken) grouping for those runs ONLY, and says so.
+    legacy = sum(1 for p in pts if p[2] is None)
+    stage = np.array([p[2] if p[2] is not None else round(p[0], 3) for p in pts])
+    speeds = sorted({float(x) for x in stage})
     spread = max(speeds) / min(speeds) if min(speeds) > 0 else 1.0
 
     t_hat, b_hat = _lstsq(v, d)
@@ -203,12 +244,13 @@ def fit(runs, n_boot=2000, seed=0):
 
     out = {
         'n_runs': len(pts),
+        'legacy_runs_without_commanded_speed': legacy,
         'distinct_speeds': speeds,
         'speed_spread': spread,
         'T_stop_s': t_hat,
         'residual_rms_m': float(np.sqrt(np.mean(res ** 2))),
         'residual_max_m': float(np.max(np.abs(res))),
-        'points': [(float(a), float(b)) for a, b in pts],
+        'points': [(float(vv), float(dd)) for vv, dd, _ in pts],
     }
     out['decel_m_s2'] = (1.0 / (2.0 * b_hat)) if b_hat > 0 else None
 
@@ -219,7 +261,8 @@ def fit(runs, n_boot=2000, seed=0):
     # fed it stopping distances that DECREASED with speed and got identifiable: True with
     # T_stop = 5.109 s; and a set giving T_stop = -0.295 s, also identifiable: True.
     # Neither is a hard case -- both are impossible, and the fit had no opinion.
-    per_speed = {sp: [d for vv, d in pts if round(vv, 3) == sp] for sp in speeds}
+    per_speed = {sp: [float(dd) for dd, st in zip(d, stage) if st == sp]
+                 for sp in speeds}
     means = [float(np.mean(per_speed[sp])) for sp in speeds]
 
     checks = {
@@ -243,7 +286,7 @@ def fit(runs, n_boot=2000, seed=0):
     boot = []
     for _ in range(n_boot):
         idx = rng.integers(0, len(v), len(v))
-        if len({round(x, 3) for x in v[idx]}) < 2:
+        if len({float(x) for x in stage[idx]}) < 2:
             continue
         try:
             boot.append(_lstsq(v[idx], d[idx]))
@@ -317,11 +360,22 @@ def envelope(f, speed, pct=95):
     preds = bt * speed + bb * speed ** 2
     est = float(np.percentile(preds, pct))
 
-    # (2) worst over the bias sweep.
-    for b in f.get('bias_sweep', []):
-        if b.get('decel_m_s2') and b['T_stop_s'] > 0:
-            est = max(est, b['T_stop_s'] * speed
-                      + speed ** 2 / (2.0 * b['decel_m_s2']))
+    # (2) worst over the bias sweep -- and REFUSE if any sweep result is unphysical.
+    #
+    # This used to `if b.get('decel_m_s2') and b['T_stop_s'] > 0:`, silently SKIPPING
+    # exactly the sweep results that matter. A negative T_stop under 1 mm of assumed
+    # bias does not mean "ignore this sample", it means the split between T_stop and `a`
+    # is not determined by this data at all -- which is the single failure mode the
+    # sweep exists to expose. Skipping it made the envelope "the worst of the results
+    # that happened to be physical", not "the worst of the sweep" as documented.
+    # Audit finding.
+    sweep = f.get('bias_sweep', [])
+    if not sweep:
+        return None
+    for b in sweep:
+        if not b.get('decel_m_s2') or b['T_stop_s'] <= 0:
+            return None
+        est = max(est, b['T_stop_s'] * speed + speed ** 2 / (2.0 * b['decel_m_s2']))
 
     # (3) never below anything already measured at or below this speed.
     observed = [d for v, d in f.get('points', []) if v <= speed + 1e-9]
@@ -495,9 +549,18 @@ def main():
         return 0
 
     if args.fit:
+        keep, skip, k = runs_for_active_calibration(store)
         print('=== fit over recorded runs ===')
-        print(f'odometry scale k = {store.get("odom_scale_k")}')
-        report(fit(store['runs']), print)
+        print(f'odometry scale k = {k}')
+        if skip:
+            print(f'  EXCLUDED {len(skip)} run(s) recorded under a DIFFERENT calibration')
+            print('  (or with none recorded). stop_distance = tape - k*runup, so those')
+            print('  runs carry a different systematic correction and cannot be pooled')
+            print('  with these -- the combined model would look fine and mean nothing.')
+        if not keep:
+            print('  no runs match the active calibration; nothing to fit')
+            return 1
+        report(fit(keep), print)
         return 0
 
     if not args.calibrate and args.speed > args.max_speed \
@@ -888,9 +951,12 @@ def main():
     store['runs'].extend(new)
     save(store)
 
+    keep, skip, _ = runs_for_active_calibration(store)
     say('')
-    say(f'=== fit over all {len(store["runs"])} recorded runs ===')
-    report(fit(store['runs']), say)
+    say(f'=== fit over {len(keep)} run(s) on the ACTIVE calibration ===')
+    if skip:
+        say(f'    ({len(skip)} run(s) from other calibrations excluded)')
+    report(fit(keep), say)
 
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f'braking-{stamp}.log')
