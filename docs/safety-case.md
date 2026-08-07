@@ -129,6 +129,33 @@ To protect a vendor node ad hoc:
 ros2 run <pkg> <node> --ros-args -r /cmd_vel:=/cmd_vel_raw
 ```
 
+Seven of these end in a bare `rclpy.spin(node)` with no cleanup at all — `yahboom_joy`,
+`yahboom_joy_R2`, `multi_yahboom_joy` and `listenline` among them — so **any** exit path
+leaves the last commanded twist latched on a firmware that never times it out. They are
+left that way by decision, to keep the course PDFs correct and the upstream diff
+readable. Do not read the section below as covering them.
+
+### First-party tools ARE isolated, since 2026-08-07
+
+Every tool under `tools/` that can command a velocity now goes through
+[`tools/_cmd_vel_safety.py`](../tools/_cmd_vel_safety.py):
+
+- **`require_simulator()`** refuses to run if `YB_Car_Node` is on the domain **at all** —
+  including when a simulator is present too, because a command published then reaches
+  both. A simulator is recognised only by *positive* evidence: the `fake_robot` node, or
+  `/sim/ground_truth`, a topic the firmware cannot publish. Never by the absence of the
+  car, which would fail open whenever discovery was slow.
+- **`SafeCmdVel`** publishes zeros on normal exit, on an exception, on `SIGINT` **and on
+  `SIGTERM`**. Measured both ways with a listener recording the last commanded value:
+  guarded leaves `[0.0 × 5]`, unguarded leaves `[0.15 × 5]`.
+
+This was prompted by an audit finding that three first-party tools — including one added
+the day before — published 0.12–0.15 m/s with no guard and no cleanup, two of them
+defaulting to `ROS_DOMAIN_ID=20`, which is the car.
+
+**None of this survives `SIGKILL` or a Wi-Fi drop.** That is why `cmd_vel_deadman` runs
+as a separate process, and why the power switch is still the only stop that always works.
+
 ## Limits that remain even on protected paths
 
 These are properties of the design, not bugs, and they bound what the governor can claim:

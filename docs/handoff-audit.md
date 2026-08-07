@@ -340,3 +340,79 @@ Both audits were right about everything I checked.
   XRCE session. Identical config, captured from `docker inspect` first.
 
 Reverse the pip installs with `pip uninstall`; apt's versions are untouched on disk.
+
+
+---
+
+# Third audit (commit `c718803`) — verdict NO-GO, all six findings confirmed
+
+Every finding was checked against the code before any was acted on. **All six were
+correct**, and the first was worse than reported. Nothing was disputed.
+
+| # | Finding | Verified as | Fixed in |
+|---|---|---|---|
+| 1 | Simulator tooling can drive the physical robot | **correct, and wider** — 3 tools, not 1 | `b424656` |
+| 2 | The gyro gate is not enforced by calibration | correct | `659c40d` |
+| 3 | Real braking data will not group reliably | correct, all 4 parts | `4c78d0d` |
+| 4 | Nav2's success assertion is unsound | correct, both parts | `b310dfd` |
+| 5 | Isaac's `/odom_raw` is not firmware-equivalent | correct | `75bf4a9` |
+| 6 | Evidence and test-automation gaps | correct | `b424656`, `75bf4a9` |
+
+## What I got wrong, and the shape of it
+
+**Finding 1 is mine, and it is the one that could have hurt someone.** In the previous
+commit I promoted a scratchpad script to `tools/check_isaac_contract.py` without the
+guards every other tool in this repo has. It published 0.12 m/s and 0.3 rad/s with no
+hardware refusal, no zeros on exit, and no domain pin — so on `ROS_DOMAIN_ID=20` it would
+have driven the car ungoverned, and a Ctrl+C in its first half would have left that
+command latched forever.
+
+A sweep found two more first-party tools in the same state — `measure_latency.py` and
+`test_failsafe.py`, both *defaulting* to the car's domain. The irony of the third is
+worth stating: `test_failsafe.py` exists to prove what happens when a command path dies,
+and it could strand a command itself.
+
+**The pattern across findings 2, 3 and 4 is one kind of mistake: a gate that looks like
+it enforces something and does not.**
+
+- A dead gyro produced the *best-looking* calibration the tool could make — exactly
+  `0.000000`, which the gate read as a perfectly straight push. The failure signature was
+  already documented in `CLAUDE.md`; the gate simply did not check for it.
+- Braking runs grouped on measured speed, an identity no two real runs share, so the tool
+  would have refused physically perfect floor data. Verified by reproducing it: the fit
+  recovered T_stop and `a` exactly and still reported `identifiable: False`.
+- Nav2 "success" compared an `odom`-frame pose to a `map`-frame goal and never checked
+  the action status. Near the origin those frames nearly coincide, which is why it
+  produced 177 mm — a plausible number rather than an obviously wrong one. **Retracted.**
+
+Each of these produced a confident number from data that could not support it. That is
+the same failure this repo has now had to retract three times, and the lesson has not
+changed: a check that has never been seen to fail is not known to work.
+
+**Two things the audit did not find, discovered while fixing it:**
+
+- `nav2_smoke.py` returned on timeout while Nav2 was still driving. On the real robot,
+  with no governor and no deadman in that launch, walking away from a moving robot is the
+  worst available response to a timeout. It now cancels.
+- The Isaac backend advertises **no ROS nodes at all**, so a node-name hardware guard
+  cannot see it. That is why the simulator check now also accepts `/sim/ground_truth` —
+  positive evidence rather than the absence of a car.
+
+**One correction to my own checker, during verification:** `check_odom_properties.py`
+read `truth[-1]` immediately after clearing the buffer, so the slip comparison silently
+skipped itself and reported success. The tool being written to catch a hidden defect had
+a defect that hid it.
+
+## What the audit was right to call NOT a regression
+
+`colcon test` shows 121 failures. Every one is vendor lint, copyright or style — there is
+not a single functional failure. Categorised in
+[`porting-notes.md`](porting-notes.md#ci-test-result-categorised-2026-08-07) so the number
+is a known baseline rather than noise. First-party packages: 165 tests, 0 failures.
+
+## Still NO-GO for powered floor testing
+
+None of this measures the robot. Stopping distance remains **unmeasured**, the gyro is
+**undetermined** until someone turns the car by hand, and the hardware braking store
+holds **zero runs**. What changed is that the tooling can no longer drive the car by
+accident, and can no longer certify a measurement it did not make.
