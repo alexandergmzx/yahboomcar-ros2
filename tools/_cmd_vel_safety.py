@@ -65,17 +65,34 @@ def target_of(node, seconds=15.0):
     Never by absence. "I did not find the car" is not evidence that the car is not
     there -- discovery may just be slow -- and a guard built on that would fail open.
     """
+    # ASYMMETRIC EXIT, because DDS discovery is INCREMENTAL: participants appear one by
+    # one over several seconds, in no particular order. This loop used to break on the
+    # FIRST evidence of either kind -- so a simulator discovered at t=2s concluded
+    # 'simulator' while the car, discovered at t=4s, was still invisible, and the tool
+    # then drove a domain the car was on. Fail-open, found by audit.
+    #
+    # Now: finding the CAR ends the search immediately (the conclusion is refusal, and
+    # more waiting cannot make that wrong). Finding a SIMULATOR does not -- the search
+    # continues for `confirm` more seconds specifically looking for a car before
+    # 'simulator' may be concluded. The cost is a few seconds on every guarded start;
+    # the alternative was a race whose losing case drives the real robot.
+    confirm = 6.0
     deadline = time.time() + seconds
-    names, topics = [], []
+    sim_seen_at = None
+    real = sim = False
     while time.time() < deadline:
         time.sleep(1.0)
         names = [n for n, _ in node.get_node_names_and_namespaces()]
         topics = [t for t, _ in node.get_topic_names_and_types()]
-        if (SIMULATOR_NODE in names or REAL_ROBOT_NODE in names
-                or SIMULATOR_TOPIC in topics):
+        real = REAL_ROBOT_NODE in names
+        sim = SIMULATOR_NODE in names or SIMULATOR_TOPIC in topics
+        if real:
             break
-    real = REAL_ROBOT_NODE in names
-    sim = SIMULATOR_NODE in names or SIMULATOR_TOPIC in topics
+        if sim:
+            if sim_seen_at is None:
+                sim_seen_at = time.time()
+            elif time.time() - sim_seen_at >= confirm:
+                break
     if real and sim:
         return 'both'
     if real:

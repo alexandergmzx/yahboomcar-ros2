@@ -90,6 +90,9 @@ import threading
 import time
 from datetime import datetime
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import install_stop_handlers               # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
 # Hardware and simulator results live in SEPARATE stores. They shared one file, and a
@@ -192,10 +195,24 @@ def runs_for_active_calibration(store):
     k = store.get('odom_scale_k')
     if k is None:
         return [], list(store.get('runs', [])), None
+    # MATCH BY IMMUTABLE ID, not by float. Runs used to be associated with their
+    # calibration via abs(run.k - active.k) < 1e-9 -- but k is a MEASUREMENT, not an
+    # identity: two different sessions on two different floors can legitimately produce
+    # the same scale factor, and their runs would then silently pool into one model
+    # carrying two different systematic corrections. The calibration's timestamp is
+    # minted once at --calibrate and never recomputed, so it is the identity.
+    # Audit finding.
+    cal_id = store.get('active_cal_id')
     keep, skip = [], []
     for r in store.get('runs', []):
-        rk = r.get('odom_scale_k')
-        (keep if rk is not None and abs(rk - k) < 1e-9 else skip).append(r)
+        if cal_id is not None:
+            # Runs recorded before cal_id existed have no provenance and are foreign.
+            (keep if r.get('cal_id') == cal_id else skip).append(r)
+        else:
+            # Legacy store with no active_cal_id: the float match is all there is, and
+            # it stays only for reading OLD data -- every new calibration writes an id.
+            rk = r.get('odom_scale_k')
+            (keep if rk is not None and abs(rk - k) < 1e-9 else skip).append(r)
     return keep, skip, k
 
 
@@ -630,6 +647,10 @@ def main():
             lambda m: truth.append((m.pose.pose.position.x, m.pose.pose.position.y)), 10)
     topic = '/cmd_vel' if args.direct else '/cmd_vel_raw'
     pub = node.create_publisher(Twist, topic, 10)
+    # `finally: hard_stop()` covers Ctrl+C and exceptions but NOT SIGTERM, whose default
+    # action terminates the process before any cleanup runs -- and this tool commands a
+    # REAL car at speed on a floor. Audit finding.
+    install_stop_handlers(pub)
 
     ex = SingleThreadedExecutor()
     ex.add_node(node)
@@ -799,7 +820,11 @@ def main():
             say('  that the tape figure is in millimetres.')
             return 2
         store.setdefault('calibrations', []).append(
-            {'timestamp': stamp, 'tape_m': tape, 'odom_m': odo, 'k': k,
+            {'timestamp': stamp,
+             # The IMMUTABLE identity runs are associated by. k is a measurement two
+             # sessions can coincidentally share; this cannot be.
+             'cal_id': stamp,
+             'tape_m': tape, 'odom_m': odo, 'k': k,
              'yaw_change_rad': dyaw,
              # Both recorded so calibration_problems() can tell a straight push from a
              # dead gyro and from an S-shape. Net yaw alone cannot distinguish either.
@@ -807,6 +832,7 @@ def main():
              'gyro_span_rad_s': gyro_span,
              'arc_chord_inflation': ((dyaw ** 2) / 24.0) if dyaw is not None else None})
         store['odom_scale_k'] = k
+        store['active_cal_id'] = stamp
         save(store)
         say(f'  saved. Odometry reads {(1/k - 1)*100:+.1f}% vs ground truth.')
         return 0
@@ -929,6 +955,7 @@ def main():
                 say('  the calibration is wrong or the car did not travel straight.')
             new.append({
                 'timestamp': stamp, 'commanded_speed_m_s': args.speed,
+                'cal_id': store.get('active_cal_id'),
                 'measured_speed_m_s': v_meas, 'total_tape_m': total,
                 'runup_m': runup, 'stop_distance_m': stop_d,
                 'odom_braking_m': odo_stop, 'time_to_rest_s': rest_t,

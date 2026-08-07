@@ -229,14 +229,18 @@ def cmd_start(args):
 
     print(f'=== simctl start  (backend {args.backend}, ROS_DOMAIN_ID={dom}) ===')
 
-    names = node_names(dom)
-    if 'YB_Car_Node' in names:
+    # sim_target polls with the asymmetric dwell -- a single node_names() look here was
+    # the fail-open version: a car whose discovery took longer than one probe was
+    # invisible, and the simulator started on its domain. Audit finding.
+    print('  checking who is on this domain (up to ~15 s)...')
+    target = sim_target(dom)
+    if target == 'hardware':
         print(f'REFUSED: the REAL ROBOT is on domain {dom}.')
         print('  Starting a simulator here would put two robots on one graph, and the')
         print('  patrol would drive the physical car. The simulator belongs on '
               f'{SIM_DOMAIN}; the car is on {CAR_DOMAIN}.')
         return 2
-    if 'fake_robot' in names:
+    if target == 'simulator':
         print(f'A simulation is already running on domain {dom}. Stop it first:')
         print('  ./tools/simctl stop')
         return 2
@@ -412,11 +416,18 @@ def cmd_stop(args):
             continue
         out = zero_domain(dom, seconds=3.0)
         vx = out.split('VX')[-1].strip() if 'VX' in out else 'no response'
+        # THREE states, not two. "nodata" used to fall through the float() parse into
+        # moving=False and print "at rest" -- but no /odom_raw samples means NOBODY
+        # OBSERVED THE ROBOT, which on an empty domain is fine and on a live one means
+        # the witness failed. Absence of evidence is reported as UNKNOWN, never as a
+        # verified stop. Audit finding.
         try:
             moving = abs(float(vx)) > 0.02
+            state = 'STILL MOVING' if moving else 'at rest (observed)'
         except ValueError:
             moving = False
-        state = 'STILL MOVING' if moving else 'at rest'
+            state = ('nothing on this domain answered -- UNKNOWN, not verified at rest'
+                     if vx in ('nodata', 'no response') else f'unparseable: {vx!r}')
         print(f'        domain {dom} ({label}): vx = {vx}  -> {state}')
         if moving:
             print('        *** retrying: something is still commanding motion ***')
@@ -511,14 +522,26 @@ def sim_target(domain):
     everything else looked fine. Hardware always wins: if YB_Car_Node is present, this is
     the car's domain no matter what else is on it.
     """
+    # Same asymmetric exit as tools/_cmd_vel_safety.target_of(): DDS discovery is
+    # incremental, so finding a simulator FIRST must not end the search -- the car may
+    # be discovered seconds later. Hardware evidence ends it immediately (the conclusion
+    # is refusal); simulator evidence starts a 6 s confirmation dwell watching for the
+    # car. A single 2.5 s look here was the fail-open version. Audit finding.
     out = ros_eval(
-        'rclpy.init(); n=Node("simctl_target"); time.sleep(2.5)\n'
-        'names=[x for x,_ in n.get_node_names_and_namespaces()]\n'
-        'topics=[t for t,_ in n.get_topic_names_and_types()]\n'
-        'real="YB_Car_Node" in names\n'
-        'sim="fake_robot" in names or "/sim/ground_truth" in topics\n'
+        'rclpy.init(); n=Node("simctl_target")\n'
+        'real=sim=False; sim_at=None; end=time.time()+14.0\n'
+        'while time.time()<end:\n'
+        '    time.sleep(1.0)\n'
+        '    names=[x for x,_ in n.get_node_names_and_namespaces()]\n'
+        '    topics=[t for t,_ in n.get_topic_names_and_types()]\n'
+        '    real="YB_Car_Node" in names\n'
+        '    sim="fake_robot" in names or "/sim/ground_truth" in topics\n'
+        '    if real: break\n'
+        '    if sim:\n'
+        '        if sim_at is None: sim_at=time.time()\n'
+        '        elif time.time()-sim_at>=6.0: break\n'
         'print("TARGET", "hardware" if real else "simulator" if sim else "nothing")\n'
-        'sys.stdout.flush(); os._exit(0)\n', domain, timeout=30)
+        'sys.stdout.flush(); os._exit(0)\n', domain, timeout=40)
     return out.split('TARGET')[-1].strip() if 'TARGET' in out else 'nothing'
 
 

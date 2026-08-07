@@ -87,8 +87,18 @@ if fwd:
           f'{sum(fwd)/len(fwd):+.4f} m/s')
 
 # ---- 3. does odometry track the wheels rather than the world? -------------
-# The robot is against a wall or free; either way, compare the DISTANCE odometry
-# claims against the ground-truth displacement over the same window.
+# ENFORCED, not merely printed. This used to calculate slip, print it, and pass
+# regardless -- an audit reproduced a run with 0.0% odometry/truth divergence that
+# still said OK, which is exactly the signature of an implementation that copies
+# ground truth into odometry. The property either gets demonstrated or the verdict
+# is UNPROVEN (nonzero exit); it is never assumed.
+#
+# The scenario matters per backend:
+#   * a COLLISION backend (Isaac): driving at the arena wall guarantees slip --
+#     wheels turn, body pinned. That divergence is the property.
+#   * the 2D backend with slip:=0 genuinely HAS no slip -- odometry and truth agree
+#     by construction, correctly. Agreement there proves nothing either way, so the
+#     verdict is UNPROVEN with instructions, not OK and not FAIL.
 odom.clear()
 truth.clear()
 # Wait for BOTH. Reading truth[-1] right after clear() gave None and silently skipped
@@ -96,22 +106,47 @@ truth.clear()
 deadline = time.time() + 10
 while time.time() < deadline and not (odom and truth):
     rclpy.spin_once(n, timeout_sec=0.1)
-p0 = odom[-1].pose.pose.position
-t0 = truth[-1].pose.pose.position if truth else None
-drive(0.15, 0.0, 8.0)
-settle()
-p1 = odom[-1].pose.pose.position
-t1 = truth[-1].pose.pose.position if truth else None
-odo_d = math.hypot(p1.x - p0.x, p1.y - p0.y)
-print(f'ODOMETRY claims {odo_d:.3f} m of travel')
-if t0 is not None and t1 is not None:
+if not truth:
+    fails.append('no /sim/ground_truth -- without truth the wheels-vs-world property '
+                 'cannot be witnessed at all, and unwitnessed is not passed')
+if not odom:
+    fails.append('no /odom_raw before the slip phase')
+
+unproven = None
+if odom and truth:
+    p0 = odom[-1].pose.pose.position
+    t0 = truth[-1].pose.pose.position
+    # Long enough that any collision backend reaches a wall from anywhere in the
+    # 4x4 m arena and spends time pinned against it.
+    drive(0.15, 0.0, 20.0)
+    settle()
+    p1 = odom[-1].pose.pose.position
+    t1 = truth[-1].pose.pose.position
+    odo_d = math.hypot(p1.x - p0.x, p1.y - p0.y)
     true_d = math.hypot(t1.x - t0.x, t1.y - t0.y)
     slip = (1 - true_d / odo_d) * 100 if odo_d > 1e-6 else 0.0
+    print(f'ODOMETRY claims {odo_d:.3f} m of travel')
     print(f'GROUND TRUTH moved {true_d:.3f} m  ->  slip {slip:+.1f}%')
-    print('  (nonzero slip means odometry is measuring WHEELS, not the world --')
-    print('   which is the property the real robot has and the point of the fix)')
-else:
-    print('  (no /sim/ground_truth on this backend; slip not comparable here)')
+    if odo_d < 0.1:
+        fails.append(f'odometry advanced only {odo_d*1000:.0f} mm while commanded '
+                     'forward -- the wheels themselves are not being measured')
+    elif slip >= 3.0:
+        print('  slip DEMONSTRATED: odometry is measuring wheels, not the world')
+    else:
+        # Odometry and truth agree. On a collision backend after 20 s at a wall that
+        # would be the cheat signature; on the 2D sim with slip:=0 it is correct
+        # behaviour that simply cannot demonstrate the property.
+        is_2d = any(name == 'fake_robot'
+                    for name, _ in n.get_node_names_and_namespaces())
+        if is_2d:
+            unproven = ('2D backend with no slip configured: odometry equals truth by '
+                        'construction, so the wheels-vs-world property CANNOT be '
+                        'witnessed here. Restart with `./tools/simctl start --slip 0.3` '
+                        'and rerun.')
+        else:
+            fails.append(f'slip only {slip:+.1f}% after 20 s of commanded driving on a '
+                         'collision backend -- odometry is tracking ground truth, '
+                         'which is the cheat this checker exists to catch')
 
 print()
 if fails:
@@ -119,4 +154,8 @@ if fails:
     for f in fails:
         print(f'  - {f}')
     sys.exit(1)
-print('ODOMETRY PROPERTIES OK')
+if unproven:
+    print('=== UNPROVEN ===')
+    print(f'  {unproven}')
+    sys.exit(1)
+print('ODOMETRY PROPERTIES OK -- reverse signed, and slip demonstrated')

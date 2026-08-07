@@ -54,9 +54,13 @@ In simulation there is nothing to hit, so it runs freely.
 import argparse
 import math
 import os
+import signal
 import sys
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import target_of                           # noqa: E402
 
 
 def main():
@@ -146,11 +150,13 @@ def main():
             f'({here[0]:+.2f}, {here[1]:+.2f}) in {args.goal_frame}')
 
     # WHICH ROBOT? Nav2 on the real car drives with nothing between it and the motors.
-    names = [n for n, _ in node.get_node_names_and_namespaces()]
-    real = 'YB_Car_Node' in names
-    sim = 'fake_robot' in names
-    say(f'  target: {"HARDWARE" if real else "simulator" if sim else "unknown"}')
-    if real and not args.i_accept_driving_unprotected:
+    # target_of polls with the asymmetric dwell (hardware ends the search, a simulator
+    # must survive a confirmation window) and recognises the Isaac backend by
+    # /sim/ground_truth -- a single node-name look here called Isaac "unknown" and
+    # PROCEEDED, which is fail-open twice over. Audit finding.
+    target = target_of(node)
+    say(f'  target: {target.upper()}')
+    if target in ('hardware', 'both') and not args.i_accept_driving_unprotected:
         say('')
         say('  REFUSED: this would drive the REAL robot, and Nav2 drives unprotected.')
         say('    * Nav2 publishes to /cmd_vel, bypassing cmd_vel_governor entirely')
@@ -160,9 +166,17 @@ def main():
         say('  envelope first (docs/first-floor-procedure.md), keep a hand on the power')
         say('  switch, then pass --i-accept-driving-unprotected if you still mean it.')
         return 2
-    if real:
-        say('  *** OVERRIDDEN: commanding a REAL robot with no governor and no '
-            'deadman. Hand on the power switch. ***')
+    if target == 'nothing' and not args.i_accept_driving_unprotected:
+        say('')
+        say('  REFUSED: no positive evidence of a simulator on this domain, and "I did')
+        say('  not find the car" is not evidence the car is not there -- discovery may')
+        say('  just be slow. An unidentified domain gets no autonomous goals. Start a')
+        say('  simulator (./tools/simctl start), check ROS_DOMAIN_ID, or pass')
+        say('  --i-accept-driving-unprotected to command it anyway.')
+        return 2
+    if target in ('hardware', 'both', 'nothing'):
+        say('  *** OVERRIDDEN: commanding an unprotected target with no governor and '
+            'no deadman. Hand on the power switch. ***')
 
     client = ActionClient(node, NavigateToPose, 'navigate_to_pose')
     if not client.wait_for_server(timeout_sec=10.0):
@@ -192,6 +206,49 @@ def main():
         f'{args.tolerance*1000:.0f} mm, timeout {args.timeout:.0f} s')
     cmds.clear()
 
+    def cancel_and_verify(handle, why):
+        """Cancel the goal, CHECK the response, and confirm motion actually ceased.
+
+        A completed cancel future is not an accepted cancellation: the CancelGoal
+        response carries `goals_canceling`, and an empty list means the server declined
+        (ERROR_REJECTED and friends). The old code read `cancel.done()` as
+        "acknowledged" -- which is true even of a rejection -- and never looked at what
+        Nav2 did next. Audit finding. The only proof that matters is /cmd_vel going
+        quiet, so that is what is checked last.
+        """
+        say(f'  {why} -- CANCELLING the goal')
+        acked = False
+        try:
+            cancel = handle.cancel_goal_async()
+            tc = time.time()
+            while not cancel.done() and time.time() - tc < 10.0:
+                time.sleep(0.1)
+            if cancel.done():
+                resp = cancel.result()
+                acked = bool(resp and resp.goals_canceling)
+                say('  cancel ACCEPTED by the server' if acked else
+                    '  WARNING: server DECLINED the cancel (no goals canceling)')
+            else:
+                say('  WARNING: cancel response never arrived')
+        except Exception as e:
+            say(f'  WARNING: cancel failed ({e})')
+        # Proof over promises: watch /cmd_vel until nothing nonzero for 2 s.
+        quiet_since = time.time()
+        deadline = time.time() + 8.0
+        n_before = len(cmds)
+        while time.time() < deadline:
+            time.sleep(0.2)
+            recent = cmds[n_before:]
+            n_before = len(cmds)
+            if any(abs(v) > 0.01 or abs(w) > 0.01 for v, w in recent):
+                quiet_since = time.time()
+            elif time.time() - quiet_since >= 2.0:
+                say('  motion commands ceased -- verified quiet for 2 s')
+                return acked
+        say('  *** Nav2 IS STILL COMMANDING MOTION after the cancel. Kill the nav')
+        say('  launch, and on the real robot use the power switch. ***')
+        return False
+
     send = client.send_goal_async(goal)
     t0 = time.time()
     while not send.done() and time.time() - t0 < 10.0:
@@ -205,9 +262,29 @@ def main():
         return 1
     say('  goal accepted')
 
+    # From here a goal is LIVE. Ctrl+C or SIGTERM used to exit this process outright,
+    # leaving Nav2 navigating with no governor and no deadman -- walking away from a
+    # moving robot. Both now cancel first. Audit finding.
+    def on_signal(signum, _frame):
+        say(f'\n  signal {signum} while a goal is live')
+        cancel_and_verify(handle, f'interrupted by signal {signum}')
+        sys.stdout.flush()
+        os._exit(143 if signum == signal.SIGTERM else 130)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, on_signal)
+
     result_future = handle.get_result_async()
-    while not result_future.done() and time.time() - t0 < args.timeout:
-        time.sleep(0.2)
+    try:
+        while not result_future.done() and time.time() - t0 < args.timeout:
+            time.sleep(0.2)
+    except Exception:
+        cancel_and_verify(handle, 'exception while waiting for the result')
+        raise
+    finally:
+        # The goal is settled or being handled; stop intercepting signals.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
 
     timed_out = not result_future.done()
     if timed_out:
@@ -215,16 +292,7 @@ def main():
         # robot, with no governor and no deadman in that launch, walking away from a
         # moving robot is the worst possible response to a timeout.
         say('')
-        say(f'  timed out after {args.timeout:.0f} s -- CANCELLING the goal')
-        try:
-            cancel = handle.cancel_goal_async()
-            tc = time.time()
-            while not cancel.done() and time.time() - tc < 10.0:
-                time.sleep(0.1)
-            say('  cancel acknowledged' if cancel.done() else
-                '  WARNING: cancel not acknowledged; the robot may still be driving')
-        except Exception as e:
-            say(f'  WARNING: cancel failed ({e}); the robot may still be driving')
+        cancel_and_verify(handle, f'timed out after {args.timeout:.0f} s')
 
     end = pose_in_goal_frame() or start
     err = math.hypot(end[0] - args.x, end[1] - args.y)

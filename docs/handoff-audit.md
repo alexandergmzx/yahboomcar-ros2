@@ -416,3 +416,65 @@ None of this measures the robot. Stopping distance remains **unmeasured**, the g
 **undetermined** until someone turns the car by hand, and the hardware braking store
 holds **zero runs**. What changed is that the tooling can no longer drive the car by
 accident, and can no longer certify a measurement it did not make.
+
+
+---
+
+# Fourth audit (commit `5935ca5`) — verdict NO-GO, seven findings, all verified
+
+Same discipline as rounds 1–3: every finding checked against the code before acting.
+**All seven were correct.**
+
+| # | Finding | Fixed? |
+|---|---|---|
+| 1 | Target discovery fails open: first simulator signal ends the search | ✅ asymmetric dwell in `target_of`, `sim_target`, `simctl start`; `nav2_smoke` now refuses `unknown` |
+| 2 | Nav2 cancel unverified; no signal handling around a live goal | ✅ response's `goals_canceling` checked, SIGINT/SIGTERM cancel first, and /cmd_vel is watched until quiet — proof over promises |
+| 3 | No persistent, validated digital-twin runtime | ⬜ **open — feature work**, see below |
+| 4 | Physical braking / fail-safe evidence not yet valid | ⬜ **open — needs the car**, see below |
+| 5 | Braking runs associated by float `k`, not an immutable id | ✅ `cal_id` minted at `--calibrate`, stamped on every run, matched by id; float match retained only for pre-id legacy data |
+| 6 | Odometry checker computes slip but never fails on it | ✅ enforced: ≥3% on a collision backend or FAIL; 2D-with-no-slip is UNPROVEN (nonzero), never OK |
+| 7 | `measure_braking` lacks SIGTERM; `simctl stop` reads "nodata" as at rest | ✅ `install_stop_handlers` wired; nodata now reports UNKNOWN, "at rest" only when observed |
+
+## The shape of this round's mistakes
+
+**Finding 1 is the dwell I did not think to need.** The guard was built in round 3 and
+verified against a car that was *already discovered*. DDS discovery is incremental; the
+guard broke out of its polling loop on the FIRST evidence of either kind, so a simulator
+discovered at t=2 s concluded 'simulator' while the car surfaced at t=4 s. Verified by
+reproducing the race: simulator evidence live immediately, `YB_Car_Node` joining 5 s
+late — the fixed guard waits out a 6 s confirmation dwell after sim evidence and caught
+it (`REFUSED ... reaches BOTH`, exit 2). The rule that generalises: **evidence that ends
+a search must be the kind more waiting cannot overturn.** Finding the car is that kind;
+finding a simulator is not.
+
+**Finding 6 is my own tool failing my own standard.** `check_odom_properties.py` was
+written (round 4 of *my* fixes) to catch odometry that copies ground truth — and it
+computed the incriminating number, printed it, and passed anyway. The auditor reproduced
+0.0% divergence reporting OK. A check that cannot fail is not a check; this is the
+third time this repo has had to relearn that.
+
+**Finding 2's lesson:** a completed cancel future is not a cancelled goal. The CancelGoal
+response can be a rejection and still `done()`. The fix trusts neither the future nor the
+response: it watches `/cmd_vel` until it has been quiet for 2 s, and says so either way.
+
+## The two open items, honestly scoped
+
+**3 — twin runtime.** `isaac_twin_setup.py` is marked KNOWN BROKEN deliberately;
+`verify_twin.py` runs a bounded verification and exits by design; `twin_launch.py` only
+bridges description + joint states. A persistent, live-odometry twin is *feature work*,
+not a bug fix, and the recorded twin successes used generated fixtures — real-robot
+live tracking has not been demonstrated. Owner: open. Nothing currently depends on it;
+`simctl --backend isaac` runs the simulator, not the twin.
+
+**4 — hardware evidence.** Zero accepted braking runs; the five stored calibrations
+correctly refused (they predate the gyro-span field); `failsafe_report.json` correctly
+marked `needs_rerun`. The tools to produce all of it now exist and are negative-tested.
+What is missing is floor time: a current-boot rotate-window gyro PASS, a fresh ≥1.5 m
+calibration, an elevated fail-safe rerun, then the supervised 0.05 m/s session. That is
+Alex's hardware session, per docs/first-floor-procedure.md — a tool cannot produce it.
+
+## Still NO-GO for powered floor testing
+
+Unchanged, and correctly so: stopping distance unmeasured, gyro undetermined, hardware
+braking store empty. This round removed fail-open paths in the tooling; it produced no
+new evidence about the robot.
