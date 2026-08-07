@@ -592,24 +592,37 @@ def run_ros(sim, app, args, say):
 
     But /scan arrives at 14.4 Hz against a 12 Hz contract, while this loop counts
     exactly 12 renders per second -- so it looks correct from the inside and is only
-    visible to a subscriber. ROS2RtxLidarHelper publishes every completed rotation
-    buffered since the last render, and the sensor turns out to rotate on the
-    RENDERER's clock at a rate that ignores the scanRateBaseHz=12 authored on the prim
-    (verified by readback in build_arena.py). Measured directly:
+    visible to a subscriber. Measured at two render steps:
 
-        rendering_dt   scans per render   /scan Hz at 12 renders/s
-        1/60 (default)      1.2                 14.4
-        1/12                6.0                 72.0
+        rendering_dt   renders/s   render-time per wall second   /scan Hz
+        1/60 (default)     12              0.200                   14.4
+        1/12               12              1.000                   72.0
 
-    Exactly 5x for 5x, i.e. the sensor rotates at a fixed 72 Hz of render time. Pinning
-    rendering_dt therefore makes it worse, not better, and the default is used here
-    because 14.4 is merely the closest wrong answer.
+    Both fit exactly:  messages/s = 72 x renders/s x rendering_dt.
 
-    Rendering at 10 Hz instead of 12 would land on 12 Hz of /scan, but that is
-    calibrating against an unexplained constant rather than understanding it, and it
-    would silently drift with anything that changes render timing. Left unfixed and
-    visible instead. A backend that half-satisfies the contract is worse than no
-    backend -- so simctl keeps refusing until this is understood.
+    So emission is a fixed 72 messages per second of RENDER time, and the authored
+    scanRateBaseHz=12 -- verified by readback in build_arena.py -- does not set it.
+
+    TWO HYPOTHESES TESTED AND ELIMINATED:
+
+      * "these are 6 partial scans per revolution" (72 = 6 x 12), which the helper's
+        own docs suggest: fullScan "publish[es] a full scan when enough data has
+        accumulated instead of partial scans each frame". Setting fullScan=True on the
+        laser_scan path changed the rate by NOTHING, exactly 14.4 Hz again -- the doc
+        note that it "supports point cloud type only" is accurate. And each message
+        carries 286/360 finite returns spanning the whole room, which is a near
+        complete scan, not a 60-degree sector. So these are 72 real revolutions per
+        render-second, not 6 partials of 12.
+
+      * "rendering_dt is mismatched to the rotation period". Pinning it to 1/12 made
+        the rate six times WORSE, per the formula above.
+
+    What is left is that the RTX lidar's rotation rate simply does not follow
+    scanRateBaseHz in this configuration. Rendering at 10 Hz instead of 12 would land
+    on exactly 12 Hz, and the formula fits well enough across a 5x change to make that
+    reliable -- but it encodes an unexplained 72 rather than fixing it, and would drift
+    with anything affecting render timing. A backend that half-satisfies the contract
+    is worse than no backend, so simctl keeps refusing until the 72 is understood.
     """
     import time as _time
     domain = os.environ.get('ROS_DOMAIN_ID', '0')
