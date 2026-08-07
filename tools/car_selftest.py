@@ -29,6 +29,9 @@ import os
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import install_stop_handlers            # noqa: E402
 from datetime import datetime
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -203,6 +206,8 @@ def main():
     # from it. --direct exists for the bench, where no governor may be running.
     cmd_topic = '/cmd_vel' if args.direct else '/cmd_vel_raw'
     cmd_pub = node.create_publisher(Twist, cmd_topic, 10)
+    # `finally` alone does not survive SIGTERM (pkill).
+    install_stop_handlers(cmd_pub)
     s1 = node.create_publisher(Int32, '/servo_s1', 10)
     s2 = node.create_publisher(Int32, '/servo_s2', 10)
 

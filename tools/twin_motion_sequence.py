@@ -22,6 +22,11 @@ import time
 
 import argparse
 
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import install_stop_handlers            # noqa: E402
+
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -41,6 +46,8 @@ class Sequencer(Node):
             f'commanding on {topic}'
             + ('  (DIRECT -- governor bypassed)' if direct else '  (via governor)'))
         self.cmd = self.create_publisher(Twist, topic, 10)
+        # `finally` alone does not survive SIGTERM (pkill).
+        install_stop_handlers(self.cmd)
         self.s1 = self.create_publisher(Int32, '/servo_s1', 10)
         self.s2 = self.create_publisher(Int32, '/servo_s2', 10)
         self.beep = self.create_publisher(UInt16, '/beep', 10)

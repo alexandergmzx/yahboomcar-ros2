@@ -55,6 +55,7 @@ interval. Times are reported as BRACKETS, same as tools/measure_latency.py: last
 still moving = lower bound, first sample at rest = upper bound. Take the upper bound.
 """
 import argparse
+import atexit
 import json
 import os
 import signal
@@ -63,6 +64,9 @@ import sys
 import threading
 import time
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import SafeCmdVel                          # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
@@ -162,25 +166,36 @@ def main():
     rclpy.init()
     node = Node('test_failsafe')
     mon = Monitor(node, Odometry, qos_profile_sensor_data)
-    cmd = node.create_publisher(Twist, '/cmd_vel', 10)
-    cmd_raw = node.create_publisher(Twist, '/cmd_vel_raw', 10)
 
     ex = SingleThreadedExecutor()
     ex.add_node(node)
     threading.Thread(target=ex.spin, daemon=True).start()
 
+    # hard_stop() existed and was called at every normal exit point, but was wired to no
+    # `finally`, no SIGINT handler and no SIGTERM handler -- so a Ctrl+C during a drive
+    # phase left 0.15 m/s latched on ROS_DOMAIN_ID=20, which is the car. This test's whole
+    # subject is what happens when a command path dies; leaving it able to strand a
+    # command was the sharpest version of that irony. Audit finding.
+    safe = SafeCmdVel(node, ['/cmd_vel', '/cmd_vel_raw'])
+    # __enter__ installs the SIGINT/SIGTERM handlers, which stop the car and exit.
+    # atexit covers every one of main()'s many `return` paths and any exception; the
+    # signal handlers os._exit() after stopping, so the two never both fire.
+    safe.__enter__()
+    atexit.register(safe.stop)
+
     def hard_stop(reps=15):
         """Always leave the car stopped, whatever the test proved."""
-        for _ in range(reps):
-            cmd.publish(Twist())
-            time.sleep(0.04)
+        safe.zero_reps = reps
+        safe.stop()
 
-    def drive(pub, seconds):
+    def drive(topic, seconds):
+        """Drive on ONE topic. `safe` publishes to both, so pick with the index."""
+        end = time.time() + seconds
         t = Twist()
         t.linear.x = float(args.speed)
-        end = time.time() + seconds
+        idx = safe.topics.index(topic)
         while time.time() < end:
-            pub.publish(t)
+            safe.pubs[idx].publish(t)
             time.sleep(0.05)
 
     stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -251,7 +266,7 @@ def main():
 
     # ------------------------------------------------- 1. commands stop arriving
     say('=== case 1: commands stop arriving (no zeros sent) ===')
-    drive(cmd, args.drive_seconds)
+    drive('/cmd_vel', args.drive_seconds)
     if not mon.is_moving():
         say('  INVALID: wheels never started. Cannot prove a stop that never began.')
         hard_stop()
@@ -264,8 +279,8 @@ def main():
             t_ref = time.time()
             end = t_ref + args.stop_timeout + 1.0
             while time.time() < end:
-                t = Twist(); t.linear.x = float(args.speed)
-                cmd.publish(t); time.sleep(0.05)
+                safe.publish(vx=float(args.speed))
+                time.sleep(0.05)
             br = find_rest(mon.samples, t_ref, args.stop_timeout)
             hard_stop()
             if br is None:
@@ -275,7 +290,7 @@ def main():
                 say(f'  NEGATIVE TEST FAILED: detector claimed a stop at {br} '
                     'while the car was still being commanded. Do not trust this tool.')
                 results['negative_test'] = 'FAILED'
-            with open(REPORT, 'w') as f:
+            with open(report_path, 'w') as f:
                 json.dump(results, f, indent=2)
             return 0 if results['negative_test'] == 'passed' else 1
 
@@ -307,7 +322,7 @@ def main():
         results['cases']['governor_sigkill'] = {'stopped': None,
                                                 'detail': 'governor failed to start'}
     else:
-        drive(cmd_raw, args.drive_seconds)
+        drive('/cmd_vel_raw', args.drive_seconds)
         if not mon.is_moving():
             say('  INVALID: governor passed no motion through (obstacle? stale scan?).')
             results['cases']['governor_sigkill'] = {'stopped': None,
@@ -338,7 +353,7 @@ def main():
             input('  Press Enter when you are watching... ')
         except EOFError:
             pass
-        drive(cmd, args.drive_seconds)
+        drive('/cmd_vel', args.drive_seconds)
         moving_before = mon.is_moving()
         if not moving_before:
             say('  INVALID: wheels never started.')
@@ -489,6 +504,9 @@ def main():
 
 if __name__ == '__main__':
     code = main()
+    # os._exit BYPASSES atexit, so run the registered handlers explicitly first --
+    # otherwise the guaranteed stop is silently skipped on every normal run.
+    atexit._run_exitfuncs()
     # rclpy's teardown aborts with "terminate called without an active exception" after
     # everything is written, turning a clean run into a core dump and losing the status.
     sys.stdout.flush()

@@ -71,10 +71,16 @@ def main():
         if 'fake_robot' in names or 'YB_Car_Node' in names:
             break
 
-    if 'YB_Car_Node' in names and 'fake_robot' not in names:
+    # `and 'fake_robot' not in names` used to qualify the first test, which let the
+    # patrol drive whenever a simulator happened to share a domain with the car -- the
+    # one case where you are most likely to believe you are safe. Audit finding.
+    if 'YB_Car_Node' in names:
         print('REFUSED: this is the REAL robot. A patrol loop must never drive hardware '
               'unattended -- the firmware has no command watchdog, so if this process '
               'dies mid-leg the car keeps going.')
+        if 'fake_robot' in names:
+            print('  (a simulator is on this domain too; that does not help -- a command '
+                  'published now reaches BOTH)')
         return 2
     if 'fake_robot' not in names:
         print('No simulator found on this domain. Start it with:')

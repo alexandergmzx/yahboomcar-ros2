@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
-"""Check EVERY field of the firmware contract against whatever backend is running.
+"""Check the firmware contract against whatever SIMULATOR is running.
 
-    ./tools/check_isaac_contract.py 30      # 30 s window
+    ./tools/check_isaac_contract.py --seconds 30
+
+SIMULATOR ONLY. It refuses to run if YB_Car_Node is on the domain, because it DRIVES:
+it commands 0.12 m/s so that /cmd_vel is proven to actually move the robot, and a
+subscriber that only listens could never establish that.
+
+That refusal was missing when this file was first committed. It published 0.12 m/s and
+0.3 rad/s with no hardware guard, no zeros on exit and no domain pin, so running it on
+ROS_DOMAIN_ID=20 would have driven the car ungoverned, and a Ctrl+C in its first half
+would have left that command latched forever on a firmware with no watchdog. Found by
+audit. The guards now come from tools/_cmd_vel_safety.py, which every driving tool here
+shares.
 
 Runs in SYSTEM python (3.12) on purpose: rclpy cannot be imported into Isaac's
 interpreter at all -- Isaac is 3.11 and Jazzy builds rclpy for 3.12, an ABI mismatch
@@ -13,25 +24,40 @@ renders per second while /scan was actually arriving at 14.4 Hz, and the 2D simu
 published a perfectly constant 9.81 accelerometer, which is what a DEAD sensor looks
 like. Both were invisible from inside the publisher.
 
-
 Compares what a backend publishes against CLAUDE.md's measured contract:
   pub /scan 12 Hz, /odom_raw 11 Hz, /imu 25 Hz, /battery 1 Hz
   sub /cmd_vel
+
+WHAT IT DOES NOT CHECK, since the name once claimed "EVERY field": QoS profiles, frame
+ids beyond /scan's, message timestamps, /beep and the two servo topics, and the sign
+conventions of anything. It checks rates, scan geometry, IMU liveness and battery scale.
 """
+import argparse
 import math
+import os
 import sys
 import time
 
-import rclpy
-from geometry_msgs.msg import Twist
-from nav_msgs.msg import Odometry
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Imu, LaserScan
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import SafeCmdVel, require_simulator      # noqa: E402
+
+import rclpy                                                    # noqa: E402
+from nav_msgs.msg import Odometry                               # noqa: E402
+from rclpy.node import Node                                     # noqa: E402
+from rclpy.qos import qos_profile_sensor_data                   # noqa: E402
+from sensor_msgs.msg import Imu, LaserScan                      # noqa: E402
 from std_msgs.msg import UInt16
 
-SECS = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
 WANT_HZ = {'scan': 12.0, 'odom_raw': 11.0, 'imu': 25.0, 'battery': 1.0}
+
+ap = argparse.ArgumentParser()
+ap.add_argument('--seconds', type=float, default=30.0)
+ap.add_argument('--speed', type=float, default=0.12)
+ap.add_argument('--turn', type=float, default=0.3)
+ap.add_argument('--domain', type=int, default=66,
+                help='simulator domain; the car is on 20 and is refused')
+args = ap.parse_args()
+os.environ.setdefault('ROS_DOMAIN_ID', str(args.domain))
 
 rclpy.init()
 n = Node('contract_check')
@@ -46,18 +72,21 @@ n.create_subscription(LaserScan, '/scan', rec('scan'), qos_profile_sensor_data)
 n.create_subscription(Odometry, '/odom_raw', rec('odom_raw'), qos_profile_sensor_data)
 n.create_subscription(Imu, '/imu', rec('imu'), qos_profile_sensor_data)
 n.create_subscription(UInt16, '/battery', rec('battery'), qos_profile_sensor_data)
-pub = n.create_publisher(Twist, '/cmd_vel', 10)
 
-t_end = time.time() + SECS
-drive_until = time.time() + SECS * 0.5
-while time.time() < t_end:
-    # Drive for the first half, so /cmd_vel is proven to actually move the robot.
-    tw = Twist()
-    if time.time() < drive_until:
-        tw.linear.x = 0.12
-        tw.angular.z = 0.3
-    pub.publish(tw)
-    rclpy.spin_once(n, timeout_sec=0.05)
+# THE GUARD. This tool commands motion, so it must never find the real robot.
+require_simulator(n, what='check_isaac_contract.py')
+
+with SafeCmdVel(n, ['/cmd_vel']) as safe:
+    t_end = time.time() + args.seconds
+    drive_until = time.time() + args.seconds * 0.5
+    while time.time() < t_end:
+        # Drive for the first half, so /cmd_vel is proven to actually move the robot.
+        if time.time() < drive_until:
+            safe.publish(vx=args.speed, wz=args.turn)
+        else:
+            safe.publish()
+        rclpy.spin_once(n, timeout_sec=0.05)
+# Leaving the block published zeros. So does Ctrl+C, SIGTERM, or any exception above.
 
 fails = []
 print(f'{"topic":12s} {"msgs":>6s} {"Hz":>7s} {"want":>6s}')

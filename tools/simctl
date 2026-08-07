@@ -127,8 +127,37 @@ def zero_domain(domain, seconds=2.5):
         'sys.stdout.flush(); os._exit(0)\n', domain, timeout=30)
 
 
-def running(patterns):
-    """PIDs whose command line matches any pattern. Never matches simctl itself."""
+def domain_of(pid):
+    """ROS_DOMAIN_ID of a running process, from /proc/<pid>/environ. None if unknown.
+
+    A process's domain is NOT visible in `ps args`, which is why this used to match on
+    the command line alone -- see running().
+    """
+    try:
+        with open(f'/proc/{pid}/environ', 'rb') as f:
+            for entry in f.read().split(b'\0'):
+                if entry.startswith(b'ROS_DOMAIN_ID='):
+                    return int(entry.split(b'=', 1)[1] or 0)
+    except (OSError, ValueError):
+        return None
+    # ROS 2 treats an unset ROS_DOMAIN_ID as 0.
+    return 0
+
+
+def running(patterns, domain=None):
+    """PIDs whose command line matches any pattern. Never matches simctl itself.
+
+    `domain` RESTRICTS the match to processes actually on that ROS domain. Without it
+    this matched on command line alone, and SIM_PROCS contains `cmd_vel_governor` and
+    `cmd_vel_deadman` -- so `simctl stop` would kill the PHYSICAL safety layer while
+    printing "the car gets ZEROS ONLY, its agent and nodes are never killed". Stripping
+    the car's only protection while claiming not to touch it is the worst version of
+    this mistake. Audit finding.
+
+    A process whose domain cannot be read (permissions, already exited) is SKIPPED when
+    a domain is specified: refusing to kill something unidentified is the safe default
+    when the thing you might be killing is a robot's deadman.
+    """
     me = os.getpid()
     out = subprocess.run(['ps', '-eo', 'pid,args'], capture_output=True, text=True).stdout
     pids = []
@@ -139,8 +168,11 @@ def running(patterns):
         pid, args = int(parts[0]), parts[1]
         if pid == me or 'simctl' in args or 'micro_ros_agent' in args:
             continue
-        if any(pat in args for pat in patterns):
-            pids.append(pid)
+        if not any(pat in args for pat in patterns):
+            continue
+        if domain is not None and domain_of(pid) != domain:
+            continue
+        pids.append(pid)
     return pids
 
 
@@ -303,14 +335,14 @@ def cmd_stop(args):
     # halted when it was killed afterwards, which is precisely the accident this
     # ordering is meant to prevent.
     print('  [1/5] silencing command sources (they would republish over the zeros)')
-    src = running(COMMAND_SOURCES)
+    src = running(COMMAND_SOURCES, domain=args.domain)
     for p in src:
         try:
             os.kill(p, signal.SIGTERM)          # SIGTERM first: sim_patrol zeroes on it
         except ProcessLookupError:
             pass
     time.sleep(2.5)
-    for p in running(COMMAND_SOURCES):
+    for p in running(COMMAND_SOURCES, domain=args.domain):
         try:
             os.kill(p, signal.SIGKILL)
         except ProcessLookupError:
@@ -338,23 +370,28 @@ def cmd_stop(args):
             print(f'        domain {dom} ({label}): vx = {vx} after retry')
     if not args.no_car:
         print('        (the car gets ZEROS ONLY -- its agent and nodes are never killed)')
+        print(f'        every kill below is filtered to ROS_DOMAIN_ID={args.domain}, so a '
+              f'governor')
+        print(f'        or deadman running on {CAR_DOMAIN} is left alone)')
 
     print('  [3/5] killing simulation processes')
-    pids = running(SIM_PROCS)
+    pids = running(SIM_PROCS, domain=args.domain)
     for p in pids:
         try:
             os.kill(p, signal.SIGTERM)
         except ProcessLookupError:
             pass
     time.sleep(3)
-    left = running(SIM_PROCS)
+    left = running(SIM_PROCS, domain=args.domain)
     for p in left:
         try:
             os.kill(p, signal.SIGKILL)
         except ProcessLookupError:
             pass
     time.sleep(1)
-    print(f'        {len(pids)} terminated, {len(running(SIM_PROCS))} remaining')
+    print(f'        {len(pids)} terminated, '
+          f'{len(running(SIM_PROCS, domain=args.domain))} remaining '
+          f'(domain {args.domain} only)')
 
     # Stale segments silently block new DDS participants: nodes just never appear.
     print('  [4/5] clearing stale DDS shared memory')

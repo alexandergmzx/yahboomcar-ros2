@@ -63,6 +63,9 @@ import threading
 import time
 from datetime import datetime
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import SafeCmdVel                          # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
 PARAM_OUT = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
@@ -101,7 +104,6 @@ def main():
     from rclpy.executors import SingleThreadedExecutor
     from rclpy.node import Node
     from rclpy.qos import qos_profile_sensor_data
-    from geometry_msgs.msg import Twist
     from nav_msgs.msg import Odometry
     from sensor_msgs.msg import LaserScan
 
@@ -130,7 +132,9 @@ def main():
 
     node.create_subscription(LaserScan, '/scan', on_scan, qos_profile_sensor_data)
     node.create_subscription(Odometry, '/odom_raw', on_odom, qos_profile_sensor_data)
-    cmd = node.create_publisher(Twist, '/cmd_vel', 10)
+    # No bare publisher here on purpose: every command goes through
+    # SafeCmdVel below, so there is no path that can command motion
+    # without a guaranteed stop.
 
     # SingleThreadedExecutor, deliberately. A MultiThreadedExecutor runs callbacks on
     # parallel threads, so receive timestamps get appended OUT OF ORDER and the gaps
@@ -185,46 +189,44 @@ def main():
         say('    (car must be ELEVATED -- the wheels will spin)')
         brackets = []
         trial_samples = []        # per trial: [(dt_since_cmd, vx), ...] for the sweep
-        for i in range(args.repeats):
-            # settle at rest
-            t = Twist()
-            for _ in range(6):
-                cmd.publish(t)
-                time.sleep(0.05)
-            time.sleep(0.5)
-            odom.clear()
-            time.sleep(0.35)          # collect a few at-rest samples
+        # SafeCmdVel guarantees zeros on SIGINT, SIGTERM and any exception. Before this
+        # the wheels were commanded for 1.5 s per trial with no handler at all, on the
+        # CAR'S OWN DOMAIN by default -- a Ctrl+C mid-step left 0.15 m/s latched, and the
+        # firmware has no watchdog to time it out.
+        with SafeCmdVel(node, ['/cmd_vel']) as safe:
+            for i in range(args.repeats):
+                # settle at rest
+                for _ in range(6):
+                    safe.publish()
+                    time.sleep(0.05)
+                time.sleep(0.5)
+                odom.clear()
+                time.sleep(0.35)          # collect a few at-rest samples
 
-            step = Twist()
-            step.linear.x = float(args.speed)
-            t_cmd = time.time()
-            deadline = t_cmd + 1.5
-            while time.time() < deadline:
-                cmd.publish(step)
-                time.sleep(0.02)
-            # stop
-            for _ in range(6):
-                cmd.publish(Twist())
-                time.sleep(0.03)
+                t_cmd = time.time()
+                deadline = t_cmd + 1.5
+                while time.time() < deadline:
+                    safe.publish(vx=float(args.speed))
+                    time.sleep(0.02)
+                # stop
+                for _ in range(6):
+                    safe.publish()
+                    time.sleep(0.03)
 
-            samples = [(ts, vx) for ts, vx, _ in odom if ts >= t_cmd - 0.4]
-            trial_samples.append([(ts - t_cmd, vx) for ts, vx in samples])
+                samples = [(ts, vx) for ts, vx, _ in odom if ts >= t_cmd - 0.4]
+                trial_samples.append([(ts - t_cmd, vx) for ts, vx in samples])
 
-            thresh = args.speed * 0.25
-            first = next((ts for ts, vx in samples if ts > t_cmd and abs(vx) > thresh),
-                         None)
-            if first is None:
-                say(f'  trial {i+1:2d}: no motion detected -- skipped')
-                continue
-            prev = max([ts for ts, vx in samples
-                        if ts < first and abs(vx) <= thresh] + [t_cmd])
-            lo, hi = max(0.0, prev - t_cmd), first - t_cmd
-            brackets.append((lo, hi))
-            say(f'  trial {i+1:2d}: latency in [{lo*1000:6.1f}, {hi*1000:6.1f}] ms')
-
-        for _ in range(10):
-            cmd.publish(Twist())
-            time.sleep(0.03)
+                thresh = args.speed * 0.25
+                first = next((ts for ts, vx in samples
+                              if ts > t_cmd and abs(vx) > thresh), None)
+                if first is None:
+                    say(f'  trial {i+1:2d}: no motion detected -- skipped')
+                    continue
+                prev = max([ts for ts, vx in samples
+                            if ts < first and abs(vx) <= thresh] + [t_cmd])
+                lo, hi = max(0.0, prev - t_cmd), first - t_cmd
+                brackets.append((lo, hi))
+                say(f'  trial {i+1:2d}: latency in [{lo*1000:6.1f}, {hi*1000:6.1f}] ms')
 
         if brackets:
             los = [b[0] for b in brackets]

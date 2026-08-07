@@ -52,6 +52,9 @@ import threading
 import time
 from datetime import datetime
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cmd_vel_safety import install_stop_handlers            # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WS = os.path.join(REPO, 'yahboomcar_ws')
 PARAM_DIR = os.path.join(WS, 'src', 'yahboomcar_bringup', 'param')
@@ -151,6 +154,8 @@ def main():
             lambda m: laser.append((m.pose.pose.position.x,
                                     m.pose.pose.position.y)), 10)
         cmd = node.create_publisher(Twist, '/cmd_vel', 10)
+        # `finally` alone does not survive SIGTERM (pkill).
+        install_stop_handlers(cmd)
         ex = SingleThreadedExecutor()
         ex.add_node(node)
         threading.Thread(target=ex.spin, daemon=True).start()
