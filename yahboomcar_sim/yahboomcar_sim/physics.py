@@ -121,7 +121,19 @@ def step(state, vx, wz, dt, slip=0.0, decel=0.0, dead_time=0.0):
     return s, ex, ew
 
 
-def apply_command(vx, vy, wz, max_speed=0.35, max_yaw=1.5):
+# The simulated firmware's acceptance cap. ASSUMPTION, NOT MEASUREMENT, and the
+# provenance matters: the real firmware's top speed has never been measured. This used
+# to be 0.35, which was the GOVERNOR's floor-safety cap leaking into the firmware
+# model -- so even ungoverned teleop crawled, while the real car is (field report)
+# "very fast". 1.0 m/s is the vendor's own default `linear_speed_limit` in
+# yahboom_keyboard.py, i.e. what Yahboom expects the firmware to accept. Replace this
+# the day someone measures the elevated top speed; until then the number's basis is at
+# least the vendor's, not a safety cap wearing a firmware costume.
+FIRMWARE_MAX_SPEED = 1.0
+FIRMWARE_MAX_YAW = 5.0    # vendor keyboard's angular_speed_limit default, same basis
+
+
+def apply_command(vx, vy, wz, max_speed=FIRMWARE_MAX_SPEED, max_yaw=FIRMWARE_MAX_YAW):
     """What the firmware does with a Twist.
 
     vy is DISCARDED, not scaled: the chassis is differential, and a commanded strafe

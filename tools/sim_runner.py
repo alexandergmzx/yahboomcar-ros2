@@ -373,6 +373,11 @@ TESTS = {
 # paced graph is worse than no backend: every result taken from it silently stops
 # transferring to the real robot.
 SCAN_HZ, ODOM_HZ, IMU_HZ, BATTERY_HZ = 12.0, 11.0, 25.0, 1.0
+# Same firmware-acceptance assumption as the 2D backend (vendor keyboard
+# defaults; the real cap is unmeasured). Duplicated as literals because rclpy
+# -- and thus yahboomcar_sim -- cannot be imported into Isaac's 3.11.
+FIRMWARE_MAX_SPEED = 1.0
+FIRMWARE_MAX_YAW = 5.0
 BATTERY_VOLTS = 8.3
 
 # MEASURED, AND UNEXPLAINED. ROS2RtxLidarHelper emits a fixed 72 LaserScan messages per
@@ -555,12 +560,22 @@ class RosBridge:
                 'run and /scan will simply never appear. Rebuild the arena.')
 
     def read_cmd_vel(self):
-        """-> (vx, wz). vy is DISCARDED: the chassis is differential, measured."""
+        """-> (vx, wz). vy is DISCARDED: the chassis is differential, measured.
+
+        CLAMPED to the same firmware-acceptance caps the 2D backend applies. Isaac used
+        to pass commands through UNCAPPED, so the two backends disagreed about the very
+        firmware they both claim to model -- a 2.0 m/s command was a 1.0 m/s robot on
+        one and a 2.0 m/s robot on the other. The caps are assumptions (vendor keyboard
+        defaults); see yahboomcar_sim.physics.FIRMWARE_MAX_SPEED. Both backends share
+        the assumption so they can at least be wrong identically.
+        """
         lin = self.og.Controller.get(
             self.og.Controller.attribute('/World/ROS/CmdVel.outputs:linearVelocity'))
         ang = self.og.Controller.get(
             self.og.Controller.attribute('/World/ROS/CmdVel.outputs:angularVelocity'))
-        return float(lin[0]), float(ang[2])
+        vx = max(-FIRMWARE_MAX_SPEED, min(FIRMWARE_MAX_SPEED, float(lin[0])))
+        wz = max(-FIRMWARE_MAX_YAW, min(FIRMWARE_MAX_YAW, float(ang[2])))
+        return vx, wz
 
     def wheel_odometry(self, dt):
         """Integrate WHEEL ROTATION into a pose, the way encoders do. -> (x, y, yaw, v, w)

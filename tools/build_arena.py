@@ -155,6 +155,13 @@ def main():
     ap.add_argument('--gui', action='store_true')
     ap.add_argument('--no-verify', dest='verify', action='store_false', default=True)
     ap.add_argument('--verify-seconds', type=float, default=10.0)
+    ap.add_argument('--box-mass', type=float, default=0.12,
+                    help='kg per cardboard box. An empty ~30 cm box is ~0.1-0.15 kg; '
+                         'the old 0.4 outweighed the robot.')
+    ap.add_argument('--robot-mass', type=float, default=1.0,
+                    help='kg, TOTAL for the robot. Estimate from holding the real car '
+                         '("like a kilogram"); the URDF inertials total only 0.355 kg. '
+                         'Put the car on a scale and update this.')
     ap.add_argument('--no-lidar', dest='lidar', action='store_false', default=True,
                     help='omit the RTX lidar. Without it the arena cannot feed SLAM, '
                          'Nav2 or the governor -- they all wait on /scan, silently.')
@@ -258,13 +265,18 @@ def main():
 
         # Movable cardboard boxes, kept clear of the 2x2 m UMBmark square so they do
         # not silently corrupt a calibration run.
+        #
+        # MASS: 0.12 kg default, was 0.4. At 0.4 each box OUTWEIGHED the robot (whose
+        # URDF inertials total 0.355 kg), which is why the car "could barely move"
+        # boxes that are supposed to be light cardboard -- field report. An empty
+        # ~30 cm cardboard box is roughly 0.1-0.15 kg.
         b = 0.3
         spots = [(1.45, 1.45), (-1.45, 1.30), (1.35, -1.40), (-1.30, -1.45),
                  (0.0, 1.55), (1.55, 0.0)]
         for i in range(min(args.boxes, len(spots))):
             bx, by = spots[i]
             box(f'/World/Box_{i}', (b, b, b), (bx, by, b / 2 + 0.001),
-                cardboard, rigid=True, mass=0.4)
+                cardboard, rigid=True, mass=args.box_mass)
 
         # Lighting: dome for fill, distant for shape and shadows.
         dome = UsdLux.DomeLight.Define(stage, '/World/Lights/Dome')
@@ -290,6 +302,39 @@ def main():
         # would collide with the existing stack. XformCommonAPI edits in place instead.
         UsdGeom.XformCommonAPI(robot.GetPrim()).SetTranslate(
             Gf.Vec3d(0.0, 0.0, spawn_z))
+
+        # ROBOT MASS. The URDF inertials total 0.355 kg -- recorded as a known defect
+        # since the second audit -- while the real car is about 1 kg in the hand. With
+        # the old 0.4 kg boxes the ROBOT WAS THE LIGHTER PARTY in every collision, which
+        # is why it could barely shift them. The difference is added to base_link (the
+        # chassis is where the battery and boards live); the wheels keep their URDF
+        # inertials so the contact patches behave the same. ESTIMATE until the car
+        # meets a kitchen scale; --robot-mass replaces it, and the report records it.
+        # Both figures read from the URDF's <mass> elements, not remembered.
+        urdf_total = 0.355482
+        if args.robot_mass > urdf_total:
+            base_prim = None
+            for prim in Usd.PrimRange(stage.GetPrimAtPath(ROBOT_PRIM)):
+                if prim.GetName() == 'base_link':
+                    base_prim = prim
+                    break
+            if base_prim is None:
+                say('  FAIL: no base_link to set the robot mass on')
+                return 1
+            extra = args.robot_mass - urdf_total
+            # The URDF gives base_link its own share of the 0.355; MassAPI's mass attr
+            # OVERRIDES that link's mass outright, so the new value is its URDF share
+            # plus everything the URDF undercounts.
+            base_urdf_share = 0.222555   # base_link's own <mass> in MicroROS.urdf
+            UsdPhysics.MassAPI.Apply(base_prim).CreateMassAttr(
+                base_urdf_share + extra)
+            say(f'  robot mass: base_link set to {base_urdf_share + extra:.3f} kg so '
+                f'the articulation totals ~{args.robot_mass:.2f} kg')
+            say(f'    (URDF total {urdf_total} kg is a known defect; '
+                f'{args.robot_mass:.2f} kg is an in-hand ESTIMATE -- weigh the car)')
+        else:
+            say(f'  robot mass left at URDF inertials (~{urdf_total} kg): '
+                f'--robot-mass {args.robot_mass} does not exceed them')
 
         # The lidar, parented under base_link so it rides with the chassis. It is
         # authored into the arena rather than at run time so `arena.usd` is complete on

@@ -12,7 +12,8 @@ import pytest
 
 from yahboomcar_sim.arena import (LIDAR_RANGE_MAX, default_arena, raycast,
                                   segments_box, segments_room)
-from yahboomcar_sim.physics import (ACCEL_NOISE, GRAVITY, RobotState,
+from yahboomcar_sim.physics import (ACCEL_NOISE, FIRMWARE_MAX_SPEED,
+                                    FIRMWARE_MAX_YAW, GRAVITY, RobotState,
                                     apply_command, imu_sample, step)
 
 
@@ -61,10 +62,20 @@ def test_strafe_is_discarded_entirely():
     assert vx == 0.0 and wz == 0.0
 
 
-def test_speed_and_yaw_are_capped():
+def test_speed_and_yaw_are_capped_at_the_assumed_firmware_limits():
+    """1.0 m/s / 5.0 rad/s are the VENDOR KEYBOARD's own limit defaults -- an assumption
+    with stated provenance, not a measurement; the real cap is unmeasured. The old 0.35
+    here was the GOVERNOR's floor-safety cap leaking into the firmware model, which made
+    even ungoverned teleop crawl while the real car is fast."""
     vx, wz = apply_command(10.0, 0.0, 99.0)
-    assert vx == pytest.approx(0.35)
-    assert wz == pytest.approx(1.5)
+    assert vx == pytest.approx(FIRMWARE_MAX_SPEED) == pytest.approx(1.0)
+    assert wz == pytest.approx(FIRMWARE_MAX_YAW) == pytest.approx(5.0)
+
+
+def test_caps_are_parameters_so_a_measured_value_can_replace_the_assumption():
+    vx, wz = apply_command(10.0, 0.0, 99.0, max_speed=0.42, max_yaw=1.1)
+    assert vx == pytest.approx(0.42)
+    assert wz == pytest.approx(1.1)
 
 
 def test_driving_forward_moves_along_the_heading():

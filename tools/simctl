@@ -316,7 +316,8 @@ def cmd_start(args):
 
     if args.safety:
         print('  [2/6] safety governor + deadman...')
-        sh('ros2 launch yahboomcar_safety safety_launch.py', dom,
+        sh('ros2 launch yahboomcar_safety safety_launch.py '
+           f'max_speed:={args.max_speed}', dom,
            log=os.path.join(log, 'simctl-safety.log'))
         time.sleep(8)
 
@@ -586,14 +587,69 @@ def cmd_teleop(args):
         print('  ./tools/simctl start --no-patrol')
         return 2
 
+    # TELEOP MUST OWN THE DOMAIN. Field report: teleop was started with the patrol
+    # still running (simctl start starts one by default), the two interleaved on
+    # /cmd_vel_raw, the governor forwarded both, and the car "kept moving forward" no
+    # matter what was pressed -- the patrol simply out-published the keys. Same
+    # silence-the-sources-first pattern as cmd_stop step 1, for the same reason:
+    # zeroing under a live publisher just gets republished over.
+    rivals = running(COMMAND_SOURCES, domain=args.domain)
+    if rivals:
+        print(f'  silencing {len(rivals)} competing command source(s) -- two '
+              'controllers interleave,')
+        print('  and the firmware model latches whichever command lands last:')
+        for pid in rivals:
+            try:
+                with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                    name = f.read().split(b'\0')[1:2]
+                print(f'    pid {pid}  {name[0].decode() if name else "?"}')
+            except OSError:
+                print(f'    pid {pid}')
+            try:
+                os.kill(pid, signal.SIGTERM)     # patrol zeroes on SIGTERM
+            except ProcessLookupError:
+                pass
+        time.sleep(2.5)
+        for pid in running(COMMAND_SOURCES, domain=args.domain):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        # Clear anything they latched before the keyboard takes over.
+        zero_domain(args.domain, seconds=2.0)
+        print('  silenced; the keyboard is now the only command source')
+
     governed = not args.direct and bool(running(['cmd_vel_governor'],
                                                 domain=args.domain))
     if governed:
         print('  governor detected: keys go to /cmd_vel_raw, governed onto /cmd_vel')
+        # The LIVE cap, not the default -- printing "0.35" while the governor ran at
+        # 1.0 was misleading in the first test of this very feature.
+        cap = ros_eval(
+            'rclpy.init(); n=Node("cap_probe")\n'
+            'from rcl_interfaces.srv import GetParameters\n'
+            'c=n.create_client(GetParameters,"/cmd_vel_governor/get_parameters")\n'
+            'r=None\n'
+            'if c.wait_for_service(timeout_sec=4.0):\n'
+            '    req=GetParameters.Request(); req.names=["max_speed"]\n'
+            '    f=c.call_async(req)\n'
+            '    rclpy.spin_until_future_complete(n,f,timeout_sec=4.0)\n'
+            '    r=f.result()\n'
+            'print("CAP", r.values[0].double_value if r and r.values else "?")\n'
+            'sys.stdout.flush(); os._exit(0)\n', args.domain, timeout=20)
+        cap = cap.split('CAP')[-1].strip() if 'CAP' in cap else '?'
+        print(f'  SPEED: keyboard starts at 0.2 m/s, q raises 10% per press; the')
+        print(f'  governor caps at max_speed = {cap} m/s (this session).')
+        print('  PRESS q SLOWLY -- the vendor node flushes its input queue between')
+        print('  reads (tty.setraw/TCSAFLUSH), so rapid presses are silently dropped.')
+        print('  For a faster session: simctl start --no-patrol --max-speed 1.0,')
+        print('  or bypass the governor:  simctl teleop --direct')
         remap = ' --ros-args -r cmd_vel:=/cmd_vel_raw'
     else:
         why = '--direct' if args.direct else 'no governor running'
         print(f'  publishing /cmd_vel directly ({why}) -- bare vendor behaviour')
+        print('  SPEED: keyboard starts at 0.2 m/s; q raises 10% per press up to 1.0,')
+        print('  and the simulated firmware accepts up to 1.0 m/s (assumed, unmeasured).')
         remap = ''
     print('  Ctrl+C to stop; the robot is left stationary.')
     print()
@@ -634,6 +690,8 @@ def main():
                    help='run Isaac headless. Without this a window opens --\n                         seeing it is most of why you would pick Isaac.')
     s.add_argument('--domain', type=int, default=SIM_DOMAIN)
     s.add_argument('--slip', type=float, default=0.0)
+    s.add_argument('--max-speed', type=float, default=0.35,
+                   help='governor forward cap, m/s. Default mirrors the floor\n                         safety value; raise for a faster sim session, e.g. 1.0.\n                         The sim firmware itself accepts up to 1.0 (assumed).')
     s.add_argument('--no-rviz', dest='rviz', action='store_false')
     s.add_argument('--no-slam', dest='slam', action='store_false')
     s.add_argument('--no-safety', dest='safety', action='store_false')

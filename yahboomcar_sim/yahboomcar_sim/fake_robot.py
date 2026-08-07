@@ -49,8 +49,9 @@ from std_msgs.msg import UInt16
 
 from yahboomcar_sim.arena import (LIDAR_BEAMS, LIDAR_RANGE_MAX, LIDAR_RANGE_MIN,
                                   default_arena, raycast)
-from yahboomcar_sim.physics import (ACCEL_NOISE, RobotState, apply_command,
-                                    imu_sample, step)
+from yahboomcar_sim.physics import (ACCEL_NOISE, FIRMWARE_MAX_SPEED,
+                                    FIRMWARE_MAX_YAW, RobotState,
+                                    apply_command, imu_sample, step)
 
 # Measured rates of the real firmware.
 SCAN_HZ = 12.0
@@ -67,6 +68,10 @@ class FakeRobot(Node):
         self.declare_parameter('scan_noise', 0.01)      # m, 1-sigma
         # m/s^2, 1-sigma. MEASURED: 0.0122-0.0307 across three at-rest selftest bags.
         self.declare_parameter('accel_noise', ACCEL_NOISE)
+        # The firmware's acceptance caps. ASSUMPTIONS (vendor keyboard defaults),
+        # not measurements -- see physics.FIRMWARE_MAX_SPEED's note.
+        self.declare_parameter('max_speed', FIRMWARE_MAX_SPEED)
+        self.declare_parameter('max_yaw', FIRMWARE_MAX_YAW)
         self.declare_parameter('dropout', 0.0)          # fraction of scans withheld
         self.declare_parameter('start_x', 0.0)
         self.declare_parameter('start_y', 0.0)
@@ -82,6 +87,8 @@ class FakeRobot(Node):
         self.slip = float(self.get_parameter('slip').value)
         self.scan_noise = float(self.get_parameter('scan_noise').value)
         self.accel_noise = float(self.get_parameter('accel_noise').value)
+        self.max_speed = float(self.get_parameter('max_speed').value)
+        self.max_yaw = float(self.get_parameter('max_yaw').value)
         self.dropout = float(self.get_parameter('dropout').value)
         self.battery = float(self.get_parameter('battery_volts').value)
         self.decel = float(self.get_parameter('decel').value)
@@ -147,7 +154,8 @@ class FakeRobot(Node):
 
     def _on_cmd(self, msg: Twist):
         # vy discarded: differential chassis, measured to produce exactly zero.
-        self.cmd = apply_command(msg.linear.x, msg.linear.y, msg.angular.z)
+        self.cmd = apply_command(msg.linear.x, msg.linear.y, msg.angular.z,
+                                 self.max_speed, self.max_yaw)
 
     def _tick_physics(self):
         now = self.get_clock().now()
