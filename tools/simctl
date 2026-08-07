@@ -171,15 +171,18 @@ def cmd_start(args):
     # 1. the robot, plus the REAL bringup stack on top of it
     if args.backend == 'isaac':
         # Refuse loudly rather than start something that cannot satisfy the contract.
-        # sim_runner.py drives Isaac physics but publishes nothing to ROS, and
-        # build_arena.py has no lidar prim at all -- so an Isaac-backed run would come up
-        # with no /scan, and SLAM, Nav2 and the governor would all sit there silently
-        # waiting. A backend that half-satisfies the firmware contract is worse than no
-        # backend, because every result taken from it stops transferring without saying so.
-        print('The Isaac backend is not wired to ROS yet.')
-        print('  missing: sim_runner.py --ros (publishers), build_arena.py lidar prim')
-        print('  Isaac today runs physics only -- see tools/verify_twin.py.')
-        print('  Use the 2D backend: ./tools/simctl start')
+        # A backend that half-satisfies it is worse than no backend, because every
+        # result taken from it stops transferring to the real robot without saying so.
+        print('The Isaac backend is close but OFF-CONTRACT on /scan.')
+        print('  It publishes /scan, /odom_raw, /imu and /battery and drives from')
+        print('  /cmd_vel -- run it directly with:')
+        print('    ~/isaac/env_isaaclab/bin/python tools/sim_runner.py --ros')
+        print('  Measured: scan geometry exact (360 beams, 1.000 deg, 0.12-8.0 m),')
+        print('  /odom_raw 11.0, /imu 25.0, /battery 1.0 Hz, realtime x1.00.')
+        print('  BUT /scan arrives at 14.4 Hz against a 12 Hz contract: the RTX lidar')
+        print('  rotates on the renderer clock at a fixed 72 Hz, ignoring the')
+        print('  scanRateBaseHz=12 authored on the prim. See run_ros() in sim_runner.py.')
+        print('  Use the 2D backend meanwhile: ./tools/simctl start')
         return 2
     else:
         print('  [1/6] simulated firmware + real bringup...')

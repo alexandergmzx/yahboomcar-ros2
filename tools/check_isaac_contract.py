@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Check EVERY field of the firmware contract against whatever backend is running.
+
+    ./tools/check_isaac_contract.py 30      # 30 s window
+
+Runs in SYSTEM python (3.12) on purpose: rclpy cannot be imported into Isaac's
+interpreter at all -- Isaac is 3.11 and Jazzy builds rclpy for 3.12, an ABI mismatch
+rather than a path problem -- so this has to be a separate process from the simulator
+it is measuring.
+
+It caught two things a backend cannot see about itself: sim_runner counted exactly 12
+renders per second while /scan was actually arriving at 14.4 Hz, and the 2D simulator
+published a perfectly constant 9.81 accelerometer, which is what a DEAD sensor looks
+like. Both were invisible from inside the publisher.
+
+
+Compares what a backend publishes against CLAUDE.md's measured contract:
+  pub /scan 12 Hz, /odom_raw 11 Hz, /imu 25 Hz, /battery 1 Hz
+  sub /cmd_vel
+"""
+import math
+import sys
+import time
+
+import rclpy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Imu, LaserScan
+from std_msgs.msg import UInt16
+
+SECS = float(sys.argv[1]) if len(sys.argv) > 1 else 30.0
+WANT_HZ = {'scan': 12.0, 'odom_raw': 11.0, 'imu': 25.0, 'battery': 1.0}
+
+rclpy.init()
+n = Node('contract_check')
+got = {k: [] for k in WANT_HZ}
+
+
+def rec(k):
+    return lambda m: got[k].append((time.time(), m))
+
+
+n.create_subscription(LaserScan, '/scan', rec('scan'), qos_profile_sensor_data)
+n.create_subscription(Odometry, '/odom_raw', rec('odom_raw'), qos_profile_sensor_data)
+n.create_subscription(Imu, '/imu', rec('imu'), qos_profile_sensor_data)
+n.create_subscription(UInt16, '/battery', rec('battery'), qos_profile_sensor_data)
+pub = n.create_publisher(Twist, '/cmd_vel', 10)
+
+t_end = time.time() + SECS
+drive_until = time.time() + SECS * 0.5
+while time.time() < t_end:
+    # Drive for the first half, so /cmd_vel is proven to actually move the robot.
+    tw = Twist()
+    if time.time() < drive_until:
+        tw.linear.x = 0.12
+        tw.angular.z = 0.3
+    pub.publish(tw)
+    rclpy.spin_once(n, timeout_sec=0.05)
+
+fails = []
+print(f'{"topic":12s} {"msgs":>6s} {"Hz":>7s} {"want":>6s}')
+for k, want in WANT_HZ.items():
+    ms = got[k]
+    hz = (len(ms) - 1) / (ms[-1][0] - ms[0][0]) if len(ms) > 1 else 0.0
+    # 10%, not 20%: a 20% band exactly masked /scan at 14.4 Hz against 12.
+    flag = '' if abs(hz - want) <= max(0.3, want * 0.10) else '  <-- OFF'
+    if not ms:
+        flag = '  <-- SILENT'
+        fails.append(f'{k} never published')
+    elif flag:
+        fails.append(f'{k} at {hz:.1f} Hz, want ~{want}')
+    print(f'{k:12s} {len(ms):6d} {hz:7.1f} {want:6.1f}{flag}')
+
+print()
+if got['scan']:
+    m = got['scan'][-1][1]
+    inc = math.degrees(m.angle_increment)
+    print(f'scan: {len(m.ranges)} beams, {inc:.4f} deg, '
+          f'{math.degrees(m.angle_min):.1f}..{math.degrees(m.angle_max):.1f} deg, '
+          f'{m.range_min:.3f}-{m.range_max:.3f} m, frame {m.header.frame_id!r}')
+    if len(m.ranges) != 360:
+        fails.append(f'scan has {len(m.ranges)} beams, want 360')
+    if abs(inc - 1.0) > 0.01:
+        fails.append(f'scan increment {inc:.4f} deg, want 1.0')
+
+if got['imu']:
+    m = got['imu'][-1][1]
+    az = [x[1].linear_acceleration.z for x in got['imu']]
+    mean = sum(az) / len(az)
+    var = sum((v - mean) ** 2 for v in az) / len(az)
+    print(f'imu:  orientation_covariance[0]={m.orientation_covariance[0]} '
+          f'(-1 means "not provided"), accel_z mean {mean:.3f} std {var**0.5:.4f}')
+    if m.orientation_covariance[0] != -1.0:
+        fails.append('imu claims an orientation; this IMU is 6-axis with no magnetometer')
+    if var == 0.0:
+        fails.append('imu accel_z has ZERO variance -- that is what a dead sensor looks like')
+
+if got['odom_raw']:
+    xs = [math.hypot(x[1].pose.pose.position.x, x[1].pose.pose.position.y)
+          for x in got['odom_raw']]
+    print(f'odom: travelled {max(xs) - min(xs):.3f} m during the run')
+    if max(xs) - min(xs) < 0.02:
+        fails.append('robot never moved -- /cmd_vel is not reaching the wheels')
+
+if got['battery']:
+    v = got['battery'][-1][1].data
+    print(f'batt: raw {v} -> {v/10:.1f} V')
+    if not (60 <= v <= 90):
+        fails.append(f'battery raw {v} is not a plausible tenths-of-a-volt reading')
+
+print()
+if fails:
+    print(f'=== {len(fails)} CONTRACT FAILURES ===')
+    for f in fails:
+        print(f'  - {f}')
+    sys.exit(1)
+print('CONTRACT SATISFIED')

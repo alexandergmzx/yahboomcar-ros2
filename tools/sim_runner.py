@@ -64,7 +64,7 @@ MIRROR_RIGHT = True
 class Sim:
     """Thin wrapper over the arena stage: pose, wheel drives, stepping."""
 
-    def __init__(self, app, gui, wheel_error=0.0, imbalance=0.0):
+    def __init__(self, app, gui, wheel_error=0.0, imbalance=0.0, rendering_dt=None):
         self.app = app
         self.gui = gui
         self.wheel_r = WHEEL_R * (1.0 + wheel_error)
@@ -86,7 +86,13 @@ class Sim:
         app.update()
         self.stage = omni.usd.get_context().get_stage()
 
-        self.sim = SimulationContext()
+        # rendering_dt is exposed because the RTX lidar rotates on the RENDERER's clock,
+        # and that is the open problem in --ros mode. It is NOT a fix -- see the
+        # SCAN RATE note in run_ros() before touching it.
+        if rendering_dt is not None:
+            self.sim = SimulationContext(rendering_dt=rendering_dt)
+        else:
+            self.sim = SimulationContext()
         self.sim.initialize_physics()
         self.sim.play()
         for _ in range(30):
@@ -360,6 +366,332 @@ TESTS = {
 }
 
 
+# ===================================================================== --ros ===
+# The MEASURED firmware contract. Isaac must satisfy it exactly, because the entire
+# point is that yahboomcar_bringup, the EKF, the governor, SLAM, Nav2 and RViz run
+# against it UNMODIFIED. A backend that publishes a differently shaped or differently
+# paced graph is worse than no backend: every result taken from it silently stops
+# transferring to the real robot.
+SCAN_HZ, ODOM_HZ, IMU_HZ, BATTERY_HZ = 12.0, 11.0, 25.0, 1.0
+BATTERY_VOLTS = 8.3
+# Measured from three at-rest selftest bags -- see yahboomcar_sim.physics.imu_sample,
+# which owns these numbers and explains why the gyro is deliberately noiseless.
+GRAVITY, ACCEL_NOISE = 9.799, 0.013
+
+
+class RosBridge:
+    """Publishes the firmware contract out of Isaac, and drives from /cmd_vel.
+
+    WHY OMNIGRAPH AND NOT rclpy: rclpy cannot be imported into Isaac's interpreter at
+    all. Isaac runs Python 3.11, Jazzy builds rclpy for 3.12, and that is an ABI
+    mismatch rather than a path problem. isaacsim.ros2.bridge is C++, carries its own
+    ROS 2, and does share a DDS graph with system ROS 2.
+
+    RATE CONTROL, which is the whole difficulty here: ROS2RtxLidarHelper publishes on
+    every RENDER tick, so with a plain playback tick /scan came out at 34.6 Hz -- the
+    frame rate, not the sensor's 12 Hz. Rendering is also the expensive part. So this
+    renders only on the frames where a scan is due, and the other publishers hang off
+    OnImpulseEvent nodes fired from Python at their own contract rates. That gets the
+    rates right AND buys back most of the frame budget.
+    """
+
+    def __init__(self, sim, app, domain_id, say):
+        self.sim, self.app, self.say = sim, app, say
+        import omni.graph.core as og
+        import omni.replicator.core as rep
+        from pxr import Usd
+        self.og = og
+
+        lidar = None
+        for prim in Usd.PrimRange(sim.stage.GetPrimAtPath(ROBOT_PRIM)):
+            if prim.GetTypeName() == 'OmniLidar':
+                lidar = prim
+                break
+        if lidar is None:
+            raise RuntimeError(
+                'no OmniLidar in the arena. Rebuild it:\n'
+                '  ~/isaac/env_isaaclab/bin/python tools/build_arena.py')
+        self.lidar_path = str(lidar.GetPath())
+        say(f'  lidar prim: {self.lidar_path}')
+        self._assert_contract(lidar)
+
+        rp = rep.create.render_product(self.lidar_path, [1, 1], name='YahboomLidarRP')
+        rp_path = rp.path if hasattr(rp, 'path') else str(rp)
+
+        keys = og.Controller.Keys
+        og.Controller.edit(
+            {'graph_path': '/World/ROS', 'evaluator_name': 'execution'},
+            {
+                keys.CREATE_NODES: [
+                    ('Tick', 'omni.graph.action.OnPlaybackTick'),
+                    ('Ctx', 'isaacsim.ros2.bridge.ROS2Context'),
+                    ('Scan', 'isaacsim.ros2.bridge.ROS2RtxLidarHelper'),
+                    ('CmdVel', 'isaacsim.ros2.bridge.ROS2SubscribeTwist'),
+                    ('OdomTick', 'omni.graph.action.OnImpulseEvent'),
+                    ('Odom', 'isaacsim.ros2.bridge.ROS2PublishOdometry'),
+                    ('ImuTick', 'omni.graph.action.OnImpulseEvent'),
+                    ('Imu', 'isaacsim.ros2.bridge.ROS2PublishImu'),
+                    ('BattTick', 'omni.graph.action.OnImpulseEvent'),
+                    ('Batt', 'isaacsim.ros2.bridge.ROS2Publisher'),
+                ],
+                keys.SET_VALUES: [
+                    ('Ctx.inputs:domain_id', int(domain_id)),
+                    # /scan -- BEST_EFFORT sensor QoS, as the firmware publishes it.
+                    ('Scan.inputs:topicName', 'scan'),
+                    ('Scan.inputs:frameId', 'laser_frame'),
+                    ('Scan.inputs:type', 'laser_scan'),
+                    ('Scan.inputs:renderProductPath', rp_path),
+                    # Wall-clock stamps: there is no /clock here and nothing in the
+                    # stack sets use_sim_time, by design.
+                    ('Scan.inputs:useSystemTime', True),
+                    ('CmdVel.inputs:topicName', 'cmd_vel'),
+                    # NOTE /odom_raw, not /odom. /odom is the EKF's, downstream.
+                    ('Odom.inputs:topicName', 'odom_raw'),
+                    ('Odom.inputs:odomFrameId', 'odom'),
+                    ('Odom.inputs:chassisFrameId', 'base_footprint'),
+                    ('Imu.inputs:topicName', 'imu'),
+                    ('Imu.inputs:frameId', 'imu_frame'),
+                    # The ICM-42670-P is 6-axis with NO magnetometer, so the firmware
+                    # has no absolute attitude to report. Publishing a made-up
+                    # orientation here would hand imu_filter_madgwick an answer it is
+                    # supposed to be computing.
+                    ('Imu.inputs:publishOrientation', False),
+                    ('Imu.inputs:publishAngularVelocity', True),
+                    ('Imu.inputs:publishLinearAcceleration', True),
+                    ('Batt.inputs:topicName', 'battery'),
+                    ('Batt.inputs:messagePackage', 'std_msgs'),
+                    ('Batt.inputs:messageSubfolder', 'msg'),
+                    ('Batt.inputs:messageName', 'UInt16'),
+                ],
+                keys.CONNECT: [
+                    ('Tick.outputs:tick', 'Scan.inputs:execIn'),
+                    ('Tick.outputs:tick', 'CmdVel.inputs:execIn'),
+                    ('OdomTick.outputs:execOut', 'Odom.inputs:execIn'),
+                    ('ImuTick.outputs:execOut', 'Imu.inputs:execIn'),
+                    ('BattTick.outputs:execOut', 'Batt.inputs:execIn'),
+                    ('Ctx.outputs:context', 'Scan.inputs:context'),
+                    ('Ctx.outputs:context', 'CmdVel.inputs:context'),
+                    ('Ctx.outputs:context', 'Odom.inputs:context'),
+                    ('Ctx.outputs:context', 'Imu.inputs:context'),
+                    ('Ctx.outputs:context', 'Batt.inputs:context'),
+                ],
+            },
+        )
+        self.rng = __import__('numpy').random.default_rng(0)
+        self._counts = {'scan': 0, 'odom': 0, 'imu': 0, 'batt': 0}
+        self._prev_pose = sim.pose()
+        self._prev_t = 0.0
+        say(f'  graph built on ROS_DOMAIN_ID={domain_id}')
+
+    def _due(self, key, t, hz):
+        """Phase accumulator, NOT an elapsed-time gate.
+
+        A gate of `t - last >= 1/hz` can only ever fire on a step boundary, so at 60 Hz
+        physics the achievable rates are 60/n -- 30, 20, 15, 12 -- and 25 Hz came out
+        as 20, a 20% error. Comparing a count against floor(t*hz) instead lets the
+        firing pattern be uneven while the AVERAGE rate stays exact, which is what the
+        contract is about.
+        """
+        if self._counts[key] < int(t * hz):
+            self._counts[key] += 1
+            return True
+        return False
+
+    def _assert_contract(self, lidar):
+        """The arena's lidar must still be the one build_arena.py verified.
+
+        Checked here as well as at build time because arena.usd is regenerable and a
+        stale or hand-edited one would publish a differently shaped scan while
+        everything downstream carried on looking healthy.
+        """
+        P = 'omni:sensor:Core:'
+        want = {P + 'scanRateBaseHz': 12, P + 'reportRateBaseHz': 4320,
+                P + 'numberOfChannels': 1}
+        for k, v in want.items():
+            got = lidar.GetAttribute(k).Get()
+            if got != v:
+                raise RuntimeError(
+                    f'arena lidar is off-contract: {k.split(":")[-1]} = {got}, '
+                    f'wanted {v}. Rebuild with tools/build_arena.py')
+        elev = list(lidar.GetAttribute(P + 'emitterState:s001:elevationDeg').Get() or [])
+        if any(e != 0.0 for e in elev):
+            raise RuntimeError(
+                f'arena lidar has nonzero elevation {elev}; FlatScan will refuse to '
+                'run and /scan will simply never appear. Rebuild the arena.')
+
+    def read_cmd_vel(self):
+        """-> (vx, wz). vy is DISCARDED: the chassis is differential, measured."""
+        lin = self.og.Controller.get(
+            self.og.Controller.attribute('/World/ROS/CmdVel.outputs:linearVelocity'))
+        ang = self.og.Controller.get(
+            self.og.Controller.attribute('/World/ROS/CmdVel.outputs:angularVelocity'))
+        return float(lin[0]), float(ang[2])
+
+    def _fire(self, node):
+        self.og.Controller.set(
+            self.og.Controller.attribute(f'/World/ROS/{node}.state:enableImpulse'), True)
+
+    def publish(self, t, dt):
+        """Fire each publisher at its own contract rate."""
+        og = self.og
+        x, y, yaw = self.sim.pose()
+
+        if self._due('odom', t, ODOM_HZ):
+            px, py, pyaw = self._prev_pose
+            span = max(1e-6, t - self._prev_t)
+            vx = math.hypot(x - px, y - py) / span
+            wz = norm(yaw - pyaw) / span
+            og.Controller.set(og.Controller.attribute('/World/ROS/Odom.inputs:position'),
+                              [x, y, 0.0])
+            og.Controller.set(
+                og.Controller.attribute('/World/ROS/Odom.inputs:orientation'),
+                [0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)])
+            og.Controller.set(
+                og.Controller.attribute('/World/ROS/Odom.inputs:linearVelocity'),
+                [vx, 0.0, 0.0])
+            og.Controller.set(
+                og.Controller.attribute('/World/ROS/Odom.inputs:angularVelocity'),
+                [0.0, 0.0, wz])
+            self._fire('OdomTick')
+            self._prev_pose = (x, y, yaw)
+            self._prev_t = t
+            self._wz_now = wz
+
+        if self._due('imu', t, IMU_HZ):
+            wz = getattr(self, '_wz_now', 0.0)
+            og.Controller.set(
+                og.Controller.attribute('/World/ROS/Imu.inputs:angularVelocity'),
+                [0.0, 0.0, float(wz)])
+            # Noisy accel on measured figures. A constant 9.81 is exactly what a DEAD
+            # accelerometer looks like, and tools/sensor_health.py flags a
+            # zero-variance channel as stuck -- correctly.
+            og.Controller.set(
+                og.Controller.attribute('/World/ROS/Imu.inputs:linearAcceleration'),
+                [float(self.rng.normal(0.0, ACCEL_NOISE)),
+                 float(self.rng.normal(0.0, ACCEL_NOISE)),
+                 float(self.rng.normal(GRAVITY, ACCEL_NOISE))])
+            self._fire('ImuTick')
+
+        if self._due('batt', t, BATTERY_HZ):
+            og.Controller.set(og.Controller.attribute('/World/ROS/Batt.inputs:data'),
+                              int(round(BATTERY_VOLTS * 10)))
+            self._fire('BattTick')
+
+
+def run_ros(sim, app, args, say):
+    """Drive Isaac from /cmd_vel and publish the firmware contract. Runs until killed.
+
+    SCAN RATE: UNRESOLVED, and the reason tools/simctl still refuses --backend isaac.
+
+    Everything else matches the contract exactly, measured by an external subscriber:
+    /scan is 360 beams at 1.0000 deg spanning -180.0..179.0 deg over 0.120-8.000 m in
+    frame laser_frame (identical to the 2D simulator, whose angle_max is
+    pi - 2*pi/360); /odom_raw 11.0 Hz; /imu 25.0 Hz with orientation_covariance[0] = -1
+    and accel_z 9.800 +/- 0.0127; /battery 8.3 V; and /cmd_vel moves the robot (1.7 m
+    over a 30 s run). Realtime factor 1.00.
+
+    But /scan arrives at 14.4 Hz against a 12 Hz contract, while this loop counts
+    exactly 12 renders per second -- so it looks correct from the inside and is only
+    visible to a subscriber. ROS2RtxLidarHelper publishes every completed rotation
+    buffered since the last render, and the sensor turns out to rotate on the
+    RENDERER's clock at a rate that ignores the scanRateBaseHz=12 authored on the prim
+    (verified by readback in build_arena.py). Measured directly:
+
+        rendering_dt   scans per render   /scan Hz at 12 renders/s
+        1/60 (default)      1.2                 14.4
+        1/12                6.0                 72.0
+
+    Exactly 5x for 5x, i.e. the sensor rotates at a fixed 72 Hz of render time. Pinning
+    rendering_dt therefore makes it worse, not better, and the default is used here
+    because 14.4 is merely the closest wrong answer.
+
+    Rendering at 10 Hz instead of 12 would land on 12 Hz of /scan, but that is
+    calibrating against an unexplained constant rather than understanding it, and it
+    would silently drift with anything that changes render timing. Left unfixed and
+    visible instead. A backend that half-satisfies the contract is worse than no
+    backend -- so simctl keeps refusing until this is understood.
+    """
+    import time as _time
+    domain = os.environ.get('ROS_DOMAIN_ID', '0')
+    say('=== ROS bridge ===')
+    bridge = RosBridge(sim, app, domain, say)
+
+    dt = sim.dt()
+    say(f'  physics {1/dt:.0f} Hz')
+    say(f'  /scan {SCAN_HZ:.0f}  /odom_raw {ODOM_HZ:.0f}  /imu {IMU_HZ:.0f}  '
+        f'/battery {BATTERY_HZ:.0f} Hz   <- /cmd_vel')
+    say('  NO COMMAND WATCHDOG, as on the real firmware: a commanded speed is held')
+    say('  indefinitely. Modelled on purpose.')
+    say('')
+
+    # Everything is driven off WALL CLOCK, not accumulated sim steps. Nothing in this
+    # stack sets use_sim_time -- by design, so that swapping the simulator for the car
+    # changes nothing -- which means the rate a subscriber measures is a wall-clock
+    # rate, and that is the one that has to match the contract.
+    t0 = _time.time()
+    last_report = t0
+    sim_t = 0.0
+    last_render = -1.0
+    try:
+        while True:
+            t = _time.time() - t0
+            vx, wz = bridge.read_cmd_vel()
+            sim.drive(vx, wz)
+            # Render ONLY when a scan is due, and gate that on SIM time rather than
+            # wall time. ROS2RtxLidarHelper publishes on every render tick, so:
+            #   * rendering every frame pinned /scan to the frame rate (34.6 Hz) and
+            #     ate the whole frame budget;
+            #   * gating on WALL time gave 14.4 Hz, because the lidar's rotation is
+            #     driven by SIM time at scanRateBaseHz while the renders came on a
+            #     wall-clock cadence, and the two beat -- roughly one render in five
+            #     found two completed rotations buffered and published both.
+            # dt is 1/60 and 1/SCAN_HZ is 1/12, so this is exactly every 5th step:
+            # one rotation, one render, one message.
+            render = (sim_t - last_render) >= (1.0 / SCAN_HZ) - 1e-9
+            if render:
+                last_render = sim_t
+                bridge._counts['scan'] += 1
+            sim.sim.step(render=render)
+            app.update()
+            sim_t += dt
+            bridge.publish(t, dt)
+
+            # PACE SIM TIME TO WALL TIME. Without this the loop runs flat out, the
+            # lidar completes ~2 rotations per rendered frame, and the helper publishes
+            # BOTH -- measured as 24 Hz of /scan while this loop counted 12 renders.
+            # Every other rate looked correct throughout, because only /scan is driven
+            # by the sensor's own rotation rather than by a Python-fired impulse.
+            ahead = sim_t - (_time.time() - t0)
+            if ahead > 0:
+                _time.sleep(ahead)
+
+            now = _time.time()
+            if now - last_report >= 10.0:
+                c = bridge._counts
+                rtf = sim_t / t
+                say(f'  t={t:6.1f}s  realtime x{rtf:.2f}  scan {c["scan"]/t:.1f}  '
+                    f'odom {c["odom"]/t:.1f}  imu {c["imu"]/t:.1f}  '
+                    f'batt {c["batt"]/t:.1f} Hz')
+                if rtf < 0.9:
+                    say(f'  WARNING: only {rtf:.2f}x realtime. The robot is moving in '
+                        'slow motion relative to the wall-clock rates above, so any '
+                        'timing taken from this run is meaningless.')
+                for k, wanted in (('scan', SCAN_HZ), ('odom', ODOM_HZ),
+                                  ('imu', IMU_HZ)):
+                    if c[k] / t < wanted * 0.9:
+                        say(f'  WARNING: /{k} is only making {c[k]/t:.1f} of '
+                            f'{wanted:.0f} Hz -- this machine cannot sustain the '
+                            'contract.')
+                last_report = now
+    except KeyboardInterrupt:
+        say('\n  interrupted; stopping the robot')
+        sim.drive(0.0, 0.0)
+        for _ in range(10):
+            sim.sim.step(render=False)
+            app.update()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--test', default='drive-straight',
@@ -377,6 +709,10 @@ def main():
     ap.add_argument('--calibrate', action='store_true',
                     help='measure the effective rolling radius and report it, instead '
                          'of trusting the constant')
+    ap.add_argument('--ros', action='store_true',
+                    help='publish the firmware contract (/scan, /odom_raw, /imu, '
+                         '/battery) and drive from /cmd_vel, so the real ROS 2 stack '
+                         'runs against Isaac unmodified. Runs until Ctrl+C.')
     args = ap.parse_args()
 
     if not os.path.exists(ARENA_USD):
@@ -432,6 +768,19 @@ def main():
             say(f'  geometric radius = {WHEEL_R_GEOMETRIC}  '
                 f'-> ratio {(v/wa)/WHEEL_R_GEOMETRIC:.2f}x, still unexplained')
             say('')
+
+        if args.ros:
+            # Enable the bridge BEFORE any graph is built; the ROS2 node types do not
+            # exist until the extension loads.
+            from isaacsim.core.utils.extensions import enable_extension
+            for ext in ('isaacsim.ros2.bridge', 'isaacsim.sensors.rtx',
+                        'isaacsim.core.nodes', 'omni.graph.action',
+                        'omni.replicator.core'):
+                enable_extension(ext)
+            for _ in range(5):
+                app.update()
+            code['v'] = run_ros(sim, app, args, say)
+            return code['v']
 
         if args.test == 'all':
             names = list(TESTS)
