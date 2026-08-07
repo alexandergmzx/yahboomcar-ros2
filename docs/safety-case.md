@@ -254,7 +254,19 @@ the gyro specifically. **Neither a power cycle nor a serial reset recovers it.**
 
 **A stationary robot cannot answer this**, which matters because preflight runs on a
 stationary robot: at rest a working gyro and a broken one both read exactly 0.000000.
-`tools/sensor_health.py --rotate-test` is the only decisive check.
+
+The decisive check does not rely on anyone's timing or word:
+`tools/sensor_health.py --rotate-window 75` watches while the car is turned by hand and
+uses the **lidar to independently establish that a rotation happened**, then asks whether
+the gyro noticed. Three outcomes, all unambiguous — lidar sees rotation and the gyro
+responds (live), lidar sees rotation and the gyro is flat (fault), or the lidar sees too
+little rotation (inconclusive, turn it further).
+
+**Result 2026-08-07: LIVE.** The lidar witnessed 4084° of hand rotation and the gyro
+peaked at 5.29 rad/s. So the fault is intermittent rather than permanent, and the sensor
+is currently working — but it has failed three times before with no recovery from either
+a power cycle or a serial reset, so **it is worth re-checking after any session where
+yaw matters**, and a mid-session dropout would silently invalidate a calibration.
 
 **A stuck channel is worse than a silent one.** A topic that stops publishing fails
 loudly; a gyro pinned at exactly zero publishes at full rate and reads as *"the robot is

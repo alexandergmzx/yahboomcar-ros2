@@ -57,6 +57,8 @@ import sys
 import threading
 import time
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -65,6 +67,10 @@ def main():
     ap.add_argument('--rotate-test', action='store_true',
                     help='the only decisive gyro check: you rotate the car by hand and '
                          'the gyro must respond. Needs no motors.')
+    ap.add_argument('--rotate-window', type=float, default=0.0,
+                    help='non-interactive rotate test: watch for this many seconds and '
+                         'use the LIDAR to witness whether a rotation actually happened, '
+                         'so you can turn the car whenever you like within the window.')
     args = ap.parse_args()
     os.environ.setdefault('ROS_DOMAIN_ID', str(args.domain))
 
@@ -186,6 +192,60 @@ def main():
         print(f'  BATTERY: {v:.1f} V  (session gate {gate} V)')
         if v < gate:
             fails.append(f'battery {v:.1f} V below the {gate} V session gate')
+
+    # ---- lidar-witnessed rotate test, no timing coordination needed ----
+    if args.rotate_window > 0:
+        print()
+        print(f'  LIDAR-WITNESSED ROTATE TEST -- {args.rotate_window:.0f} s window.')
+        print('  Turn the car by hand about the vertical axis at ANY point during it.')
+        print('  The lidar independently establishes whether a rotation happened, so the')
+        print('  gyro is judged against physical evidence rather than against your word')
+        print('  or my timing.')
+        sys.path.insert(0, os.path.join(REPO_ROOT, 'yahboomcar_ws', 'src',
+                                        'yahboomcar_localization'))
+        from yahboomcar_localization.scan_geometry import scan_to_xy
+        from yahboomcar_localization.scan_matcher import estimate_motion
+
+        imu.clear()
+        scans.clear()
+        t0 = time.time()
+        while time.time() - t0 < args.rotate_window:
+            time.sleep(1.0)
+            print(f'    {time.time()-t0:4.0f} s / {args.rotate_window:.0f} s  '
+                  f'({len(scans)} scans, {len(imu)} imu)', end='\r', flush=True)
+        print()
+
+        b = np.array(imu) if imu else np.zeros((0, 5))
+        gyro_peak = float(np.max(np.abs(b[:, 2]))) if len(b) else 0.0
+
+        # What the LIDAR says happened, independent of the IMU entirely.
+        lidar_yaw = 0.0
+        prev = None
+        step = max(1, len(scans) // 120)
+        for sc in scans[::step]:
+            xy = scan_to_xy(list(sc.ranges), sc.angle_min, sc.angle_increment,
+                            range_min=max(sc.range_min, 0.05), range_max=sc.range_max)
+            if prev is not None and len(xy) > 20:
+                r = estimate_motion(prev, xy)
+                if r.converged:
+                    lidar_yaw += abs(r.dtheta)
+            prev = xy
+
+        print(f'    lidar saw {math.degrees(lidar_yaw):.0f} deg of total rotation')
+        print(f'    gyro peak {gyro_peak:.4f} rad/s')
+        if lidar_yaw < math.radians(30):
+            warns.append(f'the lidar only saw {math.degrees(lidar_yaw):.0f} deg of '
+                         'rotation, so the car was probably not turned enough. '
+                         'INCONCLUSIVE -- rerun and turn it further.')
+            print('    -> INCONCLUSIVE: not enough rotation to judge the gyro.')
+        elif gyro_peak < 0.05:
+            fails.append(f'the lidar witnessed {math.degrees(lidar_yaw):.0f} deg of '
+                         f'rotation while the gyro peaked at {gyro_peak:.4f} rad/s -- '
+                         'the gyro did not see a rotation that demonstrably happened')
+            print('    -> DEAD. The room moved and the gyro did not notice.')
+        else:
+            print('    -> LIVE. It responded to a rotation the lidar confirms happened.')
+            warns[:] = [w for w in warns if 'gyro is flat' not in w]
 
     # ---- the only decisive gyro test: make it rotate ----
     if args.rotate_test:
