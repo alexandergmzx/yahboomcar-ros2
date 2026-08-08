@@ -51,6 +51,14 @@ WHEEL_R_GEOMETRIC = 0.0245
 # UNITS/CONVENTION factor of ~2.0 between apply_action/get_joint_velocities and the
 # physical angular velocity, not contact geometry. Where the 2 comes from is still
 # unexplained; the constant compensates it exactly, and --calibrate re-measures.
+#
+# CORROBORATED 2026-08-08 on a SECOND robot: the RaspTank twin (fresh URDF,
+# analytic cylinders authored at exactly r=0.025) measured 0.399 m/s of ground
+# truth against 0.2 m/s commanded through the geometric radius — the same ~2.0,
+# on hardware-independent geometry. That rules out anything specific to this
+# robot's import; it is a property of the Isaac joint-velocity pathway itself.
+# Evidence: rasptank-ros2/tools/build_rasptank_arena.py forward gate;
+# fleet docs/research-log.md session-5 table.
 WHEEL_R = 0.0458
 LY = 0.0675            # half-track from the URDF joint origins
 LEFT = ['zq_Joint', 'zh_Joint']
