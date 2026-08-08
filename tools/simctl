@@ -108,6 +108,8 @@ SIM_PROCS = [
     'ekf_node', 'imu_filter_madgwick_node', 'robot_state_publisher',
     'joint_state_publisher', 'static_transform_publisher', 'rviz2',
     'sim_runner.py', 'component_container_isolated', 'env_isaaclab',
+    # robot2 sessions (fleet session 5):
+    'fake_rasptank', 'rasptank_twin_runner', 'twin_scan_conditioner',
 ]
 
 
@@ -157,11 +159,13 @@ def zero_domain(domain, seconds=2.5):
         'rclpy.init(); n=Node("simctl_stop"); v=[]\n'
         'n.create_subscription(Odometry,"/odom_raw",lambda m: v.append(m.twist.twist.linear.x), qos_profile_sensor_data)\n'
         'a=n.create_publisher(Twist,"/cmd_vel",10); b=n.create_publisher(Twist,"/cmd_vel_raw",10)\n'
+        # robot2 sessions (fleet session 5): same zeros, its namespace.
+        'c=n.create_publisher(Twist,"/robot2/cmd_vel",10); d=n.create_publisher(Twist,"/robot2/cmd_vel_raw",10)\n'
         'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
         'time.sleep(1.0)\n'
         f'end=time.time()+{seconds}\n'
         'while time.time()<end:\n'
-        '    a.publish(Twist()); b.publish(Twist()); time.sleep(0.04)\n'
+        '    a.publish(Twist()); b.publish(Twist()); c.publish(Twist()); d.publish(Twist()); time.sleep(0.04)\n'
         'time.sleep(0.6)\n'
         'print("VX", v[-1] if v else "nodata")\n'
         'sys.stdout.flush(); os._exit(0)\n', domain, timeout=30)
@@ -250,6 +254,51 @@ def stale_segments():
 
 
 # ------------------------------------------------------------------------ start
+def start_robot2(args, dom, log):
+    """robot2 session: fake_rasptank (2d) or the Isaac twin, + the real stack.
+
+    Same evidence discipline as the yahboom flow: wait on topics, never on a
+    sleep. The stack launch (fleet_bringup robot2_sim_bringup_launch.py)
+    carries matcher+EKF+SLAM itself, so there are no separate steps here.
+    """
+    print(f'  robot2 session, backend {args.backend}')
+    if args.backend == 'isaac':
+        isaac_py = os.path.expanduser('~/isaac/env_isaaclab/bin/python')
+        if not os.path.exists(isaac_py):
+            print(f'  Isaac python not found at {isaac_py}')
+            return 2
+        rt_tools = os.path.abspath(os.path.join(REPO, '..', 'rasptank-ros2', 'tools'))
+        gui = ' --gui' if not args.no_isaac_gui else ''
+        print('  [1/3] RaspTank Isaac twin (~90 s)...')
+        sh(f'{isaac_py} {rt_tools}/rasptank_twin_runner.py --ros{gui}', dom,
+           log=os.path.join(log, 'simctl-r2-twin.log'))
+        deadline = time.time() + 420
+    else:
+        print('  [1/3] 2D contract sim starts inside the stack launch')
+        deadline = time.time() + 90
+
+    print('  [2/3] robot2 stack (matcher + EKF + SLAM + safety)...')
+    sh(f'ros2 launch fleet_bringup robot2_sim_bringup_launch.py '
+       f'backend:={args.backend}', dom,
+       log=os.path.join(log, 'simctl-r2-stack.log'))
+
+    print('  [3/3] waiting for evidence: /robot2/scan_filtered then /robot2/odom_laser')
+    want = ['/robot2/scan_filtered', '/robot2/odom_laser']
+    while time.time() < deadline and want:
+        out = subprocess.run(
+            ['bash', '-c', 'source /opt/ros/jazzy/setup.bash 2>/dev/null && '
+             f'ROS_DOMAIN_ID={dom} timeout 10 ros2 topic list'],
+            capture_output=True, text=True).stdout
+        want = [t for t in want if t not in out]
+        if want:
+            time.sleep(5)
+    if want:
+        print(f'  FAILED: still missing {want}. See simctl-r2-*.log')
+        return 1
+    print('  up. ./tools/simctl estop --domain', dom, ' to zero;  stop to tear down')
+    return 0
+
+
 def cmd_start(args):
     dom = args.domain
     log = os.path.join(ASSETS, 'logs')
@@ -279,6 +328,9 @@ def cmd_start(args):
         print(f'A simulation is already running on domain {dom}. Stop it first:')
         print('  ./tools/simctl stop')
         return 2
+
+    if getattr(args, 'robot', 'robot1') == 'robot2':
+        return start_robot2(args, dom, log)
 
     # 1. the robot, plus the REAL bringup stack on top of it
     if args.backend == 'isaac':
@@ -730,6 +782,8 @@ def main():
                    help='2d is instant and has no physics; isaac has real\n                         contact physics and collisions, takes ~90 s, and\n                         needs the GPU')
     s.add_argument('--no-isaac-gui', action='store_true',
                    help='run Isaac headless. Without this a window opens --\n                         seeing it is most of why you would pick Isaac.')
+    s.add_argument('--robot', choices=['robot1', 'robot2'], default='robot1',
+                   help='robot2 = RaspTank session (2d contract sim or Isaac twin)')
     s.add_argument('--domain', type=int, default=SIM_DOMAIN)
     s.add_argument('--slip', type=float, default=0.0)
     s.add_argument('--max-speed', type=float, default=0.35,

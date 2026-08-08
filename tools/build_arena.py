@@ -50,7 +50,17 @@ LIDAR_RANGE_MAX = 8.0
 LIDAR_XYZ = (-0.0046, 0.0, 0.094)
 
 
-def author_lidar(stage, base_path, Gf, Vt, say, break_it=False):
+def author_lidar(stage, base_path, Gf, Vt, say, break_it=False,
+                 beams=None, hz=None, range_min=None, range_max=None,
+                 xyz=None, name='laser_frame_lidar'):
+    # Parameterized for fleet reuse (session 5, rasptank twin): keyword
+    # args default to this module's MS200 constants, so every existing
+    # caller is unchanged; the C1 caller passes its own contract.
+    beams = LIDAR_BEAMS if beams is None else beams
+    hz = LIDAR_HZ if hz is None else hz
+    range_min = LIDAR_RANGE_MIN if range_min is None else range_min
+    range_max = LIDAR_RANGE_MAX if range_max is None else range_max
+    xyz = LIDAR_XYZ if xyz is None else xyz
     """Create the RTX lidar and author the contract onto it. Returns its prim path.
 
     THREE TRAPS, each of which looks like success:
@@ -76,9 +86,9 @@ def author_lidar(stage, base_path, Gf, Vt, say, break_it=False):
     import omni.kit.commands
     ok, sensor = omni.kit.commands.execute(
         'IsaacSensorCreateRtxLidar',
-        path='laser_frame_lidar',
+        path=name,
         parent=base_path,
-        translation=Gf.Vec3d(*LIDAR_XYZ),
+        translation=Gf.Vec3d(*xyz),
         orientation=Gf.Quatd(1.0, 0.0, 0.0, 0.0),
     )
     if not sensor:
@@ -95,12 +105,12 @@ def author_lidar(stage, base_path, Gf, Vt, say, break_it=False):
         E + 'fireTimeNs': Vt.UIntArray([0]),
         P + 'numberOfChannels': 1,
         P + 'numberOfEmitters': 1,
-        P + 'scanRateBaseHz': LIDAR_HZ,
+        P + 'scanRateBaseHz': hz,
         # Firings per second / rotations per second = beams per revolution. This, not
         # any explicit resolution field, is what sets the 1.000 deg increment.
-        P + 'reportRateBaseHz': LIDAR_BEAMS * LIDAR_HZ,
-        P + 'nearRangeM': LIDAR_RANGE_MIN,
-        P + 'farRangeM': LIDAR_RANGE_MAX,
+        P + 'reportRateBaseHz': beams * hz,
+        P + 'nearRangeM': range_min,
+        P + 'farRangeM': range_max,
         P + 'maxReturns': 1,
         # ROS LaserScan sweeps upward from angle_min, i.e. counter-clockwise.
         P + 'rotationDirection': 'CCW',
@@ -140,8 +150,8 @@ def author_lidar(stage, base_path, Gf, Vt, say, break_it=False):
         return None
 
     say(f'  lidar: {lidar.GetPath()}')
-    say(f'    {LIDAR_BEAMS} beams at {360/LIDAR_BEAMS:.3f} deg, '
-        f'{LIDAR_RANGE_MIN}-{LIDAR_RANGE_MAX} m, {LIDAR_HZ} Hz  '
+    say(f'    {beams} beams at {360/beams:.3f} deg, '
+        f'{range_min}-{range_max} m, {hz} Hz  '
         f'(all {len(wanted)} parameters read back)')
     return str(lidar.GetPath())
 

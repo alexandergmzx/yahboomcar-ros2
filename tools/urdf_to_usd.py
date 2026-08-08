@@ -62,6 +62,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--urdf', default=DEFAULT_URDF)
     ap.add_argument('--out', default=DEFAULT_OUT)
+    # Fleet reuse (session 5): the verify section was yahboom-hardcoded.
+    # Defaults unchanged; other robots pass their own expectations.
+    ap.add_argument('--expect-joints', default=None,
+                    help='comma-separated movable joints (default: yahboom set)')
+    ap.add_argument('--min-geoms', type=int, default=9,
+                    help='minimum geometry prims (Mesh+Cube+Cylinder+Capsule+Sphere)')
     ap.add_argument('--velocity-drives', action='store_true', default=True,
                     help='wheels get velocity drives (physics drive mode)')
     ap.add_argument('--position-drives', dest='velocity_drives',
@@ -144,7 +150,7 @@ def main():
         meshes, joints, colliders = 0, [], 0
         for prim in stage.Traverse(Usd.TraverseInstanceProxies()):
             t = str(prim.GetTypeName())
-            if t == 'Mesh':
+            if t in ('Mesh', 'Cube', 'Cylinder', 'Capsule', 'Sphere'):
                 meshes += 1
             if 'Joint' in t:
                 joints.append((prim.GetName(), t))
@@ -152,7 +158,7 @@ def main():
                 colliders += 1
 
         say(f'\nUSD: {stage_path}')
-        say(f'meshes        : {meshes}   (expect 9, one per link)')
+        say(f'geom prims    : {meshes}   (expect >= {args.min_geoms})')
         say(f'joints        : {len(joints)}')
         say(f'collider prims: {colliders}   (0 here means it WILL fall through the floor)')
         for nme, t in sorted(joints):
@@ -160,9 +166,11 @@ def main():
 
         movable = {n for n, t in joints if 'Revolute' in t or 'Prismatic' in t}
         say(f'\nmovable joints: {len(movable)} -> {sorted(movable)}')
-        ok = EXPECTED_JOINTS <= movable and meshes >= 9 and colliders > 0
-        if not EXPECTED_JOINTS <= movable:
-            say(f'MISSING joints: {sorted(EXPECTED_JOINTS - movable)}')
+        expected = (set(args.expect_joints.split(','))
+                    if args.expect_joints else EXPECTED_JOINTS)
+        ok = expected <= movable and meshes >= args.min_geoms and colliders > 0
+        if not expected <= movable:
+            say(f'MISSING joints: {sorted(expected - movable)}')
         if colliders == 0:
             say('FAIL: no collision geometry -- check collision_from_visuals')
         say('\nRESULT: ' + ('PASS' if ok else 'FAIL'))

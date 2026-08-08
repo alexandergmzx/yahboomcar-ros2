@@ -24,12 +24,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', required=True)
     ap.add_argument('--period', type=float, default=5.0)
+    ap.add_argument('--topic', default='/scan')   # fleet reuse, session 5
     args = ap.parse_args()
 
     rclpy.init()
     n = Node('scan_rate_probe')
     stamps = []
-    n.create_subscription(LaserScan, '/scan',
+    n.create_subscription(LaserScan, args.topic,
                           lambda m: stamps.append(time.time()),
                           qos_profile_sensor_data)
     tmp = args.out + '.tmp'
