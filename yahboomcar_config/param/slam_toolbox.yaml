@@ -1,0 +1,113 @@
+# PROVENANCE (fleet D-12): copied verbatim from
+# ../MicroROS/yahboomcar_ws/src/yahboomcar_nav/params/slam_toolbox.yaml at
+# commit deb670a ("SLAM tuning + a leaner RViz view, tested against real
+# slip") — Alex-authored content living in a vendor package tree; this copy
+# is the first-party home. The vendor file stays untouched for the vendor
+# launch. Divergences after deb670a must be deliberate and commented.
+# slam_toolbox for the Yahboom microROS car.
+#
+# WHY THIS FILE EXISTS AT ALL
+# ---------------------------
+# The vendor's mapping path is DEAD on Jazzy. yahboomcar_nav/launch/map_gmapping_launch.py
+# includes the `slam_gmapping` package, which does not exist on Jazzy -- `slam_toolbox` is
+# the only maintained 2D SLAM in the distribution (cartographer_ros is also installed, and
+# is offered alongside for comparison). The vendor launch is left untouched so it stays
+# diffable against upstream and the course PDFs remain accurate.
+#
+# TUNED FOR THIS ROBOT, NOT COPIED FROM A DEFAULT
+# -----------------------------------------------
+# Every value that departs from the stock config is justified by something measured on
+# this hardware. The defaults assume a larger robot in a larger space with a faster
+# scanner, and applied here they mostly waste effort or reject good scans.
+
+slam_toolbox:
+  ros__parameters:
+    # --- frames and topics ---------------------------------------------------------
+    odom_frame: odom
+    map_frame: map
+    # base_footprint, not base_link: the EKF publishes odom -> base_footprint, and
+    # pointing SLAM at base_link would leave a gap in the chain it walks.
+    base_frame: base_footprint
+    scan_topic: /scan
+    use_map_saver: true
+    mode: mapping
+
+    # --- rates -----------------------------------------------------------------------
+    # The lidar runs at ~12 Hz and has been observed as low as 4 Hz on a poor link, so
+    # asking for more than it can supply just burns CPU on repeat scans.
+    transform_publish_period: 0.02
+    map_update_interval: 1.0
+    resolution: 0.02              # 2 cm: the arena is 4x4 m, so a 5 cm grid would put
+                                  # the whole room in 80 cells and lose the boxes
+    max_laser_range: 8.0          # the device's real range_max, measured
+    minimum_time_interval: 0.1
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+
+    # --- when to take a new scan -----------------------------------------------------
+    # Small room, slow robot. The stock 0.5 m / 0.5 rad thresholds would take only a
+    # handful of scans crossing a 4 m space, which is far too sparse to close a loop.
+    minimum_travel_distance: 0.10
+    minimum_travel_heading: 0.10
+    scan_buffer_size: 30
+    scan_buffer_maximum_scan_distance: 8.0
+
+    # --- scan matching ---------------------------------------------------------------
+    use_scan_matching: true
+    use_scan_barycenter: true
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    # Correlation search windows sized to the per-scan motion this car can actually
+    # produce: at 12 Hz, 0.3 m/s is 25 mm and 1.5 rad/s is 0.125 rad. Searching metres
+    # would be searching for motion the robot cannot make.
+    correlation_search_space_dimension: 0.3
+    correlation_search_space_resolution: 0.01
+    correlation_search_space_smear_deviation: 0.03
+
+    # --- loop closure ------------------------------------------------------------------
+    # A 4x4 room means the robot revisits everything constantly, so loop closure is cheap
+    # and frequent here rather than a rare expensive event.
+    do_loop_closing: true
+    loop_search_maximum_distance: 3.0
+    loop_match_minimum_chain_size: 5
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45
+    loop_search_space_dimension: 4.0
+    loop_search_space_resolution: 0.05
+    loop_search_space_smear_deviation: 0.03
+
+    # --- how much to trust the wheels --------------------------------------------------
+    # These penalties say how far the matcher may pull a scan away from where odometry
+    # claims it is. Deliberately LOOSE, because on this robot odometry is the least
+    # trustworthy input available: wheel slip is invisible to the encoders, and the car
+    # on its stand reports 1.6 m of travel while the lidar sees 0.128 m.
+    # Tightening these would tell SLAM to believe the wheels, which is the exact failure
+    # the EKF work already measured (vendor filter: 2239 mm reported against a true 0).
+    distance_variance_penalty: 0.3
+    angle_variance_penalty: 0.6
+    fine_search_angle_offset: 0.00349
+    coarse_search_angle_offset: 0.349
+    coarse_angle_resolution: 0.0349
+    minimum_angle_penalty: 0.9
+    minimum_distance_penalty: 0.5
+    use_response_expansion: true
+
+    debug_logging: false
+    throttle_scans: 1
+    enable_interactive_mode: false
+
+    # --- solver robustness against outlier constraints --------------------------------
+    # A different layer from the penalty block above: those tune how far the LOCAL
+    # correlative scan matcher may trust odometry per scan. This tunes the GLOBAL pose
+    # graph solver (Ceres), which re-optimizes the whole graph, including loop closures.
+    # Left at the stock default of None, one bad constraint -- a false loop closure, or
+    # one badly-slipped odometry link -- gets squared like every other residual and can
+    # drag the whole graph, not just its own edge.
+    # The maintainer names this robot's exact situation: "If you have an abnormal
+    # application or expect wheel slippage, I might recommend a HuberLoss function...
+    # a really good catch-all" -- and 92% wheel slip is measured on this robot (stand
+    # test, docs/sensor-fusion-research.md).
+    # https://github.com/SteveMacenski/slam_toolbox#configuration
+    ceres_loss_function: HuberLoss

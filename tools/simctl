@@ -55,7 +55,28 @@ import sys
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WS = os.path.join(REPO, 'yahboomcar_ws')
+# Extraction-aware layout (fleet D-12, session 4): this repo now lives as the
+# fleet's src/yahboomcar-ros2 (packages at repo root; the SOLE fleet env is
+# ground_station/install per Amendment A2.3; assets stay in the read-only
+# MicroROS checkout, reachable as ../MicroROS from src/). The original
+# yahboomcar_ws layout is kept as a fallback so this tool still runs from an
+# unextracted MicroROS checkout. Env vars win over detection.
+def _first_existing(cands):
+    for c in cands:
+        if os.path.exists(c):
+            return os.path.abspath(c)
+    return os.path.abspath(cands[-1])
+
+WS_SETUP = os.environ.get('FLEET_WS_SETUP') or _first_existing([
+    os.path.join(REPO, '..', '..', 'ground_station', 'install', 'setup.bash'),
+    os.path.join(REPO, 'yahboomcar_ws', 'install', 'setup.bash')])
+ASSETS = os.environ.get('MICROROS_ASSETS') or _first_existing([
+    os.path.join(REPO, 'MicroROS-assets'),
+    os.path.join(REPO, '..', 'MicroROS', 'MicroROS-assets')])
+RVIZ_SLAM = _first_existing([
+    os.path.join(REPO, 'yahboomcar_config', 'rviz', 'slam_debug.rviz'),
+    os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_nav', 'rviz',
+                 'slam_debug.rviz')])
 sys.path.insert(0, os.path.join(REPO, 'tools'))
 # ONE definition of the car's domain, shared with every guarded tool. Two copies of
 # this number would eventually disagree, and the one that was wrong would be the
@@ -92,7 +113,7 @@ SIM_PROCS = [
 
 def sh(cmd, domain, background=True, log=None):
     """Run a command with ROS sourced, in its own process group."""
-    full = (f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
+    full = (f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
             f'export ROS_DOMAIN_ID={domain} && {cmd}')
     out = open(log, 'w') if log else subprocess.DEVNULL
     p = subprocess.Popen(['bash', '-c', full], start_new_session=True,
@@ -111,7 +132,7 @@ def ros_eval(snippet, domain, timeout=40):
             'from rclpy.executors import SingleThreadedExecutor\n'
             'from rclpy.qos import qos_profile_sensor_data\n'
             + snippet)
-    full = f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && python3 -'
+    full = f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && python3 -'
     try:
         r = subprocess.run(['bash', '-c', full], input=code, capture_output=True,
                            text=True, timeout=timeout)
@@ -231,7 +252,7 @@ def stale_segments():
 # ------------------------------------------------------------------------ start
 def cmd_start(args):
     dom = args.domain
-    log = os.path.join(REPO, 'MicroROS-assets', 'logs')
+    log = os.path.join(ASSETS, 'logs')
     os.makedirs(log, exist_ok=True)
 
     print(f'=== simctl start  (backend {args.backend}, ROS_DOMAIN_ID={dom}) ===')
@@ -375,9 +396,9 @@ def cmd_start(args):
         # Nav2 yourself alongside a simctl session.
         subprocess.Popen(
             ['bash', '-c',
-             f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
+             f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
              f'export ROS_DOMAIN_ID={dom} && '
-             f'rviz2 -d {WS}/src/yahboomcar_nav/rviz/slam_debug.rviz'],
+             f'rviz2 -d {RVIZ_SLAM}'],
             start_new_session=True, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(8)
@@ -677,7 +698,7 @@ def cmd_teleop(args):
 
     # Foreground, with the TTY fully inherited: stdin for the keys, stdout for the
     # vendor's own help text. sh() would swallow both.
-    full = (f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
+    full = (f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
             f'export ROS_DOMAIN_ID={args.domain} && '
             f'ros2 run yahboomcar_ctrl yahboom_keyboard{remap}')
     rc = subprocess.run(['bash', '-c', full]).returncode

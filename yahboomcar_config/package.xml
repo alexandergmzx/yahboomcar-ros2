@@ -1,0 +1,27 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>yahboomcar_config</name>
+  <version>0.1.0</version>
+  <description>
+    First-party home (fleet D-12) for Alex's configuration that previously
+    lived inside vendor packages: the corrected EKF (ekf_corrected.yaml +
+    its A/B evidence), the tuned slam_toolbox params, the SLAM debug RViz
+    view — extracted WITH history — and robot1's canonical SLAM launch
+    (D-19: composed slam_toolbox, lifecycle bond disabled). Vendor runtime
+    packages stay in the MicroROS checkout, unmodified (R-05).
+  </description>
+  <maintainer email="alexander.gomez.contact@gmail.com">Alexander Gomez</maintainer>
+  <license>MIT</license>
+
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
