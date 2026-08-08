@@ -241,10 +241,14 @@ def test_slip_attenuates_the_gyro_but_never_gravity():
 import importlib.util as _ilu
 import os as _os
 
-_spec = _ilu.spec_from_file_location(
-    'sim_runner_mod',
-    _os.path.join(_os.path.dirname(__file__), '..', '..', '..', '..',
-                  'tools', 'sim_runner.py'))
+# Layout-aware since the D-12 extraction (path-assumption audit): the package
+# now sits at repo root (tools/ two levels up); the original yahboomcar_ws
+# nesting (four levels) is kept as a fallback for unextracted checkouts.
+_here = _os.path.dirname(__file__)
+_cands = [_os.path.join(_here, '..', '..', 'tools', 'sim_runner.py'),
+          _os.path.join(_here, '..', '..', '..', '..', 'tools', 'sim_runner.py')]
+_path = next((c for c in _cands if _os.path.exists(c)), _cands[0])
+_spec = _ilu.spec_from_file_location('sim_runner_mod', _path)
 _sr = _ilu.module_from_spec(_spec)
 _spec.loader.exec_module(_sr)
 
