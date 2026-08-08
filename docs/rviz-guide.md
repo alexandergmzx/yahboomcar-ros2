@@ -1,9 +1,14 @@
 # RViz for this robot: which display answers which question
 
 ```bash
-rviz2 -d yahboomcar_ws/src/yahboomcar_nav/rviz/nav2_debug.rviz
+rviz2 -d yahboomcar_ws/src/yahboomcar_nav/rviz/nav2_debug.rviz     # full SLAM+Nav2 view
+rviz2 -d yahboomcar_ws/src/yahboomcar_nav/rviz/slam_debug.rviz     # pure-SLAM, this launch's default
 # or:  ros2 launch yahboomcar_nav slam_toolbox_launch.py rviz:=true
 ```
+
+This guide documents the combined `nav2_debug.rviz` view. The leaner `slam_debug.rviz`
+drops the Nav2-only displays that sit empty when Nav2 isn't running — see
+[`slam-research/findings.md`](slam-research/findings.md).
 
 RViz shows a great deal and explains none of it. This is a map from *symptom* to *cause*
 for the failures this stack actually produces.

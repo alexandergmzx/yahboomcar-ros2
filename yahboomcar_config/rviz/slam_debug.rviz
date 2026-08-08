@@ -1,0 +1,166 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /TF1
+      Splitter Ratio: 0.5
+    Tree Height: 500
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.5
+      Plane Cell Count: 12
+      Color: 160; 160; 164
+      Reference Frame: <Fixed Frame>
+
+    # ---- what the robot IS -------------------------------------------------------
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Alpha: 0.8
+
+    # Trimmed to the frames a pure-SLAM run actually has, instead of nav2_debug.rviz's
+    # full tree (every URDF link) -- confirmed against a real installed reference file
+    # (nav2_bringup/rviz/nav2_default_view.rviz), which does this with the `Frames` /
+    # `All Enabled: false` per-frame allowlist below, NOT the `Filter (whitelist)` regex
+    # property (that field exists but sits unused, "", in the reference file too).
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Filter (blacklist): ""
+      Filter (whitelist): ""
+      Frames:
+        All Enabled: false
+        map:
+          Value: true
+        odom:
+          Value: true
+        base_footprint:
+          Value: true
+        laser_frame:
+          Value: true
+      Show Names: false
+      Show Axes: true
+      Show Arrows: false
+      Marker Scale: 0.15
+      Frame Timeout: 15
+      Update Interval: 0
+
+    # ---- what the robot SEES -----------------------------------------------------
+    # BEST_EFFORT is essential: the firmware publishes sensor QoS, and a Reliable
+    # subscriber here shows an empty display with no error whatsoever.
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Size (m): 0.03
+      Style: Points
+      # A short trail makes the scan legible, and makes a map->odom correction obvious:
+      # the whole cloud steps at once rather than flickering.
+      Decay Time: 0.5
+      Color: 255; 85; 0
+      Color Transformer: FlatColor
+
+    # ---- the map -----------------------------------------------------------------
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 0.7
+      Color Scheme: map
+
+    # ---- the two odometry opinions, shown together -------------------------------
+    # This pair is specific to this robot and is the point of the fusion work: /odom is
+    # the EKF's fused estimate and /odom_laser is derived from the room. When they
+    # diverge, the wheels are slipping -- on the stand the wheels claimed 1.6 m while
+    # the lidar saw 0.128 m. Seeing them apart is seeing slip happen.
+    # /odom_laser is live here whenever this is launched via `tools/simctl start` (which
+    # runs laser_odometry unconditionally); it renders empty if slam_toolbox_launch.py is
+    # run standalone without also starting `ros2 run yahboomcar_localization laser_odometry`.
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry (EKF /odom)
+      Enabled: true
+      Topic:
+        Value: /odom
+        Reliability Policy: Reliable
+      Covariance:
+        Value: false
+      Keep: 30
+      Shape:
+        Color: 255; 255; 0
+        Head Length: 0.05
+        Head Radius: 0.03
+        Shaft Length: 0.1
+        Shaft Radius: 0.01
+        Value: Arrow
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry (lidar /odom_laser)
+      Enabled: true
+      Topic:
+        Value: /odom_laser
+        Reliability Policy: Reliable
+      # OFF on purpose. laser_odometry inflates its covariance along the direction the
+      # scan geometry does not constrain -- by 1/isotropy -- so in a poorly conditioned
+      # spot the ellipse grows to metres and hides the entire scene behind one blob.
+      Covariance:
+        Value: false
+      Keep: 30
+      Shape:
+        Color: 0; 255; 255
+        Head Length: 0.05
+        Head Radius: 0.03
+        Shaft Length: 0.1
+        Shaft Radius: 0.01
+        Value: Arrow
+
+  Enabled: true
+  Global Options:
+    # `map` while SLAM is running. If the map frame does not exist yet, RViz shows
+    # nothing at all and reports a TF error -- switch to `odom` to confirm the robot and
+    # scan are alive before blaming SLAM.
+    Fixed Frame: map
+    Background Color: 48; 48; 48
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      # The arena is 4x4 m, so a 6 m view shows the whole room with margin.
+      Scale: 120
+      Target Frame: <Fixed Frame>
+      X: 0
+      Y: 0
+      Angle: 0
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Width: 1600
+  Hide Left Dock: false
+  Hide Right Dock: false

@@ -368,11 +368,16 @@ def cmd_start(args):
         print('  [5/6] RViz...')
         env = dict(os.environ)
         env.setdefault('DISPLAY', ':0')
+        # simctl never starts Nav2 in any backend or flag combination, so the leaner
+        # SLAM-only view is always correct here; nav2_debug.rviz's Nav2-only displays
+        # (costmaps, plans, the Navigation 2 panel) would just sit as empty/warning
+        # entries with no publisher. Pass a different config by hand if you also start
+        # Nav2 yourself alongside a simctl session.
         subprocess.Popen(
             ['bash', '-c',
              f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
              f'export ROS_DOMAIN_ID={dom} && '
-             f'rviz2 -d {WS}/src/yahboomcar_nav/rviz/nav2_debug.rviz'],
+             f'rviz2 -d {WS}/src/yahboomcar_nav/rviz/slam_debug.rviz'],
             start_new_session=True, env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(8)
