@@ -29,8 +29,11 @@ node `/YB_Car_Node`. **It cannot be rebuilt** (vendor ships .bin only) and
 | sub | `/cmd_vel` | `geometry_msgs/Twist` | — |
 | sub | `/beep`, `/servo_s1`, `/servo_s2` | UInt16 / Int32 | — |
 
-No camera exists on this robot. BEST_EFFORT sensor QoS — a RELIABLE
-subscriber silently receives nothing.
+No camera exists on this robot. Subscribe to sensor topics with BEST_EFFORT
+sensor QoS (safe against any offer). The old claim that a RELIABLE subscriber
+silently starves **did not reproduce on 2026-08-08**: the current agent OFFERS
+RELIABLE/VOLATILE on all four sensor topics and a RELIABLE subscriber received
+1826/1827 scans [measured; fleet OI-20].
 
 ## Hard constraints (the safety-relevant core; full text in docs/)
 
@@ -63,11 +66,13 @@ tools/                    simctl, sensor_health, test_failsafe, provisioning, �
 docs/                     safety-case, sensor-fusion-research, slam-research, …
 ```
 
-Tools are extraction-aware (see the header block in `tools/simctl`): the
-fleet env is `ground_station/install` (A2.3); **MicroROS-assets** (bags,
-logs, firmware) stays in the MicroROS checkout, resolved via
-`MICROROS_ASSETS` env var or the `../MicroROS` fleet-layout default —
-assets are never extracted.
+Tools are extraction-aware through ONE shared resolver, `tools/_layout.py`
+(added 2026-08-08 after the Isaac repair found 18 tools still carrying
+private stale copies of the old `yahboomcar_ws` paths): the fleet env is
+`ground_station/install` (A2.3); **MicroROS-assets** (bags, logs, firmware)
+and the twin **USD** stay in the MicroROS checkout, resolved via
+`MICROROS_ASSETS` / `YAHBOOM_USD_DIR` env vars or the `../MicroROS`
+fleet-layout default — never extracted (R-05).
 
 ## Quickstart (fleet layout)
 
