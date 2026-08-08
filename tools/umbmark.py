@@ -23,8 +23,9 @@ import math
 import os
 import sys
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS = os.path.join(REPO, 'MicroROS-assets', 'bags', 'umbmark_results.json')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import BAG_DIR                                     # noqa: E402
+RESULTS = os.path.join(BAG_DIR, 'umbmark_results.json')
 
 L_DEFAULT = 2.0      # square side, metres
 B_NOMINAL = 0.135    # physical track from the URDF joint origins (+/-0.0675)

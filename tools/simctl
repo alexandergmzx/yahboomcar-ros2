@@ -54,30 +54,14 @@ import subprocess
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Extraction-aware layout (fleet D-12, session 4): this repo now lives as the
-# fleet's src/yahboomcar-ros2 (packages at repo root; the SOLE fleet env is
-# ground_station/install per Amendment A2.3; assets stay in the read-only
-# MicroROS checkout, reachable as ../MicroROS from src/). The original
-# yahboomcar_ws layout is kept as a fallback so this tool still runs from an
-# unextracted MicroROS checkout. Env vars win over detection.
-def _first_existing(cands):
-    for c in cands:
-        if os.path.exists(c):
-            return os.path.abspath(c)
-    return os.path.abspath(cands[-1])
-
-WS_SETUP = os.environ.get('FLEET_WS_SETUP') or _first_existing([
-    os.path.join(REPO, '..', '..', 'ground_station', 'install', 'setup.bash'),
-    os.path.join(REPO, 'yahboomcar_ws', 'install', 'setup.bash')])
-ASSETS = os.environ.get('MICROROS_ASSETS') or _first_existing([
-    os.path.join(REPO, 'MicroROS-assets'),
-    os.path.join(REPO, '..', 'MicroROS', 'MicroROS-assets')])
+# Extraction-aware layout (fleet D-12, session 4; single definition since the
+# 2026-08-08 audit found 18 tools with private stale copies): see tools/_layout.py.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import REPO, WS_SETUP, ASSETS, _first_existing     # noqa: E402
 RVIZ_SLAM = _first_existing([
     os.path.join(REPO, 'yahboomcar_config', 'rviz', 'slam_debug.rviz'),
     os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_nav', 'rviz',
                  'slam_debug.rviz')])
-sys.path.insert(0, os.path.join(REPO, 'tools'))
 # ONE definition of the car's domain, shared with every guarded tool. Two copies of
 # this number would eventually disagree, and the one that was wrong would be the
 # structural refusal.
@@ -253,6 +237,82 @@ def stale_segments():
     return [s for s in all_segs if s not in live]
 
 
+def _tail(path, n=15):
+    try:
+        with open(path) as f:
+            return ''.join(f.readlines()[-n:]).rstrip()
+    except OSError:
+        return f'    (no log at {path})'
+
+
+def wait_for(condition, probe, seconds, procs, logs, poll_gap=5):
+    """Wait for `probe` to report ready, or fail LOUDLY. Never silently.
+
+    Every failure names the unmet CONDITION and the log to read. `procs` are the
+    backend processes this wait depends on: one of them exiting fails the wait
+    IMMEDIATELY. Before this existed, the isaac wait polled topics for its full
+    420 s budget against a sim_runner that had exited in under a second (stale
+    post-extraction path), which is indistinguishable from a hang to anyone
+    watching -- reported as "waits indefinitely". Repair finding, 2026-08-08.
+
+    `probe` -> (ready, detail). `detail` is printed either way, so the failure
+    message says what WAS observed, not just what wasn't.
+    """
+    t0 = time.time()
+    detail = 'no probe completed'
+    while time.time() - t0 < seconds:
+        dead = [(name, p.returncode) for name, p in procs.items()
+                if p is not None and p.poll() is not None]
+        if dead:
+            print(f'  FAILED after {time.time()-t0:.0f} s waiting for: {condition}')
+            for name, rc in dead:
+                print(f'    backend process {name!r} EXITED (code {rc}) -- the wait '
+                      'cannot succeed.')
+            for lg in logs:
+                print(f'    --- {lg} (last lines) ---')
+                print(_tail(lg))
+            return False
+        time.sleep(poll_gap)
+        ready, detail = probe()
+        if ready:
+            print(f'        {detail}   ({time.time()-t0:.0f} s)')
+            return True
+    print(f'  FAILED: {condition}')
+    print(f'    unmet after the {seconds:.0f} s budget. Last probe: {detail}')
+    for lg in logs:
+        print(f'    --- {lg} (last lines) ---')
+        print(_tail(lg))
+    return False
+
+
+def probe_topics(dom, subs):
+    """Count messages on topics for ~4 s. subs = [(topic, msg, sensor_qos?)].
+    -> (all topics saw >10 msgs, human-readable counts)."""
+    imports = ('from sensor_msgs.msg import LaserScan\n'
+               'from nav_msgs.msg import Odometry\n')
+    body = 'rclpy.init(); n=Node("simctl_wait"); c={}\n'
+    for i, (topic, msg, sensor) in enumerate(subs):
+        qos = 'qos_profile_sensor_data' if sensor else '10'
+        body += (f'c[{i}]=[0]\n'
+                 f'n.create_subscription({msg},"{topic}",'
+                 f'lambda m,k=c[{i}]: k.__setitem__(0,k[0]+1), {qos})\n')
+    body += ('ex=SingleThreadedExecutor(); ex.add_node(n); '
+             'threading.Thread(target=ex.spin,daemon=True).start()\n'
+             'time.sleep(4)\n'
+             'print("COUNTS", ",".join(str(c[i][0]) for i in sorted(c)))\n'
+             'sys.stdout.flush(); os._exit(0)\n')
+    out = ros_eval(imports + body, dom, timeout=30)
+    if 'COUNTS' not in out:
+        return False, 'probe produced no output (DDS trouble? stale shm?)'
+    counts = out.split('COUNTS')[-1].strip().split(',')
+    pairs = ', '.join(f'{t}: {n}' for (t, _, _), n in zip(subs, counts))
+    try:
+        ready = all(int(x) > 10 for x in counts)
+    except ValueError:
+        return False, f'unparseable probe output {out!r}'
+    return ready, f'{pairs} msgs in 4 s'
+
+
 # ------------------------------------------------------------------------ start
 def start_robot2(args, dom, log):
     """robot2 session: fake_rasptank (2d) or the Isaac twin, + the real stack.
@@ -262,6 +322,7 @@ def start_robot2(args, dom, log):
     carries matcher+EKF+SLAM itself, so there are no separate steps here.
     """
     print(f'  robot2 session, backend {args.backend}')
+    procs, logs = {}, []
     if args.backend == 'isaac':
         isaac_py = os.path.expanduser('~/isaac/env_isaaclab/bin/python')
         if not os.path.exists(isaac_py):
@@ -270,30 +331,38 @@ def start_robot2(args, dom, log):
         rt_tools = os.path.abspath(os.path.join(REPO, '..', 'rasptank-ros2', 'tools'))
         gui = ' --gui' if not args.no_isaac_gui else ''
         print('  [1/3] RaspTank Isaac twin (~90 s)...')
-        sh(f'{isaac_py} {rt_tools}/rasptank_twin_runner.py --ros{gui}', dom,
-           log=os.path.join(log, 'simctl-r2-twin.log'))
-        deadline = time.time() + 420
+        twin_log = os.path.join(log, 'simctl-r2-twin.log')
+        procs['rasptank_twin_runner (Isaac)'] = sh(
+            f'{isaac_py} {rt_tools}/rasptank_twin_runner.py --ros{gui}', dom,
+            log=twin_log)
+        logs.append(twin_log)
+        budget = 420
     else:
         print('  [1/3] 2D contract sim starts inside the stack launch')
-        deadline = time.time() + 90
+        budget = 90
 
     print('  [2/3] robot2 stack (matcher + EKF + SLAM + safety)...')
-    sh(f'ros2 launch fleet_bringup robot2_sim_bringup_launch.py '
-       f'backend:={args.backend}', dom,
-       log=os.path.join(log, 'simctl-r2-stack.log'))
+    stack_log = os.path.join(log, 'simctl-r2-stack.log')
+    procs['robot2 stack launch'] = sh(
+        f'ros2 launch fleet_bringup robot2_sim_bringup_launch.py '
+        f'backend:={args.backend}', dom, log=stack_log)
+    logs.append(stack_log)
 
     print('  [3/3] waiting for evidence: /robot2/scan_filtered then /robot2/odom_laser')
-    want = ['/robot2/scan_filtered', '/robot2/odom_laser']
-    while time.time() < deadline and want:
+
+    def r2_probe():
         out = subprocess.run(
             ['bash', '-c', 'source /opt/ros/jazzy/setup.bash 2>/dev/null && '
              f'ROS_DOMAIN_ID={dom} timeout 10 ros2 topic list'],
             capture_output=True, text=True).stdout
-        want = [t for t in want if t not in out]
-        if want:
-            time.sleep(5)
-    if want:
-        print(f'  FAILED: still missing {want}. See simctl-r2-*.log')
+        want = [t for t in ('/robot2/scan_filtered', '/robot2/odom_laser')
+                if t not in out]
+        return (not want,
+                'both topics advertised' if not want else f'still missing {want}')
+
+    if not wait_for(
+            f'/robot2/scan_filtered and /robot2/odom_laser advertised on domain {dom}',
+            r2_probe, budget, procs, logs):
         return 1
     print('  up. ./tools/simctl estop --domain', dom, ' to zero;  stop to tear down')
     return 0
@@ -337,7 +406,8 @@ def cmd_start(args):
         # Isaac replaces ONLY the firmware, exactly as fake_robot does -- so the real
         # bringup goes on top of it unchanged, and everything above that cannot tell
         # the two backends apart.
-        print('  [1/6] Isaac Sim (~90 s to start; a window will open)...')
+        print('  [1/6] Isaac Sim (~90 s to start'
+              + (')...' if args.no_isaac_gui else '; a window will open)...'))
         print('        NOTE /scan lands on 12 Hz by CALIBRATION against a measured but')
         print('        unexplained 72-messages-per-render-second emission rate, not by')
         print('        the sensor honouring its configured rate. Verify any session with')
@@ -352,42 +422,50 @@ def cmd_start(args):
             print(f'  Isaac python not found at {isaac_py}')
             return 2
         gui = '' if args.no_isaac_gui else ' --gui'
-        sh(f'{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}', dom,
-           log=os.path.join(log, 'simctl-isaac.log'))
-        # Isaac is slow to start and the bringup below needs /odom_raw to exist, so the
-        # firmware side is given its own wait before the stack goes on top.
-        # 240 s was not enough with the GUI on: Isaac reached 'graph built' and
-        # published everything, but only after the wait had already expired.
-        print('        waiting for Isaac to publish (up to 420 s with the GUI)...')
-        sh('ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py', dom,
-           log=os.path.join(log, 'simctl-bringup.log'))
-        deadline = time.time() + 420
+        isaac_log = os.path.join(log, 'simctl-isaac.log')
+        p_isaac = sh(f'{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}', dom,
+                     log=isaac_log)
+        # Isaac is slow to start and the bringup below needs /odom_raw to exist, so
+        # the firmware side gets its own wait before the stack goes on top. (The old
+        # code PRINTED this intent but launched bringup immediately, then waited on
+        # the combined result -- so an Isaac-side death and a bringup-side death were
+        # indistinguishable.) 240 s was not enough with the GUI on: Isaac reached
+        # 'graph built' and published everything, but only after the wait expired.
+        print('        waiting for Isaac to publish (budget 420 s; GUI runs are the '
+              'slow end)...')
+        if not wait_for(
+                'Isaac firmware contract up: /odom_raw and /scan publishing on '
+                f'domain {dom}',
+                lambda: probe_topics(dom, [
+                    ('/scan', 'LaserScan', True),
+                    ('/odom_raw', 'Odometry', True)]),
+                420, {'sim_runner (Isaac)': p_isaac}, [isaac_log]):
+            return 1
+        bringup_log = os.path.join(log, 'simctl-bringup.log')
+        p_stack = sh('ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py',
+                     dom, log=bringup_log)
+        stack_procs = {'sim_runner (Isaac)': p_isaac, 'bringup launch': p_stack}
+        stack_logs = [bringup_log, isaac_log]
+        stack_budget = 120
     else:
         print('  [1/6] simulated firmware + real bringup...')
-        sh(f'ros2 launch yahboomcar_sim sim_bringup_launch.py slip:={args.slip}', dom,
-           log=os.path.join(log, 'simctl-sim.log'))
-        deadline = time.time() + 90
+        sim_log = os.path.join(log, 'simctl-sim.log')
+        p_stack = sh(f'ros2 launch yahboomcar_sim sim_bringup_launch.py '
+                     f'slip:={args.slip}', dom, log=sim_log)
+        stack_procs = {'sim_bringup launch': p_stack}
+        stack_logs = [sim_log]
+        stack_budget = 90
 
     # Wait on EVIDENCE, never on a fixed sleep: a sleep is why SLAM once appeared to
     # start and then silently did nothing at all.
     print('        waiting for /scan and /odom...')
-    while time.time() < deadline:
-        time.sleep(5)
-        out = ros_eval(
-            'from sensor_msgs.msg import LaserScan\n'
-            'from nav_msgs.msg import Odometry\n'
-            'rclpy.init(); n=Node("simctl_wait"); c={"s":0,"o":0}\n'
-            'n.create_subscription(LaserScan,"/scan",lambda m: c.__setitem__("s",c["s"]+1), qos_profile_sensor_data)\n'
-            'n.create_subscription(Odometry,"/odom",lambda m: c.__setitem__("o",c["o"]+1),10)\n'
-            'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
-            'time.sleep(4)\n'
-            'print("READY" if c["s"]>10 and c["o"]>10 else "WAIT", c["s"], c["o"])\n'
-            'sys.stdout.flush(); os._exit(0)\n', dom, timeout=30)
-        if 'READY' in out:
-            print(f'        {out.strip()}')
-            break
-    else:
-        print('  FAILED: no /scan and /odom. See MicroROS-assets/logs/simctl-*.log')
+    if not wait_for(
+            f'/scan and /odom flowing on domain {dom} (the bringup stack\'s output '
+            'on top of the firmware)',
+            lambda: probe_topics(dom, [
+                ('/scan', 'LaserScan', True),
+                ('/odom', 'Odometry', False)]),
+            stack_budget, stack_procs, stack_logs):
         return 1
 
     if args.safety:
@@ -436,6 +514,7 @@ def cmd_start(args):
                 break
         else:
             print('        WARNING: no /map after 120 s. SLAM is not producing output.')
+            print(f'        Look at {os.path.join(log, "simctl-slam.log")}')
 
     if args.rviz:
         print('  [5/6] RViz...')

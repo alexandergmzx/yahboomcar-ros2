@@ -22,7 +22,7 @@ Build the Isaac Sim digital-twin scene: robot + ROS 2 OmniGraph, saved to USD.
     ~/isaacsim/python.sh tools/isaac_twin_setup.py            # build and save
     ~/isaacsim/python.sh tools/isaac_twin_setup.py --run      # build, then simulate
 
-Produces yahboomcar_ws/src/yahboomcar_twin/usd/twin_scene.usd: a stage that *references*
+Produces twin_scene.usd in the twin USD dir (_layout.USD_DIR): a stage that *references*
 the imported robot, adds ground and light, and carries an OmniGraph subscribing to
 /joint_states and driving the articulation. Referencing rather than editing means
 tools/urdf_to_usd.py can be re-run without clobbering this.
@@ -45,8 +45,8 @@ import argparse
 import os
 import sys
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USD_DIR = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import USD_DIR                                     # noqa: E402
 ROBOT_USD = os.path.join(USD_DIR, 'MicroROS', 'MicroROS.usda')
 SCENE_USD = os.path.join(USD_DIR, 'twin_scene.usd')
 ROBOT_PRIM = '/World/micro4'

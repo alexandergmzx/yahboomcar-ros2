@@ -5,7 +5,7 @@
     ~/isaac/env_isaaclab/bin/python tools/build_arena.py --gui      # watch it
     ~/isaac/env_isaaclab/bin/python tools/build_arena.py --no-verify
 
-Output: yahboomcar_ws/src/yahboomcar_twin/usd/arena.usd
+Output: arena.usd in the twin USD dir (_layout.USD_DIR; never extracted, R-05)
 
 Sized from the UMBmark research in docs/odometry-calibration.md: a 2x2 m square path
 needs ~3x3 m of clear floor, so the default arena is 4x4 m.
@@ -27,8 +27,8 @@ import math
 import os
 import sys
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USD_DIR = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import REPO, USD_DIR                              # noqa: E402
 ROBOT_USD = os.path.join(USD_DIR, 'micro4', 'micro4.usd')
 ARENA_USD = os.path.join(USD_DIR, 'arena.usd')
 ROBOT_PRIM = '/World/Robot'

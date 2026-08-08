@@ -66,10 +66,8 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _cmd_vel_safety import SafeCmdVel                          # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
-PARAM_OUT = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
-                         'measured_params.json')
+from _layout import LOG_DIR as OUT_DIR, pkg_dir                 # noqa: E402
+PARAM_OUT = os.path.join(pkg_dir('yahboomcar_safety'), 'measured_params.json')
 
 
 def pct(values, p):

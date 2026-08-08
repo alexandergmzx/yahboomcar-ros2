@@ -44,7 +44,8 @@ import subprocess
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import REPO, WS_SETUP                              # noqa: E402
 README = os.path.join(REPO, 'README.md')
 SIM_DOMAIN = 66
 
@@ -109,7 +110,7 @@ def run(cmd, timeout, domain=None, cwd=REPO):
         env['ROS_DOMAIN_ID'] = str(domain)
     env.setdefault('DISPLAY', ':0')
     full = (f'source /opt/ros/jazzy/setup.bash 2>/dev/null; '
-            f'source {REPO}/yahboomcar_ws/install/setup.bash 2>/dev/null; {cmd}')
+            f'source {WS_SETUP} 2>/dev/null; {cmd}')
     try:
         p = subprocess.run(['bash', '-c', full], cwd=cwd, env=env,
                            capture_output=True, text=True, timeout=timeout)
@@ -126,7 +127,7 @@ def run_longrunning(cmd, domain, settle=20):
     env['ROS_DOMAIN_ID'] = str(domain)
     env.setdefault('DISPLAY', ':0')
     full = (f'source /opt/ros/jazzy/setup.bash 2>/dev/null; '
-            f'source {REPO}/yahboomcar_ws/install/setup.bash 2>/dev/null; exec {cmd}')
+            f'source {WS_SETUP} 2>/dev/null; exec {cmd}')
     p = subprocess.Popen(['bash', '-c', full], cwd=REPO, env=env,
                          start_new_session=True,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)

@@ -93,16 +93,13 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _cmd_vel_safety import forbid_car_domain, install_stop_handlers  # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
+from _layout import LOG_DIR as OUT_DIR, pkg_dir                 # noqa: E402
 # Hardware and simulator results live in SEPARATE stores. They shared one file, and a
 # simulator dry run wrote synthetic calibrations and runs into the hardware evidence --
 # the same class of mistake that had already put a simulated fail-safe result where a
 # hardware one belonged. Separation is structural now, not a matter of remembering.
-DATA_HW = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
-                       'braking_runs.json')
-DATA_SIM = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
-                        'braking_runs_sim.json')
+DATA_HW = os.path.join(pkg_dir('yahboomcar_safety'), 'braking_runs.json')
+DATA_SIM = os.path.join(pkg_dir('yahboomcar_safety'), 'braking_runs_sim.json')
 DATA = DATA_HW          # rebound in main() once --sim-tape is known
 
 AT_REST = 0.02

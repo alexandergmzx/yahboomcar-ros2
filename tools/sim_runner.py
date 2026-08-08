@@ -33,10 +33,12 @@ import sys
 import time
 from datetime import datetime
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USD_DIR = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Layout-aware paths (fleet D-12): the old REPO-relative constants here survived the
+# extraction unnoticed and killed the isaac backend -- this file exited at the arena
+# check while simctl polled topics for its full 420 s budget. See _layout.py.
+from _layout import REPO, USD_DIR, LOG_DIR, pkg_dir            # noqa: E402
 ARENA_USD = os.path.join(USD_DIR, 'arena.usd')
-LOG_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
 ROBOT_PRIM = '/World/Robot'
 
 # Geometric wheel radius, confirmed twice: 0.024 from the STL bounding box and 0.025
@@ -282,7 +284,7 @@ def t_obstacle_stop(sim, say, speed=0.25, stop_d=0.35, arena=4.0):
     and drove off in its original heading. Driving at the wall needs no turning and
     exercises exactly the same governor logic.
     """
-    sys.path.insert(0, os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety'))
+    sys.path.insert(0, pkg_dir('yahboomcar_safety'))
     from yahboomcar_safety.governor import GovernorConfig, decide
     cfg = GovernorConfig(stop_distance=stop_d, max_speed=0.6)
 

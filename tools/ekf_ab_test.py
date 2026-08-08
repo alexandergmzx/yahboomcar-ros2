@@ -55,12 +55,13 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _cmd_vel_safety import install_stop_handlers            # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WS = os.path.join(REPO, 'yahboomcar_ws')
-PARAM_DIR = os.path.join(WS, 'src', 'yahboomcar_bringup', 'param')
-OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
-BAG_DIR = os.path.join(REPO, 'MicroROS-assets', 'bags')
-RESULT = os.path.join(WS, 'src', 'yahboomcar_bringup', 'param', 'ekf_ab_result.json')
+from _layout import LOG_DIR as OUT_DIR, BAG_DIR, WS_SETUP, pkg_dir, vendor_pkg_dir  # noqa: E402
+# The two configs live apart since the extraction: the corrected one is first-party
+# (yahboomcar_config, next to its A/B evidence, per D-12); the vendor one was never
+# extracted and stays in the MicroROS checkout.
+PARAM_DIRS = [os.path.join(pkg_dir('yahboomcar_config'), 'param'),
+              os.path.join(vendor_pkg_dir('yahboomcar_bringup'), 'param')]
+RESULT = os.path.join(pkg_dir('yahboomcar_config'), 'param', 'ekf_ab_result.json')
 
 CONFIGS = {
     'vendor': ('ekf.yaml', 'wheel pose + twist, IMU yaw + rate; nothing observes the world'),
@@ -70,7 +71,7 @@ CONFIGS = {
 
 def sh(cmd, **kw):
     """Run a command under a sourced ROS environment, in its own process group."""
-    full = (f'source /opt/ros/jazzy/setup.bash && source {WS}/install/setup.bash && '
+    full = (f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
             f'{cmd}')
     return subprocess.Popen(['bash', '-c', full], start_new_session=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kw)
@@ -131,9 +132,10 @@ def main():
 
     for name in which:
         fname, desc = CONFIGS[name]
-        path = os.path.join(PARAM_DIR, fname)
+        cands = [os.path.join(d, fname) for d in PARAM_DIRS]
+        path = next((c for c in cands if os.path.exists(c)), cands[-1])
         if not os.path.exists(path):
-            say(f'SKIP {name}: {path} missing')
+            say(f'SKIP {name}: {fname} in none of {PARAM_DIRS}')
             continue
 
         say(f'--- {name}: {fname} ---')

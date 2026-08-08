@@ -74,10 +74,9 @@ import sys
 import time
 from datetime import datetime
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USD_DIR = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import REPO, USD_DIR, LOG_DIR                      # noqa: E402
 ARENA_USD = os.path.join(USD_DIR, 'arena.usd')
-LOG_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
 ROBOT_PRIM = '/World/Robot'
 
 # Must match tools/_tf_source.py.

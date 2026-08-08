@@ -201,8 +201,9 @@ def main():
         print('  The lidar independently establishes whether a rotation happened, so the')
         print('  gyro is judged against physical evidence rather than against your word')
         print('  or my timing.')
-        sys.path.insert(0, os.path.join(REPO_ROOT, 'yahboomcar_ws', 'src',
-                                        'yahboomcar_localization'))
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from _layout import pkg_dir
+        sys.path.insert(0, pkg_dir('yahboomcar_localization'))
         from yahboomcar_localization.scan_geometry import scan_to_xy
         from yahboomcar_localization.scan_matcher import estimate_motion
 

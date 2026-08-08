@@ -3,7 +3,7 @@
 
     ~/isaac/env_isaaclab/bin/python tools/urdf_to_usd.py
 
-Output: yahboomcar_ws/src/yahboomcar_twin/usd/micro4/micro4.usd
+Output: micro4/micro4.usd in the twin USD dir (_layout.USD_DIR; never extracted, R-05)
 
 Two hard-won details, both of which previously caused the simulated robot to fall
 through the world:
@@ -26,10 +26,10 @@ import shutil
 import sys
 import tempfile
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DESC = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_description')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import USD_DIR, vendor_pkg_dir                     # noqa: E402
+DESC = vendor_pkg_dir('yahboomcar_description')
 DEFAULT_URDF = os.path.join(DESC, 'urdf', 'MicroROS.urdf')
-USD_DIR = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd')
 DEFAULT_OUT = os.path.join(USD_DIR, 'micro4', 'micro4.usd')
 
 EXPECTED_JOINTS = {'zq_Joint', 'yq_Joint', 'yh_Joint', 'zh_Joint',

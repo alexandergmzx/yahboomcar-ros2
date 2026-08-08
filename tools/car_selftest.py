@@ -34,9 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _cmd_vel_safety import install_stop_handlers            # noqa: E402
 from datetime import datetime
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BAG_DIR = os.path.join(REPO, 'MicroROS-assets', 'bags')
-LOG_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
+from _layout import REPO, BAG_DIR, LOG_DIR                   # noqa: E402
 
 # The firmware's published contract (ROS node topic information.pdf), with the
 # tolerance we accept. Rates are Hz.

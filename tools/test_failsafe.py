@@ -68,17 +68,13 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _cmd_vel_safety import SafeCmdVel                          # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_DIR = os.path.join(REPO, 'MicroROS-assets', 'logs')
+from _layout import LOG_DIR as OUT_DIR, WS_SETUP, pkg_dir       # noqa: E402
 # Hardware and simulator results go to SEPARATE files. They were shared, and a run
 # against the simulator silently overwrote a hardware run -- destroying the evidence for
 # a bound the docs cite. Found by external audit, which noticed the committed report had
 # a null governor case that could not support the documented 762 ms.
-REPORT_HW = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
-                         'failsafe_report.json')
-REPORT_SIM = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_safety',
-                          'failsafe_report_sim.json')
-WS = os.path.join(REPO, 'yahboomcar_ws')
+REPORT_HW = os.path.join(pkg_dir('yahboomcar_safety'), 'failsafe_report.json')
+REPORT_SIM = os.path.join(pkg_dir('yahboomcar_safety'), 'failsafe_report_sim.json')
 
 MOVING = 0.05      # m/s: above this the wheels are definitely turning
 AT_REST = 0.02     # m/s: below this, sustained, they are stopped
@@ -336,9 +332,8 @@ def main():
     gov_env = dict(os.environ)
     # Permissive distances on purpose: this case tests the CRASH path, not the obstacle
     # logic, and the car is elevated under a desk where the lidar sees walls at < 0.35 m.
-    setup = os.path.join(WS, 'install', 'setup.bash')
     gov_cmd = ('source /opt/ros/jazzy/setup.bash && '
-               f'source {setup} && '
+               f'source {WS_SETUP} && '
                'exec ros2 run yahboomcar_safety cmd_vel_governor --ros-args '
                '-p stop_distance:=0.01 -p slow_distance:=0.02 -p max_speed:=0.5')
     proc = subprocess.Popen(['bash', '-c', gov_cmd], env=gov_env,

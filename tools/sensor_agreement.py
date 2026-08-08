@@ -36,8 +36,9 @@ import math
 import os
 import sys
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_localization'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import pkg_dir                                     # noqa: E402
+sys.path.insert(0, pkg_dir('yahboomcar_localization'))
 
 
 def read_bag(path, topics):

@@ -20,14 +20,15 @@ import subprocess
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import WS_SETUP                                    # noqa: E402
 
 
 def main():
     env = dict(os.environ)
     env.setdefault('ROS_DOMAIN_ID', '20')
     cmd = ('source /opt/ros/jazzy/setup.bash && '
-           f'source {REPO}/yahboomcar_ws/install/setup.bash && '
+           f'source {WS_SETUP} && '
            'exec ros2 launch yahboomcar_safety first_floor_launch.py')
     p = subprocess.Popen(['bash', '-c', cmd], env=env, text=True,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

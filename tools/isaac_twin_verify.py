@@ -35,8 +35,8 @@ import os
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-USD_DIR = os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_twin', 'usd')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import USD_DIR                                     # noqa: E402
 SCENE_USD = os.path.join(USD_DIR, 'twin_scene.usd')
 REPORT = os.path.join(USD_DIR, 'twin_verify_report.txt')
 EXPECTED = ['zq_Joint', 'yq_Joint', 'yh_Joint', 'zh_Joint', 'jq1_Joint', 'jq2_Joint']

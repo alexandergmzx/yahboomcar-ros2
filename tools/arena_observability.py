@@ -40,9 +40,10 @@ import sys
 
 import numpy as np
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_localization'))
-sys.path.insert(0, os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_sim'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _layout import pkg_dir                                     # noqa: E402
+sys.path.insert(0, pkg_dir('yahboomcar_localization'))
+sys.path.insert(0, pkg_dir('yahboomcar_sim'))
 
 from yahboomcar_sim.arena import raycast as _raycast          # noqa: E402
 from yahboomcar_sim.arena import segments_box, segments_room   # noqa: E402
