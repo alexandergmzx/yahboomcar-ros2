@@ -522,8 +522,14 @@ class RosBridge:
                 ],
                 keys.SET_VALUES: [
                     ('Ctx.inputs:domain_id', int(domain_id)),
-                    # /scan -- BEST_EFFORT sensor QoS, as the firmware publishes it.
-                    ('Scan.inputs:topicName', 'scan'),
+                    # NOT /scan: a large minority of RTX helper messages arrive with
+                    # their content circularly rotated ~+/-85 deg (revolutions
+                    # assembled across the 1.2-messages-per-render phase seam)
+                    # [measured 2026-08-09; histograms in _scan_frame_relay.py]. The
+                    # raw output goes to a private topic and _scan_frame_relay.py
+                    # (spawned by run_ros) validates each scan against the shared
+                    # arena geometry and publishes only clean ones as /scan.
+                    ('Scan.inputs:topicName', 'scan_isaac_raw'),
                     ('Scan.inputs:frameId', 'laser_frame'),
                     ('Scan.inputs:type', 'laser_scan'),
                     ('Scan.inputs:renderProductPath', rp_path),
@@ -845,6 +851,22 @@ def run_ros(sim, app, args, say):
         stdout=_sp.DEVNULL, stderr=_sp.DEVNULL)
     say(f'  scan-rate feedback probe: pid {probe.pid} (system python; the only real '
         'measurement)')
+    # SCAN FILTER: a minority of RTX helper messages carry phase-corrupted content
+    # (see the graph comment at Scan.inputs:topicName); this child validates each
+    # scan_isaac_raw message against the shared arena geometry and republishes only
+    # the clean ones as /scan. Dropping lowers the delivered rate; the rate trim
+    # below measures the FILTERED /scan and renders faster to hold the contract.
+    # System python for the same rclpy/3.11 reason as the probe above.
+    # stdout/stderr inherited on purpose: the filter's drop counts land in this
+    # process's log (simctl-isaac.log under simctl), where a corrupted session is
+    # visible instead of silently filtered.
+    relay = _sp.Popen(
+        ['bash', '-c',
+         'source /opt/ros/jazzy/setup.bash 2>/dev/null && '
+         f'exec python3 {REPO}/tools/_scan_frame_relay.py'],
+        env=dict(os.environ))
+    say(f'  scan filter: pid {relay.pid} (scan_isaac_raw -> /scan, phase-corrupted '
+        'revolutions dropped, validated against the shared arena)')
     say(f'  physics {1/dt:.0f} Hz, rendering_dt {rdt:.5f} s')
     say(f'  /scan {SCAN_HZ:.0f}  /odom_raw {ODOM_HZ:.0f}  /imu {IMU_HZ:.0f}  '
         f'/battery {BATTERY_HZ:.0f} Hz   <- /cmd_vel')

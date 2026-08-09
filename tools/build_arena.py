@@ -29,6 +29,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _layout import REPO, USD_DIR                              # noqa: E402
+# The box layout comes from the 2D simulator's arena module -- ONE room for both
+# backends (2026-08-08). arena.py is ROS-free (numpy only), so Isaac's python can
+# import it directly.
+sys.path.insert(0, os.path.join(REPO, 'yahboomcar_sim'))
+from yahboomcar_sim.arena import ARENA_BOXES                   # noqa: E402
+from yahboomcar_sim.arena import BOX_SIZE as ARENA_BOX_SIZE    # noqa: E402
 ROBOT_USD = os.path.join(USD_DIR, 'micro4', 'micro4.usd')
 ARENA_USD = os.path.join(USD_DIR, 'arena.usd')
 ROBOT_PRIM = '/World/Robot'
@@ -285,9 +291,11 @@ def main():
         # URDF inertials total 0.355 kg), which is why the car "could barely move"
         # boxes that are supposed to be light cardboard -- field report. An empty
         # ~30 cm cardboard box is roughly 0.1-0.15 kg.
-        b = 0.3
-        spots = [(1.45, 1.45), (-1.45, 1.30), (1.35, -1.40), (-1.30, -1.45),
-                 (0.0, 1.55), (1.55, 0.0)]
+        # Positions and size are the SHARED layout from yahboomcar_sim.arena, so this
+        # room and the 2D room are the same room. (The old private list here carried
+        # two extra optional spots; --boxes now caps at the shared four.)
+        b = ARENA_BOX_SIZE
+        spots = list(ARENA_BOXES)
         for i in range(min(args.boxes, len(spots))):
             bx, by = spots[i]
             box(f'/World/Box_{i}', (b, b, b), (bx, by, b / 2 + 0.001),

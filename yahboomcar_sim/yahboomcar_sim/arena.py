@@ -19,10 +19,18 @@ LIDAR_BEAMS = 360
 LIDAR_RANGE_MIN = 0.12
 LIDAR_RANGE_MAX = 8.0
 
-# The planned test arena.
+# The planned test arena. ONE room for both backends (2026-08-08): these constants
+# are the single source of the box layout -- tools/build_arena.py imports them for the
+# Isaac USD, so the two rooms cannot drift apart. (They had: 2D carried three 0.4 m
+# boxes mid-room while Isaac had four 0.3 m boxes by the corners, and a box count that
+# never matched what the SLAM map showed was how the drift was noticed.)
 ROOM_W = 4.0
 ROOM_H = 4.0
-BOX_SIZE = 0.4
+BOX_SIZE = 0.3
+# Near the corners, kept clear of the 2x2 m UMBmark square so an obstacle never sits
+# inside a calibration run. Deliberately NOT 4-fold symmetric (1.30 vs 1.45): a matcher
+# relocalising into the wrong quadrant must not find the same room there.
+ARENA_BOXES = ((1.45, 1.45), (-1.45, 1.30), (1.35, -1.40), (-1.30, -1.45))
 
 
 def segments_room(w=ROOM_W, h=ROOM_H):
@@ -37,8 +45,8 @@ def segments_box(cx, cy, s=BOX_SIZE):
     return [(c[i], c[(i + 1) % 4]) for i in range(4)]
 
 
-def default_arena(boxes=((-1.0, -1.0), (1.0, 1.0), (1.1, -0.9))):
-    """The 4x4 room with a few boxes in it.
+def default_arena(boxes=ARENA_BOXES):
+    """The 4x4 room with the shared box layout in it.
 
     The boxes are NOT there to make translation observable -- that was the expectation and
     measurement disproved it. They are there because the safety governor needs something

@@ -92,6 +92,9 @@ SIM_PROCS = [
     'ekf_node', 'imu_filter_madgwick_node', 'robot_state_publisher',
     'joint_state_publisher', 'static_transform_publisher', 'rviz2',
     'sim_runner.py', 'component_container_isolated', 'env_isaaclab',
+    # sim_runner's system-python children; without these here they outlive the
+    # session (the rate probe already did, unnoticed -- found while adding the relay).
+    '_scan_rate_probe', '_scan_frame_relay',
     # robot2 sessions (fleet session 5):
     'fake_rasptank', 'rasptank_twin_runner', 'twin_scan_conditioner',
 ]
@@ -368,6 +371,107 @@ def start_robot2(args, dom, log):
     return 0
 
 
+# The stack steps, one definition each. The two backends start these in DIFFERENT
+# orders (2d: robot first; isaac: everything light first, Isaac last), and duplicating
+# the blocks per order is exactly how the 18-stale-copies audit finding happened.
+def launch_safety(args, dom, log, step):
+    print(f'  {step} safety governor + deadman...')
+    sh('ros2 launch yahboomcar_safety safety_launch.py '
+       f'max_speed:={args.max_speed}', dom,
+       log=os.path.join(log, 'simctl-safety.log'))
+    time.sleep(8)
+
+
+def launch_laser_odometry(dom, log, step):
+    print(f'  {step} lidar odometry...')
+    sh('ros2 run yahboomcar_localization laser_odometry', dom,
+       log=os.path.join(log, 'simctl-laserodom.log'))
+
+
+def launch_slam(dom, log, step):
+    print(f'  {step} SLAM...')
+    # The canonical D-19 launch, NOT the vendor slam_toolbox_launch.py. The vendor
+    # manager's bond (30 s timeout + respawn) falsely declared "no heartbeat for
+    # 30000 ms" under fleet-session load and kill/respawned slam 4x in 50 s
+    # [measured, session-3 fleet log] -- each kill drops the map frame out from
+    # under RViz. slam_launch.py is the same node names and the same tuned params
+    # with the bond disabled (0 deactivations in 300 s, session-4 regression).
+    sh('ros2 launch yahboomcar_config slam_launch.py', dom,
+       log=os.path.join(log, 'simctl-slam.log'))
+
+
+def wait_map(dom, log):
+    # slam_toolbox is a LIFECYCLE node on Jazzy: it starts unconfigured and, without
+    # the lifecycle manager driving it, reads its params and then silently does
+    # nothing forever. So readiness has to be checked -- but NOT with
+    # `ros2 lifecycle get`, which reported "Node not found" on this machine while
+    # SLAM was demonstrably publishing a 4.04 x 4.04 m map. The CLI depends on the
+    # ros2 daemon, and the daemon is unreliable here after processes churn.
+    #
+    # Wait for /map instead. It is the output that matters, it cannot be stale, and
+    # it proves more than `active` does: a node can be active and still produce
+    # nothing.
+    print('        waiting for /map (checking output, not status)...')
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        time.sleep(6)
+        out = ros_eval(
+            'from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy\n'
+            'from nav_msgs.msg import OccupancyGrid\n'
+            'rclpy.init(); n=Node("simctl_map"); g=[]\n'
+            'q=QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,'
+            ' reliability=QoSReliabilityPolicy.RELIABLE)\n'
+            'n.create_subscription(OccupancyGrid,"/map",lambda m: g.append(m), q)\n'
+            'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
+            'time.sleep(5)\n'
+            'print("MAP", len(g), ("%.2f" % (g[-1].info.width*g[-1].info.resolution)) if g else 0)\n'
+            'sys.stdout.flush(); os._exit(0)\n', dom, timeout=30)
+        if 'MAP' in out and out.split('MAP')[-1].split()[0] != '0':
+            n, size = out.split('MAP')[-1].split()[:2]
+            print(f'        map publishing: {n} updates, {size} m across')
+            break
+    else:
+        print('        WARNING: no /map after 120 s. SLAM is not producing output.')
+        print(f'        Look at {os.path.join(log, "simctl-slam.log")}')
+
+
+def launch_rviz(dom, step):
+    print(f'  {step} RViz...')
+    env = dict(os.environ)
+    env.setdefault('DISPLAY', ':0')
+    # simctl never starts Nav2 in any backend or flag combination, so the leaner
+    # SLAM-only view is always correct here; nav2_debug.rviz's Nav2-only displays
+    # (costmaps, plans, the Navigation 2 panel) would just sit as empty/warning
+    # entries with no publisher. Pass a different config by hand if you also start
+    # Nav2 yourself alongside a simctl session.
+    subprocess.Popen(
+        ['bash', '-c',
+         f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
+         f'export ROS_DOMAIN_ID={dom} && '
+         f'rviz2 -d {RVIZ_SLAM}'],
+        start_new_session=True, env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(8)
+
+
+def launch_patrol(args, dom, log, step):
+    # sim_patrol publishes /cmd_vel_raw so the governor stays in the loop, exactly as
+    # it would on the floor. With --no-safety there is no governor, so NOTHING
+    # forwards /cmd_vel_raw to /cmd_vel and the robot never moves -- measured: peak
+    # velocity 0.000 m/s, looking for all the world like a broken simulator.
+    # Without a governor the patrol must publish directly.
+    if args.safety:
+        print(f'  {step} governed patrol (via /cmd_vel_raw)...')
+        extra = ''
+    else:
+        print(f'  {step} patrol, UNGOVERNED (--no-safety, so publishing /cmd_vel '
+              'directly)...')
+        extra = ' --direct'
+    sh(f'python3 {REPO}/tools/sim_patrol.py --domain {dom}{extra}', dom,
+       log=os.path.join(log, 'simctl-patrol.log'))
+    time.sleep(6)
+
+
 def cmd_start(args):
     dom = args.domain
     log = os.path.join(ASSETS, 'logs')
@@ -406,7 +510,36 @@ def cmd_start(args):
         # Isaac replaces ONLY the firmware, exactly as fake_robot does -- so the real
         # bringup goes on top of it unchanged, and everything above that cannot tell
         # the two backends apart.
-        print('  [1/6] Isaac Sim (~90 s to start'
+        #
+        # BOOT ORDER (2026-08-08, Alex): the LIGHT components first, Isaac LAST.
+        # Everything in the stack is subscription-driven and idles harmlessly until
+        # the firmware topics exist, so nothing is gained by staring at a blank
+        # desktop for Isaac's ~90-420 s load. RViz comes up in seconds and becomes
+        # the visible progress bar: RobotModel appears when bringup publishes the
+        # description, the scan and map displays sit empty/red until Isaac and SLAM
+        # feed them -- that is the boot order made visible, not a fault. Patrol
+        # still comes ABSOLUTELY LAST: the firmware model latches the last command,
+        # so commands must not accumulate before the robot exists.
+        isaac_py = os.path.expanduser('~/isaac/env_isaaclab/bin/python')
+        if not os.path.exists(isaac_py):
+            # Checked BEFORE anything launches: failing here used to leave nothing
+            # behind, and must stay that way -- no half-started stack to tear down.
+            print(f'  Isaac python not found at {isaac_py}')
+            return 2
+        print('  [1/7] real bringup stack (idles until the robot exists)...')
+        bringup_log = os.path.join(log, 'simctl-bringup.log')
+        p_stack = sh('ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py',
+                     dom, log=bringup_log)
+        if args.safety:
+            launch_safety(args, dom, log, '[2/7]')
+        launch_laser_odometry(dom, log, '[3/7]')
+        if args.slam:
+            # Activates via its own lifecycle manager and then idles until /scan
+            # exists; the /map evidence wait happens after Isaac is up.
+            launch_slam(dom, log, '[4/7]')
+        if args.rviz:
+            launch_rviz(dom, '[5/7]')
+        print('  [6/7] Isaac Sim (~90 s to start'
               + (')...' if args.no_isaac_gui else '; a window will open)...'))
         print('        NOTE /scan lands on 12 Hz by CALIBRATION against a measured but')
         print('        unexplained 72-messages-per-render-second emission rate, not by')
@@ -417,20 +550,16 @@ def cmd_start(args):
                   'here: Isaac')
             print('        has real contact physics, so slip is whatever the floor gives '
                   'you)')
-        isaac_py = os.path.expanduser('~/isaac/env_isaaclab/bin/python')
-        if not os.path.exists(isaac_py):
-            print(f'  Isaac python not found at {isaac_py}')
-            return 2
         gui = '' if args.no_isaac_gui else ' --gui'
         isaac_log = os.path.join(log, 'simctl-isaac.log')
         p_isaac = sh(f'{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}', dom,
                      log=isaac_log)
-        # Isaac is slow to start and the bringup below needs /odom_raw to exist, so
-        # the firmware side gets its own wait before the stack goes on top. (The old
-        # code PRINTED this intent but launched bringup immediately, then waited on
-        # the combined result -- so an Isaac-side death and a bringup-side death were
-        # indistinguishable.) 240 s was not enough with the GUI on: Isaac reached
-        # 'graph built' and published everything, but only after the wait expired.
+        # Isaac keeps its own wait so an Isaac-side death and a bringup-side death
+        # stay distinguishable (the 2026-08-08 repair's whole point). Bringup is
+        # already up in this order, so it rides along in the procs dict: its exit
+        # also fails this wait immediately, by name. 240 s was not enough with the
+        # GUI on: Isaac reached 'graph built' and published everything, but only
+        # after the wait expired.
         print('        waiting for Isaac to publish (budget 420 s; GUI runs are the '
               'slow end)...')
         if not wait_for(
@@ -439,11 +568,9 @@ def cmd_start(args):
                 lambda: probe_topics(dom, [
                     ('/scan', 'LaserScan', True),
                     ('/odom_raw', 'Odometry', True)]),
-                420, {'sim_runner (Isaac)': p_isaac}, [isaac_log]):
+                420, {'sim_runner (Isaac)': p_isaac, 'bringup launch': p_stack},
+                [isaac_log, bringup_log]):
             return 1
-        bringup_log = os.path.join(log, 'simctl-bringup.log')
-        p_stack = sh('ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py',
-                     dom, log=bringup_log)
         stack_procs = {'sim_runner (Isaac)': p_isaac, 'bringup launch': p_stack}
         stack_logs = [bringup_log, isaac_log]
         stack_budget = 120
@@ -468,88 +595,24 @@ def cmd_start(args):
             stack_budget, stack_procs, stack_logs):
         return 1
 
-    if args.safety:
-        print('  [2/6] safety governor + deadman...')
-        sh('ros2 launch yahboomcar_safety safety_launch.py '
-           f'max_speed:={args.max_speed}', dom,
-           log=os.path.join(log, 'simctl-safety.log'))
-        time.sleep(8)
-
-    print('  [3/6] lidar odometry...')
-    sh('ros2 run yahboomcar_localization laser_odometry', dom,
-       log=os.path.join(log, 'simctl-laserodom.log'))
-
-    if args.slam:
-        print('  [4/6] SLAM...')
-        sh('ros2 launch yahboomcar_nav slam_toolbox_launch.py', dom,
-           log=os.path.join(log, 'simctl-slam.log'))
-        # slam_toolbox is a LIFECYCLE node on Jazzy: it starts unconfigured and, without
-        # the lifecycle manager driving it, reads its params and then silently does
-        # nothing forever. So readiness has to be checked -- but NOT with
-        # `ros2 lifecycle get`, which reported "Node not found" on this machine while
-        # SLAM was demonstrably publishing a 4.04 x 4.04 m map. The CLI depends on the
-        # ros2 daemon, and the daemon is unreliable here after processes churn.
-        #
-        # Wait for /map instead. It is the output that matters, it cannot be stale, and
-        # it proves more than `active` does: a node can be active and still produce
-        # nothing.
-        print('        waiting for /map (checking output, not status)...')
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            time.sleep(6)
-            out = ros_eval(
-                'from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy\n'
-                'from nav_msgs.msg import OccupancyGrid\n'
-                'rclpy.init(); n=Node("simctl_map"); g=[]\n'
-                'q=QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,'
-                ' reliability=QoSReliabilityPolicy.RELIABLE)\n'
-                'n.create_subscription(OccupancyGrid,"/map",lambda m: g.append(m), q)\n'
-                'ex=SingleThreadedExecutor(); ex.add_node(n); threading.Thread(target=ex.spin,daemon=True).start()\n'
-                'time.sleep(5)\n'
-                'print("MAP", len(g), ("%.2f" % (g[-1].info.width*g[-1].info.resolution)) if g else 0)\n'
-                'sys.stdout.flush(); os._exit(0)\n', dom, timeout=30)
-            if 'MAP' in out and out.split('MAP')[-1].split()[0] != '0':
-                n, size = out.split('MAP')[-1].split()[:2]
-                print(f'        map publishing: {n} updates, {size} m across')
-                break
-        else:
-            print('        WARNING: no /map after 120 s. SLAM is not producing output.')
-            print(f'        Look at {os.path.join(log, "simctl-slam.log")}')
-
-    if args.rviz:
-        print('  [5/6] RViz...')
-        env = dict(os.environ)
-        env.setdefault('DISPLAY', ':0')
-        # simctl never starts Nav2 in any backend or flag combination, so the leaner
-        # SLAM-only view is always correct here; nav2_debug.rviz's Nav2-only displays
-        # (costmaps, plans, the Navigation 2 panel) would just sit as empty/warning
-        # entries with no publisher. Pass a different config by hand if you also start
-        # Nav2 yourself alongside a simctl session.
-        subprocess.Popen(
-            ['bash', '-c',
-             f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
-             f'export ROS_DOMAIN_ID={dom} && '
-             f'rviz2 -d {RVIZ_SLAM}'],
-            start_new_session=True, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(8)
+    if args.backend == 'isaac':
+        # The light components were all started BEFORE Isaac; the one thing that could
+        # not exist until the robot did is the SLAM output evidence.
+        if args.slam:
+            wait_map(dom, log)
+    else:
+        if args.safety:
+            launch_safety(args, dom, log, '[2/6]')
+        launch_laser_odometry(dom, log, '[3/6]')
+        if args.slam:
+            launch_slam(dom, log, '[4/6]')
+            wait_map(dom, log)
+        if args.rviz:
+            launch_rviz(dom, '[5/6]')
 
     if args.patrol:
-        # sim_patrol publishes /cmd_vel_raw so the governor stays in the loop, exactly as
-        # it would on the floor. With --no-safety there is no governor, so NOTHING
-        # forwards /cmd_vel_raw to /cmd_vel and the robot never moves -- measured: peak
-        # velocity 0.000 m/s, looking for all the world like a broken simulator.
-        # Without a governor the patrol must publish directly.
-        if args.safety:
-            print('  [6/6] governed patrol (via /cmd_vel_raw)...')
-            extra = ''
-        else:
-            print('  [6/6] patrol, UNGOVERNED (--no-safety, so publishing /cmd_vel '
-                  'directly)...')
-            extra = ' --direct'
-        sh(f'python3 {REPO}/tools/sim_patrol.py --domain {dom}{extra}', dom,
-           log=os.path.join(log, 'simctl-patrol.log'))
-        time.sleep(6)
+        launch_patrol(args, dom, log,
+                      '[7/7]' if args.backend == 'isaac' else '[6/6]')
 
     print()
     print('  up. ./tools/simctl status   to inspect,   ./tools/simctl stop   to tear down')

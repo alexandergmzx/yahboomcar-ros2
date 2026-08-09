@@ -93,8 +93,8 @@ FAIL — and the deadman closes it in both.
 ros2 launch yahboomcar_sim sim_bringup_launch.py
 ros2 launch yahboomcar_sim sim_bringup_launch.py slip:=1.0    # car on its stand
 
-# Mapping
-ros2 launch yahboomcar_nav slam_toolbox_launch.py rviz:=true
+# Mapping (the canonical robot1 SLAM launch, D-19)
+ros2 launch yahboomcar_config slam_launch.py rviz:=true
 ros2 run nav2_map_server map_saver_cli -f my_map
 
 # Navigation against a saved map
@@ -102,9 +102,16 @@ ros2 launch yahboomcar_nav navigation_dwb_launch.py maps:=/abs/path/my_map.yaml
 ./tools/nav2_smoke.py --x 0.8 --y 0.0
 ```
 
-The arena defaults to the planned 4×4 m room with three boxes, defined once in
-`yahboomcar_sim/arena.py` and shared with `tools/arena_observability.py` so the two cannot
-drift apart.
+The vendor `yahboomcar_nav slam_toolbox_launch.py` still exists in the vendor tree, but
+its lifecycle manager bonds with a 30 s timeout, and under fleet-session load that bond
+falsely timed out and kill/respawned SLAM mid-session (D-19) — use the canonical launch
+above, whose manager runs bond-free.
+
+The arena defaults to the planned 4×4 m room with four 0.3 m boxes near the corners,
+defined once in `yahboomcar_sim/arena.py` and imported by `tools/arena_observability.py`
+AND `tools/build_arena.py` (the Isaac room), so the backends cannot drift apart. They
+had: until 2026-08-08 the 2D room carried three mid-room boxes while Isaac had four by
+the corners, and no SLAM map could match both expectations at once.
 
 ---
 

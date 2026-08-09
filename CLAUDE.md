@@ -78,11 +78,25 @@ fleet-layout default — never extracted (R-05).
 
 ```bash test:lifecycle
 cd ../../ground_station && source /opt/ros/jazzy/setup.bash && source install/setup.bash
-../src/yahboomcar-ros2/tools/simctl start        # 2D sim + real stack
-ros2 launch yahboomcar_config slam_launch.py     # canonical robot1 SLAM (D-19)
+../src/yahboomcar-ros2/tools/simctl start        # 2D sim + real stack + canonical SLAM (D-19)
 ../src/yahboomcar-ros2/tools/simctl stop         # zeroes robots BEFORE teardown
 ```
+
+`simctl start` runs the canonical `yahboomcar_config slam_launch.py` itself —
+do NOT launch it again on top (two `/slam_toolbox` nodes fight over
+`map->odom` and the RViz map flickers apart). To run SLAM by hand:
+`simctl start --no-slam`, then `ros2 launch yahboomcar_config slam_launch.py
+rviz:=true`.
+
+SLAM on the REAL car (hand-push walk first, then governed teleop):
+`docs/floor-slam-session.md`, nested in `docs/first-floor-procedure.md`.
 
 Evidence style is this repo's export: measured vs assumed marked, negative
 results in bold, rejected alternatives recorded. The fleet added bracket
 tags and D/OI/R ids; both conventions apply here going forward.
+
+## Working agreements
+
+- **Night/autonomous sessions NEVER push to remote.** Commit locally,
+  explicit `git add` paths only; pushing happens only with Alex present
+  (rule set 2026-08-09).
