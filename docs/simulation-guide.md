@@ -117,8 +117,11 @@ Obstacle braking OFF (the governor's stop/slow distances go to 0, making the obs
 rules unreachable), speed caps at the firmware maxima (1.0 m/s forward **and**
 reverse, 5.0 rad/s yaw). It is a governor *preset*, not a bypass: the deadman stays
 armed, a stale scan still stops the robot, and teleop keeps the single-writer
-discipline. The patrol is suppressed — fun is a driving mode. Real collisions exist
-only on the isaac backend; the 2D simulator has no contact physics. Simulation-only
+discipline. The patrol is suppressed — fun is a driving mode — and **SLAM is off**:
+a map built while ramming walls and punting boxes is garbage by construction, and
+its `map->odom` corrections are what yank the view around (to map anyway, launch
+`yahboomcar_config slam_launch.py` by hand on the session's domain). Real collisions
+exist only on the isaac backend; the 2D simulator has no contact physics. Simulation-only
 by construction: `simctl` refuses the car's domain structurally, and the hardware
 launch defaults are untouched.
 

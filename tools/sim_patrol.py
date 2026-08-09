@@ -16,9 +16,10 @@ IT IS OPEN LOOP, AND ON ISAAC THAT SHOWS
 ----------------------------------------
 The legs are timed, not navigated -- this drives a square by dead reckoning and has no
 idea where it is. On the 2D simulator that is harmless because there are NO COLLISIONS
-at all. Isaac has real contact physics, so the default 1.6 m leg from the origin runs
-straight into the arena box at (1.55, 0) and pins the robot: wheels turning, body still,
-and the wall closer than the lidar's 0.12 m range_min so it cannot even be seen.
+at all. Isaac has real contact physics, so a dead-reckoned leg can run into a wall or
+one of the corner boxes (the shared layout in yahboomcar_sim.arena -- four 0.3 m boxes
+by the corners since 2026-08-08) and pin the robot: wheels turning, body still, the
+obstacle closer than the lidar's 0.12 m range_min so it cannot even be seen.
 
 So there is a stuck detector, on GROUND TRUTH rather than odometry. Odometry is
 encoder-derived and reports a robot wedged against a wall as travelling normally --

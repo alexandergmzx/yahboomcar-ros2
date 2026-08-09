@@ -523,6 +523,18 @@ def cmd_start(args):
             print('  FUN MODE: patrol suppressed -- fun is a DRIVING mode, and an '
                   'autonomous patrol')
             print('  with obstacle braking off is just a wall-grinder.')
+        if args.slam:
+            args.slam = False
+            # A map built while deliberately ramming walls and punting boxes is
+            # garbage by construction, and its map->odom corrections are what yank
+            # the whole RViz view around (measured: wall-grinding makes the encoders
+            # sprint while the body is pinned; every correction then jumps meters).
+            # With no map frame, everything renders in consistent odom coordinates
+            # and odometry drift is INVISIBLE -- what a driving view wants.
+            print('  FUN MODE: SLAM off -- crash maps are garbage and their '
+                  'corrections yank the view.')
+            print('  To map anyway: ros2 launch yahboomcar_config slam_launch.py '
+                  'on this domain.')
         print('  *** FUN MODE (simulation only) ***')
         print('  Obstacle braking OFF, caps at the firmware maxima (1.0 m/s fwd and '
               'reverse,')
@@ -809,6 +821,8 @@ def cmd_status(args):
 
 
 def cmd_patrol(args):
+    print('  (watching in RViz? The drive view\'s chase camera follows every spin --')
+    print('   the saved "Overhead" view in the Views panel is the one for spectating.)')
     return sh(f'python3 {REPO}/tools/sim_patrol.py --domain {args.domain}',
               args.domain, background=False).returncode
 
