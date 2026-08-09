@@ -57,7 +57,7 @@ import time
 # Extraction-aware layout (fleet D-12, session 4; single definition since the
 # 2026-08-08 audit found 18 tools with private stale copies): see tools/_layout.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _layout import REPO, WS_SETUP, ASSETS, _first_existing     # noqa: E402
+from _layout import REPO, WS_SETUP, ASSETS, USD_DIR, _first_existing     # noqa: E402
 RVIZ_SLAM = _first_existing([
     os.path.join(REPO, 'yahboomcar_config', 'rviz', 'slam_debug.rviz'),
     os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_nav', 'rviz',
@@ -598,8 +598,19 @@ def cmd_start(args):
                   'you)')
         gui = '' if args.no_isaac_gui else ' --gui'
         isaac_log = os.path.join(log, 'simctl-isaac.log')
-        p_isaac = sh(f'{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}', dom,
-                     log=isaac_log)
+        arena_env = ''
+        if getattr(args, 'fun', False):
+            # Feather-box variant, built NEXT TO the canonical arena -- calibration
+            # results only ever come from arena.usd, so fun never contaminates them.
+            if os.path.exists(os.path.join(USD_DIR, 'arena_fun.usd')):
+                arena_env = 'YAHBOOM_ARENA_USD=arena_fun.usd '
+                print('        FUN arena: feather boxes (arena_fun.usd)')
+            else:
+                print('        (no arena_fun.usd built -- normal 0.12 kg boxes. Build '
+                      'the fun variant:')
+                print('         build_arena.py --box-mass 0.02 --out arena_fun.usd)')
+        p_isaac = sh(f'{arena_env}{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}',
+                     dom, log=isaac_log)
         # Isaac keeps its own wait so an Isaac-side death and a bringup-side death
         # stay distinguishable (the 2026-08-08 repair's whole point). Bringup is
         # already up in this order, so it rides along in the procs dict: its exit

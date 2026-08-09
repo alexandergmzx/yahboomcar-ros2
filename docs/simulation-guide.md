@@ -117,10 +117,24 @@ Obstacle braking OFF (the governor's stop/slow distances go to 0, making the obs
 rules unreachable), speed caps at the firmware maxima (1.0 m/s forward **and**
 reverse, 5.0 rad/s yaw). It is a governor *preset*, not a bypass: the deadman stays
 armed, a stale scan still stops the robot, and teleop keeps the single-writer
-discipline. The patrol is suppressed — fun is a driving mode. Real collisions (the
-0.12 kg cardboard boxes shove satisfyingly) exist only on the isaac backend; the 2D
-simulator has no contact physics. Simulation-only by construction: `simctl` refuses
-the car's domain structurally, and the hardware launch defaults are untouched.
+discipline. The patrol is suppressed — fun is a driving mode. Real collisions exist
+only on the isaac backend; the 2D simulator has no contact physics. Simulation-only
+by construction: `simctl` refuses the car's domain structurally, and the hardware
+launch defaults are untouched.
+
+Fun sessions open the **drive view** (`yahboomcar_config/rviz/drive.rviz`): a
+chase camera following `base_footprint`, whose fixed frame exists from the first
+second of bringup, so the view is never red. If `arena_fun.usd` exists, fun isaac
+sessions load it — **feather boxes** (0.02 kg vs the calibrated 0.12): the car
+punches through at full speed (zone entry measured at 1.05 m/s, penetration to
+0.07 m of the box centre). Build it once:
+
+```bash test:skip
+~/isaac/env_isaaclab/bin/python tools/build_arena.py --box-mass 0.02 --out arena_fun.usd
+```
+
+Calibration results only ever come from the canonical `arena.usd`; the fun variant
+lives next to it, never in place of it.
 
 The arena defaults to the planned 4×4 m room with four 0.3 m boxes near the corners,
 defined once in `yahboomcar_sim/arena.py` and imported by `tools/arena_observability.py`

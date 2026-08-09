@@ -175,6 +175,10 @@ def main():
     ap.add_argument('--size', type=float, default=4.0, help='floor side, metres')
     ap.add_argument('--wall-height', type=float, default=0.4)
     ap.add_argument('--boxes', type=int, default=4)
+    ap.add_argument('--out', default='arena.usd',
+                    help='output basename under the twin USD dir. Variants (e.g. '
+                         'arena_fun.usd with feather boxes) live NEXT TO the '
+                         'canonical arena, never in place of it.')
     ap.add_argument('--friction', type=float, default=0.6)
     ap.add_argument('--gui', action='store_true')
     ap.add_argument('--no-verify', dest='verify', action='store_false', default=True)
@@ -446,8 +450,9 @@ def main():
                 'wait on /scan forever')
 
         os.makedirs(USD_DIR, exist_ok=True)
-        stage.Export(ARENA_USD)
-        say(f'arena written: {ARENA_USD}')
+        out_usd = os.path.join(USD_DIR, args.out)
+        stage.Export(out_usd)
+        say(f'arena written: {out_usd}')
         say(f'  floor {s} x {s} m, walls {wh} m, {min(args.boxes, len(spots))} boxes, '
             f'friction {args.friction}')
         say(f'  robot spawned at z={spawn_z:.3f} m')
@@ -463,7 +468,7 @@ def main():
 
         # ---- the check whose absence let a falling robot pass as working ----
         say(f'\nverifying the robot does not fall ({args.verify_seconds:.0f}s of physics)')
-        omni.usd.get_context().open_stage(ARENA_USD)
+        omni.usd.get_context().open_stage(out_usd)
         app.update()
 
         from isaacsim.core.api import SimulationContext

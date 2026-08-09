@@ -38,7 +38,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # extraction unnoticed and killed the isaac backend -- this file exited at the arena
 # check while simctl polled topics for its full 420 s budget. See _layout.py.
 from _layout import REPO, USD_DIR, LOG_DIR, pkg_dir            # noqa: E402
-ARENA_USD = os.path.join(USD_DIR, 'arena.usd')
+# YAHBOOM_ARENA_USD selects a VARIANT (absolute path or basename under USD_DIR) --
+# simctl --fun points here at arena_fun.usd (feather boxes). The canonical
+# arena.usd stays the default and the only one calibration results may come from.
+_arena_env = os.environ.get('YAHBOOM_ARENA_USD', '')
+ARENA_USD = (_arena_env if os.path.isabs(_arena_env)
+             else os.path.join(USD_DIR, _arena_env or 'arena.usd'))
 ROBOT_PRIM = '/World/Robot'
 
 # Geometric wheel radius, confirmed twice: 0.024 from the STL bounding box and 0.025
