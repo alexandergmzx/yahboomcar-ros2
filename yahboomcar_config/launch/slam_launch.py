@@ -44,14 +44,22 @@ def generate_launch_description():
         DeclareLaunchArgument('params_file', default_value=params),
         DeclareLaunchArgument('rviz', default_value='false'),
         DeclareLaunchArgument('rviz_cfg', default_value=rviz_cfg),
+        # FALSE for every live session, by design: nothing else in this stack sets
+        # sim time, so swapping the simulator for the car changes nothing. It exists
+        # for ONE caller -- tools/replay_slam_bag.py, which plays a recorded bag with
+        # `--clock`. A replay must run on the bag's clock or every transform lookup is
+        # compared against wall time and fails.
+        DeclareLaunchArgument('use_sim_time', default_value='false'),
     ]
+    use_sim_time = LaunchConfiguration('use_sim_time')
 
     slam = Node(
         package='slam_toolbox',
         executable='async_slam_toolbox_node',
         name='slam_toolbox',
         output='screen',
-        parameters=[LaunchConfiguration('params_file')],
+        parameters=[LaunchConfiguration('params_file'),
+                    {'use_sim_time': use_sim_time}],
     )
 
     lifecycle = Node(
@@ -63,6 +71,7 @@ def generate_launch_description():
             'autostart': True,
             'node_names': ['slam_toolbox'],
             'bond_timeout': 0.0,     # D-19 — see module docstring
+            'use_sim_time': use_sim_time,
         }],
     )
 
