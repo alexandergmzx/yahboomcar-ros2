@@ -496,18 +496,15 @@ def cmd_start(args):
             print('  FUN MODE: patrol suppressed -- fun is a DRIVING mode, and an '
                   'autonomous patrol')
             print('  with obstacle braking off is just a wall-grinder.')
-        if args.slam:
-            args.slam = False
-            # A map built while deliberately ramming walls and punting boxes is
-            # garbage by construction, and its map->odom corrections are what yank
-            # the whole RViz view around (measured: wall-grinding makes the encoders
-            # sprint while the body is pinned; every correction then jumps meters).
-            # With no map frame, everything renders in consistent odom coordinates
-            # and odometry drift is INVISIBLE -- what a driving view wants.
-            print('  FUN MODE: SLAM off -- crash maps are garbage and their '
-                  'corrections yank the view.')
-            print('  To map anyway: ros2 launch yahboomcar_config slam_launch.py '
-                  'on this domain.')
+        # SLAM STAYS ON. It was forced off here for a few hours on 2026-08-10 -- "crash
+        # maps are garbage and their corrections yank the view" -- and that removed the
+        # map from the one view built for watching yourself drive. Alex reported it as
+        # "still no map on rviz". The view-yanking half of that reasoning was really the
+        # FIXED FRAME (drive.rviz now anchors to odom, so a correction moves the map
+        # while the robot and scan stay put) and the scan filter starving /scan; both
+        # are fixed. The other half -- a crash map is not EVIDENCE -- is a
+        # documentation matter, not a reason to delete what somebody wants to look at.
+        # `--no-slam` remains for anyone who genuinely wants pure driving.
         print('  *** FUN MODE (simulation only) ***')
         print('  Obstacle braking OFF, caps at the firmware maxima (1.0 m/s fwd and '
               'reverse,')
@@ -517,6 +514,15 @@ def cmd_start(args):
               '--backend isaac;')
         print('  the 2d backend has no contact physics. Drive with: '
               './tools/simctl teleop')
+        if args.slam:
+            print('  MAP: SLAM runs, so the map builds while you drive '
+                  '(--no-slam turns it off).')
+            if args.backend == 'isaac':
+                print('        On isaac it WILL smear on turns: /odom_raw yaw '
+                      'over-reports ~3x under')
+                print('        turn slip [open finding, '
+                      'docs/slam-research/isaac-scan-quality.md].')
+            print('        A fun-mode map is for looking at. It is never evidence.')
         print('  SPEED: the vendor keyboard STARTS AT 0.2 m/s -- press q repeatedly '
               'to raise')
         print('  it toward the 1.0 m/s cap (each press +10%). Slow fun is usually '

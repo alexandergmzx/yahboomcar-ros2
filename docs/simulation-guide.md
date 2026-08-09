@@ -117,11 +117,19 @@ Obstacle braking OFF (the governor's stop/slow distances go to 0, making the obs
 rules unreachable), speed caps at the firmware maxima (1.0 m/s forward **and**
 reverse, 5.0 rad/s yaw). It is a governor *preset*, not a bypass: the deadman stays
 armed, a stale scan still stops the robot, and teleop keeps the single-writer
-discipline. The patrol is suppressed — fun is a driving mode — and **SLAM is off**:
-a map built while ramming walls and punting boxes is garbage by construction, and
-its `map->odom` corrections are what yank the view around (to map anyway, launch
-`yahboomcar_config slam_launch.py` by hand on the session's domain). Real collisions
-exist only on the isaac backend; the 2D simulator has no contact physics. Simulation-only
+discipline. The patrol is suppressed — fun is a driving mode. **SLAM runs, so the map
+builds while you drive** (`--no-slam` turns it off); on `--backend isaac` the map will
+smear on turns, because `/odom_raw` yaw over-reports ~3× under turn slip — an open
+finding in [`slam-research/isaac-scan-quality.md`](slam-research/isaac-scan-quality.md).
+**A fun-mode map is for looking at. It is never evidence.** Real collisions exist only
+on the isaac backend; the 2D simulator has no contact physics.
+
+> SLAM was briefly forced OFF in fun mode (2026-08-10) on the argument that a crash map
+> is garbage and its corrections yank the view. That removed the map from the one view
+> built for watching yourself drive, and it was reported as "still no map on rviz". The
+> view-yanking was really the fixed frame (now `odom`) and the scan filter starving
+> `/scan`; both are fixed. A crash map not being *evidence* is a documentation matter,
+> which is what the sentence above is. Simulation-only
 by construction: `simctl` refuses the car's domain structurally, and the hardware
 launch defaults are untouched.
 
