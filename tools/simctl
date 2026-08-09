@@ -62,6 +62,9 @@ RVIZ_SLAM = _first_existing([
     os.path.join(REPO, 'yahboomcar_config', 'rviz', 'slam_debug.rviz'),
     os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_nav', 'rviz',
                  'slam_debug.rviz')])
+# The driving view: chase camera on base_footprint, fixed frame that exists from the
+# first second, map drawn behind when SLAM runs. What --fun sessions open.
+RVIZ_DRIVE = os.path.join(REPO, 'yahboomcar_config', 'rviz', 'drive.rviz')
 # ONE definition of the car's domain, shared with every guarded tool. Two copies of
 # this number would eventually disagree, and the one that was wrong would be the
 # structural refusal.
@@ -447,20 +450,21 @@ def wait_map(dom, log):
         print(f'        Look at {os.path.join(log, "simctl-slam.log")}')
 
 
-def launch_rviz(dom, step):
-    print(f'  {step} RViz...')
+def launch_rviz(dom, step, cfg=None):
+    cfg = cfg or RVIZ_SLAM
+    print(f'  {step} RViz ({os.path.basename(cfg)})...')
     env = dict(os.environ)
     env.setdefault('DISPLAY', ':0')
     # simctl never starts Nav2 in any backend or flag combination, so the leaner
     # SLAM-only view is always correct here; nav2_debug.rviz's Nav2-only displays
     # (costmaps, plans, the Navigation 2 panel) would just sit as empty/warning
-    # entries with no publisher. Pass a different config by hand if you also start
-    # Nav2 yourself alongside a simctl session.
+    # entries with no publisher. Fun sessions get the drive view (chase camera).
+    # Pass a different config by hand if you also start Nav2 yourself.
     subprocess.Popen(
         ['bash', '-c',
          f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
          f'export ROS_DOMAIN_ID={dom} && '
-         f'rviz2 -d {RVIZ_SLAM}'],
+         f'rviz2 -d {cfg}'],
         start_new_session=True, env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(8)
@@ -579,7 +583,8 @@ def cmd_start(args):
             # exists; the /map evidence wait happens after Isaac is up.
             launch_slam(dom, log, '[4/7]')
         if args.rviz:
-            launch_rviz(dom, '[5/7]')
+            launch_rviz(dom, '[5/7]',
+                        RVIZ_DRIVE if getattr(args, 'fun', False) else None)
         print('  [6/7] Isaac Sim (~90 s to start'
               + (')...' if args.no_isaac_gui else '; a window will open)...'))
         print('        NOTE /scan lands on 12 Hz by CALIBRATION against a measured but')
@@ -649,7 +654,8 @@ def cmd_start(args):
             launch_slam(dom, log, '[4/6]')
             wait_map(dom, log)
         if args.rviz:
-            launch_rviz(dom, '[5/6]')
+            launch_rviz(dom, '[5/6]',
+                        RVIZ_DRIVE if getattr(args, 'fun', False) else None)
 
     if args.patrol:
         launch_patrol(args, dom, log,
