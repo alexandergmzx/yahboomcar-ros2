@@ -5,33 +5,31 @@
 
 WHAT WAS MEASURED [2026-08-09, bare isaac sessions, consecutive-scan cross-correlation
 against /sim/ground_truth]: the raw stream is a MIXTURE. Most messages are correct
-sensor-frame revolutions -- static pairs match at shift 0 (48/93) or +/-1, and under a
-true 0.42 rad/s turn the per-scan shift sits at -2/-3 deg, which is exactly -d(yaw) --
-but a large minority arrive with their content circularly rotated by ~+/-85 deg with
-rms-after-best-shift ~1.4 m against their neighbours: revolutions assembled with a
-wrong sweep-phase origin. The RTX helper emits ~1.2 messages per render (the measured,
-unexplained 72-per-render-second constant), and the phase seam lands inside some
-messages. SLAM ingests every scan at full confidence, so a quarter-turn-rotated scan
-every few messages smears the map on the first turn -- the reported symptom.
+sensor-frame revolutions -- static pairs match at shift 0, and under a true 0.42 rad/s
+turn the per-scan shift sits at -2/-3 deg, exactly -d(yaw) -- but a large minority
+arrive with their content circularly rotated ~+/-85 deg in BURSTS (36 consecutive
+measured): revolutions assembled with a wrong sweep-phase origin, plausibly at the
+~1.2-messages-per-render emission seam. SLAM ingests every scan at full confidence,
+so the corrupted ones smear the map on the first turn. Session-nondeterministic:
+back-to-back boots measured ~50% corrupted, then 100% clean. Hence a per-scan filter.
 
-Two wrong fixes were tried and measured out before this one:
-  * "the content is world-locked; counter-rotate by true yaw" -- refuted: good scans
-    are already sensor-framed (spawn scan matched an arena raycast at shift +1,
-    rms 0.28 m), so rotating everything by -yaw corrupts the majority to fix nothing.
-  * "the content is mirrored (CW indexing)" -- refuted by the same raycast comparison
-    (mirrored fit was strictly worse).
+WHY THE METRIC IS WALLS-ONLY AND ONE-SIDED [2026-08-10, the fun+patrol lesson]: the
+first version validated against the full arena raycast -- walls AND boxes at their
+canonical spots -- by rms. The boxes are MOVABLE BY DESIGN, and fun mode exists to
+punt them: as soon as a patrol shoved the feather boxes, good scans stopped matching
+the static model and were dropped in bursts, which stuttered the scan display,
+tripped the governor's stale-scan stops, starved SLAM, and sent the rate-feedback
+loop chasing the losses. The walls, by contrast, never move -- and geometry gives a
+one-sided test that box positions cannot touch: a real return may come back SHORTER
+than the wall distance at its azimuth (a box, wherever it currently is) but never
+LONGER, because that is seeing through a wall. Phase-rotated scans mislocate the
+walls themselves, so a large fraction of their beams instantly violate the bound;
+a displaced box can never violate it.
 
-THE FIX: validate, never mutate. Each raw scan is compared against a raycast of the
-shared arena (yahboomcar_sim.arena -- the SAME single-source geometry the USD is built
-from) at the ground-truth pose; scans within threshold pass through UNTOUCHED, the
-phase-corrupted ones are dropped. Dropping lowers the delivered rate, and sim_runner's
-closed-loop rate trim (which measures the REAL /scan downstream of this filter) renders
-faster to hold the 12 Hz contract.
-
-FAIL-OPEN, LOUDLY: if most scans fail validation (wrong/rebuilt arena, robot outside
-the room, geometry drift), filtering disables itself and passes everything through
-with a warning -- a sim session with unfiltered scans beats a sim session with no
-lidar at all, and the /map evidence gates catch the rest.
+FAIL-OPEN, LOUDLY: if ~all scans fail over a long window, the room geometry itself
+does not match yahboomcar_sim.arena (rebuilt USD, robot outside a wall, different
+--size) -- filtering disables itself with an error rather than silently starving
+/scan. Bursts (36 measured) and mixtures (~50%) can never trip it.
 
 Runs in SYSTEM python: rclpy cannot be imported into Isaac's 3.11 interpreter (ABI,
 not path), same as _scan_rate_probe.py. Uses /sim/ground_truth, which is
@@ -54,23 +52,24 @@ from sensor_msgs.msg import LaserScan
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _layout import REPO                                       # noqa: E402
 sys.path.insert(0, os.path.join(REPO, 'yahboomcar_sim'))
-from yahboomcar_sim.arena import default_arena, raycast        # noqa: E402
+from yahboomcar_sim.arena import raycast, segments_room        # noqa: E402
 
 RAW_TOPIC = 'scan_isaac_raw'
 OUT_TOPIC = 'scan'
-# A good scan sits ~0.25 m rms from the arena raycast (USD wall thickness and box
-# faces differ slightly from the segment model); a phase-corrupted one sits ~1.4 m.
-# The distribution is bimodal (p10 0.18 / p90 1.43 measured over a mixture session),
-# so the gate sits in the empty middle.
-RMS_GATE = 0.6
+# One-sided tolerance past the wall. Clean scans sit ~0.02-0.03 m from the raycast
+# (measured), so 0.25 m is ~10 sigma; the corrupted population mislocates walls by
+# ~1.4 m rms. Beams the walls-only model cannot explain UNDER the bound (boxes) are
+# legitimate and ignored.
+BEYOND_WALL_TOL_M = 0.25
+# Fraction of valid beams allowed beyond the wall before the scan is corrupt. A
+# phase-rotated scan violates on a large share of its beams at once; clean scans
+# essentially never do.
+IMPOSSIBLE_GATE = 0.10
 # The RTX pipeline emits -1.0 as a no-return sentinel; a few appear even in good
-# scans. They are excluded from the rms, and a scan that is MOSTLY sentinel is junk
-# on its own.
+# scans. Excluded from the test, and a scan that is MOSTLY sentinel is junk alone.
 MIN_VALID_BEAMS = 200
-# Corrupted scans arrive in BURSTS (36 consecutive was measured), so fail-open must
-# not trip on a burst: it exists for the case where the room geometry itself is wrong
-# (rebuilt USD, robot outside), which fails ~100% of scans, not the ~50% of a bad
-# mixture session. Hence: nearly-total failure over a long window.
+# Fail-open only on near-total failure over a long window: geometry mismatch fails
+# ~100%; corruption bursts (36 measured) and bad mixtures (~50%) never reach this.
 FAIL_OPEN_FRACTION = 0.9
 FAIL_OPEN_WINDOW = 300
 
@@ -80,12 +79,31 @@ def yaw_of(q):
                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 
+def impossible_fraction(ranges, pose, walls):
+    """Fraction of valid beams that return LONGER than the wall at their azimuth.
+
+    -> (fraction, n_valid). Boxes anywhere only ever SHORTEN returns, so this is
+    immune to the movable-box layout; only mislocated geometry (phase corruption)
+    or a wrong room can raise it.
+    """
+    expect = raycast((pose[0], pose[1]), pose[2], walls)
+    got = np.asarray(ranges, dtype=float)
+    valid = np.isfinite(got) & (got > 0.0)
+    n_valid = int(valid.sum())
+    both = np.isfinite(expect) & valid
+    n_both = int(both.sum())
+    if n_both < 90:
+        return 1.0, n_valid
+    frac = float(np.mean(got[both] > expect[both] + BEYOND_WALL_TOL_M))
+    return frac, n_valid
+
+
 class ScanFilter(Node):
     def __init__(self):
         super().__init__('scan_frame_relay')
         self._lock = threading.Lock()
         self._pose = None                   # (x, y, yaw), newest truth
-        self._segs = default_arena()
+        self._walls = segments_room()
         self._recent = []                   # last FAIL_OPEN_WINDOW pass/fail bools
         self._fail_open = False
         self._dropped = 0
@@ -102,39 +120,29 @@ class ScanFilter(Node):
             self._pose = (m.pose.pose.position.x, m.pose.pose.position.y,
                           yaw_of(m.pose.pose.orientation))
 
-    def _rms_vs_arena(self, ranges, pose):
-        expect = raycast((pose[0], pose[1]), pose[2], self._segs)
-        got = np.asarray(ranges, dtype=float)
-        # -1.0 is the RTX no-return sentinel, not a range; treat it as invalid.
-        valid = np.isfinite(got) & (got > 0.0)
-        if valid.sum() < MIN_VALID_BEAMS:
-            return float('inf')
-        both = np.isfinite(expect) & valid
-        if both.sum() < 90:
-            return float('inf')
-        return float(np.sqrt(np.mean((got[both] - expect[both]) ** 2)))
-
     def _on_scan(self, m):
         with self._lock:
             pose = self._pose
         if pose is None:
             return                          # no truth yet (first ~100 ms)
         if not self._fail_open:
-            ok = self._rms_vs_arena(m.ranges, pose) < RMS_GATE
+            frac, n_valid = impossible_fraction(m.ranges, pose, self._walls)
+            ok = n_valid >= MIN_VALID_BEAMS and frac <= IMPOSSIBLE_GATE
             self._recent.append(ok)
             del self._recent[:-FAIL_OPEN_WINDOW]
             if (len(self._recent) == FAIL_OPEN_WINDOW and
                     self._recent.count(False) > FAIL_OPEN_FRACTION * FAIL_OPEN_WINDOW):
                 self._fail_open = True
                 self.get_logger().error(
-                    'most scans fail arena validation -- the room geometry does not '
-                    'match yahboomcar_sim.arena (rebuilt USD? robot out of the room?). '
-                    'FILTERING DISABLED; /scan is now unfiltered raw.')
+                    'nearly all scans see through the walls of the room model -- the '
+                    'geometry does not match yahboomcar_sim.arena (rebuilt USD? robot '
+                    'outside the room? different --size?). FILTERING DISABLED; /scan '
+                    'is now unfiltered raw.')
             if not ok:
                 self._dropped += 1
                 if self._dropped in (1, 10) or self._dropped % 200 == 0:
                     self.get_logger().info(
-                        f'dropped {self._dropped} phase-corrupted scans '
+                        f'dropped {self._dropped} corrupted scans '
                         f'({self._passed} passed)')
                 return
         self._passed += 1
