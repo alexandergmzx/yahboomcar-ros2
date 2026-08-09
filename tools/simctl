@@ -58,6 +58,7 @@ import time
 # 2026-08-08 audit found 18 tools with private stale copies): see tools/_layout.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _layout import REPO, WS_SETUP, ASSETS, USD_DIR, _first_existing     # noqa: E402
+from _dds_shm import stale_segments                              # noqa: E402
 RVIZ_SLAM = _first_existing([
     os.path.join(REPO, 'yahboomcar_config', 'rviz', 'slam_debug.rviz'),
     os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_nav', 'rviz',
@@ -210,37 +211,9 @@ def running(patterns, domain=None):
     return pids
 
 
-def _mapped_shm_files():
-    """Every /dev/shm file currently mapped by a live process."""
-    live = set()
-    for maps in glob.glob('/proc/[0-9]*/maps'):
-        try:
-            with open(maps) as f:
-                for line in f:
-                    i = line.find('/dev/shm/')
-                    if i != -1:
-                        live.add(line[i:].strip())
-        except OSError:
-            continue          # process exited, or not ours to read
-    return live
-
-
-def stale_segments():
-    """Segments NO live process is using. The word 'stale' has to be earned.
-
-    This used to glob every /dev/shm/fastrtps* unconditionally, so `simctl stop` deleted
-    the shared memory of simulations it was not stopping. Demonstrated: with Isaac
-    running on domain 66, `simctl stop --domain 67` removed 147 segments and Isaac's
-    /scan went from 12.9 Hz to SILENT while its process stayed alive -- DDS transport
-    destroyed under a running participant, with nothing logged anywhere.
-
-    That is the same defect the domain-scoped kill was added to fix: an operation whose
-    blast radius exceeds its stated scope. Scoping the kills and leaving this global just
-    moved the problem somewhere quieter.
-    """
-    all_segs = glob.glob('/dev/shm/fastrtps*') + glob.glob('/dev/shm/sem.fastrtps*')
-    live = _mapped_shm_files()
-    return [s for s in all_segs if s not in live]
+# stale_segments()/_mapped_shm_files() moved to tools/_dds_shm.py (2026-08-10) when
+# replay_slam_bag.py needed the same logic and started out with an unscoped copy of it.
+# The incident that made staleness something to EARN is recorded there.
 
 
 def _tail(path, n=15):
