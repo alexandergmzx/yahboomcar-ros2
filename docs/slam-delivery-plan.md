@@ -186,7 +186,14 @@ Forbidden before completion: "physical SLAM works" · "a map was delivered" with
 committed `.pgm`/`.yaml` and run report · "HuberLoss improved SLAM" without same-bag A/B
 scores outside repeatability noise · "tested against real slip" when the run used
 simulator injection or an elevated chassis · "RViz is green, therefore SLAM works" ·
-"map size is correct, therefore the map is good".
+"map size is correct, therefore the map is good" · **a map from a `--fun` session, or
+any session driven into walls, is not a delivery artifact** — fun-mode SLAM exists so
+there is something to watch while driving, and its map is a picture, not evidence.
+
+One note on RViz specifically, since "RViz is green" is on the forbidden list:
+`tools/check_rviz_render.py` proves a display is **on the screen**, by pixels. That is
+strictly a rendering fact. It says nothing about whether the map is correct — which is
+`tools/score_slam_map.py`'s job, against tape measurements.
 
 ## Handoff format
 
