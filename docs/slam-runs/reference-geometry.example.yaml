@@ -1,0 +1,47 @@
+# Reference geometry: what a TAPE MEASURE says about the room, recorded BEFORE the run.
+#
+# This file is the ground truth `tools/score_slam_map.py` scores a map against. It must
+# be measured and written down before mapping, not fitted afterwards to whatever the map
+# produced -- a reference derived from the artifact under test measures nothing.
+#
+# Copy this to docs/slam-runs/<room>-reference.yaml and replace every number.
+#
+# The numbers below describe a HYPOTHETICAL room and are here to document the schema,
+# so scoring a map of some other room against this file will (correctly) fail rows.
+# For a self-consistent pass, see `./tools/score_slam_map.py --self-test`.
+
+# ---------------------------------------------------------------------- spans
+# Outer wall extents. `axis` is the map axis the span runs along: x = width
+# (columns), y = depth (rows). The scorer measures the occupied-cell extent along
+# that axis, which is valid for the outer walls of a CONVEX room and NOT valid for an
+# L-shaped or heavily cluttered one -- say so in the run report if the room is not
+# convex, rather than quietly scoring the wrong thing.
+#
+# Tolerance is max(0.15 m, 5%) per span, from the acceptance table.
+spans:
+  - name: north_south_depth
+    axis: y
+    metres: 4.02          # tape, wall face to wall face
+  - name: east_west_width
+    axis: x
+    metres: 3.98
+
+# -------------------------------------------------------------------- features
+# A gap in one outer wall -- a doorway, or a deliberate opening. The scorer finds the
+# largest interior gap in the named wall band and compares width (and offset, if given)
+# to 0.15 m.
+#
+# side: min_y | max_y | min_x | max_x  -- which outer wall the feature is in.
+# offset_m: distance from the LOW end of that wall to the near edge of the gap.
+features:
+  - name: doorway
+    side: max_y
+    width_m: 0.82
+    offset_m: 1.20
+
+# ------------------------------------------------------------------- obstacles
+# Free-text notes for the run report. The scorer does not read these; they exist so a
+# later reader can tell whether the room was the same room.
+notes: |
+  Two cardboard boxes, 0.30 m cube, at roughly (1.4, 1.4) and (-1.3, -1.4) from the
+  taped start pose. Chair legs removed. Floor is hard tile.

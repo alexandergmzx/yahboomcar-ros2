@@ -1,0 +1,45 @@
+# Run facts: what HAPPENED during one physical mapping run.
+#
+# Written after the run, from measurements and logs -- not from impressions.
+# `tools/score_slam_map.py --run-facts` scores the loop-closure and runtime-health rows
+# from this file.
+
+# ------------------------------------------------------------- loop closure
+# The car starts and ends at the SAME taped pose. These are the errors SLAM reported
+# against that physical fact:
+#   position_error_m  = distance between the map pose at the end and the map pose at the
+#                       start, given the chassis is physically back on the tape.
+#   heading_error_deg = same, for yaw.
+# Acceptance: <= 0.10 m and <= 5 deg.
+loop_closure:
+  position_error_m: 0.04
+  heading_error_deg: 1.2
+  # How the physical return was judged. "eyeball" is a legitimate answer and must be
+  # recorded as one -- it bounds how much the number above can be trusted.
+  method: taped outline, chassis corners realigned by eye
+
+# ----------------------------------------------------------- runtime health
+# From the SLAM log for this run.
+#   queue_overflows_after_warmup: count of "message filter dropping ... queue is full"
+#                                 lines after the first 10 s. Acceptance: 0.
+#   map_updates:                  how many times /map was published during motion.
+runtime_health:
+  queue_overflows_after_warmup: 0
+  map_updates: 220
+  warmup_seconds: 10
+
+# ------------------------------------------------------------------ context
+# Not scored; required by the run report so a result can be reproduced or discounted.
+context:
+  git_sha: ""                  # git rev-parse HEAD at run time
+  ros_distro: jazzy
+  domain_id: 20
+  battery_volts_start: 8.3
+  battery_volts_end: 8.1
+  params_sha256: ""            # sha256sum of the slam_toolbox params file used
+  ekf_config: ekf_corrected.yaml
+  bag_sha256: ""
+  wall_clock_start: ""
+  wall_clock_end: ""
+  gyro_check: ""               # sensor_health.py --rotate-test verdict, THIS boot
+  motion: manual push          # manual push | governed teleop | other
