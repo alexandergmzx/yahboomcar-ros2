@@ -532,6 +532,10 @@ def cmd_start(args):
               '--backend isaac;')
         print('  the 2d backend has no contact physics. Drive with: '
               './tools/simctl teleop')
+        print('  SPEED: the vendor keyboard STARTS AT 0.2 m/s -- press q repeatedly '
+              'to raise')
+        print('  it toward the 1.0 m/s cap (each press +10%). Slow fun is usually '
+              'just this.')
 
     # Discovery remains as the SECOND layer, for a car provisioned onto another domain.
     print('  checking who is on this domain (up to ~15 s)...')
@@ -899,6 +903,11 @@ def cmd_teleop(args):
         # Clear anything they latched before the keyboard takes over.
         zero_domain(args.domain, seconds=2.0)
         print('  silenced; the keyboard is now the only command source')
+
+    # The single most common "the car is slow" report is the vendor keyboard's own
+    # start speed, not any governor: it begins at 0.2 m/s / 1.0 rad/s and q raises
+    # both 10% per press (its own limits: 1.0 / 5.0).
+    print("  keyboard starts at 0.2 m/s -- press q repeatedly to go faster")
 
     gov_up = bool(running(['cmd_vel_governor'], domain=args.domain))
     if args.direct and gov_up:
