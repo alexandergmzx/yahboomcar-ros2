@@ -91,12 +91,64 @@ rviz:=true`.
 SLAM on the REAL car (hand-push walk first, then governed teleop):
 `docs/floor-slam-session.md`, nested in `docs/first-floor-procedure.md`.
 
+## Physical SLAM is NOT delivered — read the contract before tuning
+
+`docs/slam-delivery-plan.md` is binding. **No physical map exists yet.** A green RViz,
+an active lifecycle node, a `/map` publisher, a simulator map, or a parameter that
+loaded is not acceptance evidence, and the previous pass was rejected for presenting
+exactly those. Before changing a SLAM parameter, run the gates in that document, in
+order; the tooling for them is `tools/slam_preflight.py` (TF/timing, gate 2),
+`tools/score_slam_map.py` (map usefulness, gate 6 — it rejects the 14–18-pixel map that
+shipped before), and `tools/replay_slam_bag.py` (same-bag A/B, gate 7). Run reports go
+in `docs/slam-runs/`, failed attempts included. Final handoffs on SLAM lead with
+`DELIVERED`, `NOT DELIVERED`, or `BLOCKED ON HARDWARE`.
+
 Evidence style is this repo's export: measured vs assumed marked, negative
 results in bold, rejected alternatives recorded. The fleet added bracket
 tags and D/OI/R ids; both conventions apply here going forward.
 
-## Working agreements
+## Unattended sessions (operator asleep/away) — hard rules
 
-- **Night/autonomous sessions NEVER push to remote.** Commit locally,
-  explicit `git add` paths only; pushing happens only with Alex present
-  (rule set 2026-08-09).
+These bind ANY session running without an operator who can answer. If unsure
+whether a rule applies: it applies. They rank above task completion — a task
+finished by breaking one of these is a failed task.
+
+- **git is local-only tonight. `git push` does not exist.** No pushes, no PRs,
+  no remote branch creation, no fetching-and-merging. Remotes are
+  human-reviewed surfaces; nothing unreviewed leaves this machine. Morning
+  review decides what publishes.
+- **History is append-only.** New branch per session (`<purpose>-<date>`),
+  one concern per commit, finding/OI IDs in messages. Never amend, rebase,
+  `reset --hard`, `clean -fd`, or delete branches. A wrong commit is repaired
+  by a new commit that says it repairs it.
+- **A commit is a reliable checkpoint or it doesn't happen.**
+  `colcon build --packages-select <touched>` plus the touched packages' tests
+  green BEFORE each commit. Work that can't reach green stays uncommitted in
+  the tree and is reported in the handoff doc — never committed "to save it".
+  Session ends with a clean tree or a documented dirty one, nothing silent.
+- **Isaac Sim is single-occupancy, machine-wide.** Two instances can take
+  down the whole PC — killing every other session's work, not just yours.
+  Before any `simctl start --backend isaac`: acquire `/tmp/fleet-isaac.lock`
+  (write PID + session name; a lock whose PID is dead is stale and may be
+  removed) AND verify no kit/isaac process is running. If busy: poll every
+  5 min for max 45 min, then PARK every isaac-dependent task and continue
+  with what doesn't need the GPU. Never launch a second instance to "check".
+  On session end and on EVERY failure path: `simctl stop`, verify the
+  process actually died, release the lock. Orphaned kit processes hold GPU
+  memory for the next victim.
+- **Domain hygiene**: scratch ROS_DOMAIN_ID per concurrent session (67/69
+  convention). Domain 20 is the hardware fleet domain — never used unattended.
+- **No hardware while unattended.** No flashing, no serial, no GPIO, nothing
+  past `--dry-run`. Hardware requires the operator's hands within reach of
+  the power switch (floor rules, D-08 consequence).
+- **Resource check before long jobs.** Free disk before bag recording (cap
+  and split bags — an unbounded bag fills the disk by 4am); free RAM before
+  sim bringup (the 3-robot stack is ~1.75 GB [measured]).
+- **Bounded retries.** The same command failing twice for the same reason
+  closes that path: record it, move on. No retry loops.
+- **Park, don't decide.** Judgment calls (safety semantics, OI status,
+  anything touching D-nn/R-nn, preference questions) go to the handoff doc's
+  "morning decisions" list. Evidence tags and OI-close rules apply at
+  3am exactly as at 3pm.
+- **The handoff doc is the one mandatory deliverable** — written even when,
+  especially when, the session fails early.
