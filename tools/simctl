@@ -375,9 +375,21 @@ def start_robot2(args, dom, log):
 # orders (2d: robot first; isaac: everything light first, Isaac last), and duplicating
 # the blocks per order is exactly how the 18-stale-copies audit finding happened.
 def launch_safety(args, dom, log, step):
-    print(f'  {step} safety governor + deadman...')
-    sh('ros2 launch yahboomcar_safety safety_launch.py '
-       f'max_speed:={args.max_speed}', dom,
+    fun = getattr(args, 'fun', False)
+    print(f'  {step} safety governor + deadman'
+          + (' (FUN preset: obstacle braking OFF)...' if fun else '...'))
+    if fun:
+        # A PRESET, not a bypass: with stop/slow at 0 the obstacle stop, slow zone
+        # and near-yaw gate are mathematically unreachable (min_range is always
+        # > min_valid_range, so `min_range <= 0` never fires -- governor.py rules
+        # 6-7), while the deadman, the stale-scan stop, the empty-sector stop and
+        # the single-writer teleop discipline all stay live. Caps go to the
+        # firmware-acceptance maxima (assumed, vendor keyboard defaults).
+        extra = ('stop_distance:=0.0 slow_distance:=0.0 max_speed:=1.0 '
+                 'max_yaw:=5.0 max_reverse_speed:=1.0')
+    else:
+        extra = f'max_speed:={args.max_speed}'
+    sh(f'ros2 launch yahboomcar_safety safety_launch.py {extra}', dom,
        log=os.path.join(log, 'simctl-safety.log'))
     time.sleep(8)
 
@@ -487,6 +499,35 @@ def cmd_start(args):
         print(f'REFUSED: domain {dom} is the CAR\'S domain, structurally off-limits')
         print(f'  to simulators. The simulator belongs on {SIM_DOMAIN}.')
         return 2
+
+    # Flag conflicts are structural too: refused before the discovery dwell.
+    if getattr(args, 'fun', False):
+        if getattr(args, 'robot', 'robot1') == 'robot2':
+            print('REFUSED: --fun is a robot1 session flag; the robot2 flow is '
+                  'unchanged.')
+            return 2
+        # FUN MODE is a governor PRESET, never a governor bypass: --no-safety would
+        # drop the deadman and the single-writer teleop discipline along with the
+        # braking, and that is not what fun means.
+        if not args.safety:
+            print('REFUSED: --fun together with --no-safety. Fun mode IS the '
+                  'governor (braking off,')
+            print('  deadman kept). Drop one of the two flags.')
+            return 2
+        if args.patrol:
+            args.patrol = False
+            print('  FUN MODE: patrol suppressed -- fun is a DRIVING mode, and an '
+                  'autonomous patrol')
+            print('  with obstacle braking off is just a wall-grinder.')
+        print('  *** FUN MODE (simulation only) ***')
+        print('  Obstacle braking OFF, caps at the firmware maxima (1.0 m/s fwd and '
+              'reverse,')
+        print('  5.0 rad/s yaw; --max-speed is overridden). The deadman stays armed '
+              'and a')
+        print('  stale scan still stops the robot. Real collisions only on '
+              '--backend isaac;')
+        print('  the 2d backend has no contact physics. Drive with: '
+              './tools/simctl teleop')
 
     # Discovery remains as the SECOND layer, for a car provisioned onto another domain.
     print('  checking who is on this domain (up to ~15 s)...')
@@ -930,6 +971,12 @@ def main():
     s.add_argument('--slip', type=float, default=0.0)
     s.add_argument('--max-speed', type=float, default=0.35,
                    help='governor forward cap, m/s. Default mirrors the floor\n                         safety value; raise for a faster sim session, e.g. 1.0.\n                         The sim firmware itself accepts up to 1.0 (assumed).')
+    s.add_argument('--fun', action='store_true',
+                   help='obstacle braking OFF, speed caps at the firmware maxima\n'
+                        '                         (overrides --max-speed); deadman '
+                        'stays armed, patrol is\n'
+                        '                         suppressed. Real collisions only '
+                        'on --backend isaac.')
     s.add_argument('--no-rviz', dest='rviz', action='store_false')
     s.add_argument('--no-slam', dest='slam', action='store_false')
     s.add_argument('--no-safety', dest='safety', action='store_false')

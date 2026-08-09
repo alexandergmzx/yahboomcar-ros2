@@ -107,6 +107,21 @@ its lifecycle manager bonds with a 30 s timeout, and under fleet-session load th
 falsely timed out and kill/respawned SLAM mid-session (D-19) — use the canonical launch
 above, whose manager runs bond-free.
 
+### Fun mode
+
+```bash test:skip
+./tools/simctl start --backend isaac --fun     # then:  ./tools/simctl teleop
+```
+
+Obstacle braking OFF (the governor's stop/slow distances go to 0, making the obstacle
+rules unreachable), speed caps at the firmware maxima (1.0 m/s forward **and**
+reverse, 5.0 rad/s yaw). It is a governor *preset*, not a bypass: the deadman stays
+armed, a stale scan still stops the robot, and teleop keeps the single-writer
+discipline. The patrol is suppressed — fun is a driving mode. Real collisions (the
+0.12 kg cardboard boxes shove satisfyingly) exist only on the isaac backend; the 2D
+simulator has no contact physics. Simulation-only by construction: `simctl` refuses
+the car's domain structurally, and the hardware launch defaults are untouched.
+
 The arena defaults to the planned 4×4 m room with four 0.3 m boxes near the corners,
 defined once in `yahboomcar_sim/arena.py` and imported by `tools/arena_observability.py`
 AND `tools/build_arena.py` (the Isaac room), so the backends cannot drift apart. They
