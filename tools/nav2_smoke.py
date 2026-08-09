@@ -293,6 +293,7 @@ def main():
                 if cli.wait_for_service(timeout_sec=5.0):
                     rounds = 0
                     hard_cap = time.time() + 60.0
+                    zero_since = None
                     while time.time() < hard_cap:
                         fut = cli.call_async(CancelGoal.Request())   # zero UUID = all
                         tc = time.time()
@@ -304,9 +305,19 @@ def main():
                             say(f'  round {rounds}: cancelling '
                                 f'{len(resp.goals_canceling)} goal(s)')
                         time.sleep(2.0)
+                        # A zero-active reading is necessary but NOT sufficient: a
+                        # goal that has not been ACCEPTED yet has no status entry at
+                        # all, so the first zero can precede a late acceptance and
+                        # the loop used to exit straight through that window
+                        # (2026-08-09 audit). Exit only once zero-active has HELD
+                        # across 10 s of continued cancel-alls.
                         if live_status['active'] == 0:
-                            acked = True
-                            break
+                            zero_since = zero_since or time.time()
+                            if time.time() - zero_since >= 10.0:
+                                acked = True
+                                break
+                        else:
+                            zero_since = None
                     say(f'  cancel-all: {rounds} round(s); status array shows '
                         + ('NO live goals' if acked else
                            f'{live_status["active"]} live/unknown -- UNCONFIRMED, '
@@ -381,6 +392,23 @@ def main():
         say(f'  *** STILL MOVING: /odom_raw peak {peak:.3f}. Power switch. ***')
         return False
 
+    # Signal handlers go in BEFORE the send, not after acceptance: a Ctrl+C during
+    # the 10 s send wait followed by a LATE acceptance left a driving goal owned by
+    # nobody -- the handler installation itself was inside the race window
+    # (2026-08-09 audit). Before acceptance there is no handle yet, so the handler
+    # runs the same cancel-all path the send-timeout uses; after acceptance the
+    # mutable reference points at the real handle.
+    live = {'handle': None}
+
+    def on_signal(signum, _frame):
+        say(f'\n  signal {signum} with a goal pending or live')
+        cancel_and_verify(live['handle'], f'interrupted by signal {signum}')
+        sys.stdout.flush()
+        os._exit(143 if signum == signal.SIGTERM else 130)
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, on_signal)
+
     send = client.send_goal_async(goal)
     t0 = time.time()
     while not send.done() and time.time() - t0 < 10.0:
@@ -396,18 +424,7 @@ def main():
         say('  FAIL: goal REJECTED by the action server')
         return 1
     say('  goal accepted')
-
-    # From here a goal is LIVE. Ctrl+C or SIGTERM used to exit this process outright,
-    # leaving Nav2 navigating with no governor and no deadman -- walking away from a
-    # moving robot. Both now cancel first. Audit finding.
-    def on_signal(signum, _frame):
-        say(f'\n  signal {signum} while a goal is live')
-        cancel_and_verify(handle, f'interrupted by signal {signum}')
-        sys.stdout.flush()
-        os._exit(143 if signum == signal.SIGTERM else 130)
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, on_signal)
+    live['handle'] = handle
 
     result_future = handle.get_result_async()
     try:
