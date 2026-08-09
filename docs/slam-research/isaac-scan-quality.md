@@ -76,6 +76,39 @@ fail-open bar; gate 0.6 splits p10 0.18 from p90 1.43), but the burst-drop behav
 under SLAM should be confirmed the next time a session boots corrupted:
 `grep dropped` in the relay's output, and the map gate below.
 
+## The vanishing near field (2026-08-09 night session): minDistBetweenEchosM
+
+Alex's report from the teleop seat — "the range of stuff being close is too short" —
+measured out as a NEAR-FIELD collapse, not a far-range cutoff. Valid-return fraction
+vs true distance (headless, robot parked at a wall, ~65 static scans per row, compared
+per-beam against the shared-arena raycast at the truth pose):
+
+| expected distance | baseline valid | after fix |
+|---|---|---|
+| 0.0–0.5 m | **9.2%** | **89.1%** |
+| 0.5–1.0 m | 68.6% | 62.9% |
+| 1.0–4.5 m | 83–91% | 84–92% |
+| overall | 57.0% | 88.1% |
+
+The knob: **`omni:sensor:Core:minDistBetweenEchosM`, LidarCore default 0.4 m** — under
+it, beams with true range below ~0.5 m came back as the −1 sentinel and close
+obstacles simply vanished from `/scan`. Authored to 0.05 in `build_arena.author_lidar`
+(read-back enforced like the other 15 parameters). `nearRangeM=0.12` alone does not
+govern this. Found by dumping the full `omni:sensor:*` attribute inventory from the
+USD with bare pxr (no SimulationApp needed — note for future hunts:
+`omni.usd.libs-*/` from the extscache on `PYTHONPATH` plus the interpreter's
+`libpython` dir on `LD_LIBRARY_PATH`).
+
+Also measured on the way:
+
+- **`tickRate` 10→60 changed nothing** (87.5% vs 88.1%, noise) — reverted.
+- The residual ~10% dropout, uniform across distance, remains OPEN (real device:
+  ~355/360 ≈ 98.6% valid). Suspected of living with the message-assembly seam
+  (`skipDroppingInvalidPoints=True` keeps invalid points as −1 in the fixed 360
+  array).
+- A GUI session showed ~25 points MORE dropout at every distance than headless —
+  GPU contention degrades the sensor sim, not just the frame rate. Measure headless.
+
 ## Related observations, out of scope here
 
 - Achieved body yaw rate at a fixed commanded 0.5 rad/s varied 0.48 / 0.18 / 0.05

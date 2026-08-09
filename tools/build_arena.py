@@ -118,6 +118,14 @@ def author_lidar(stage, base_path, Gf, Vt, say, break_it=False,
         P + 'nearRangeM': range_min,
         P + 'farRangeM': range_max,
         P + 'maxReturns': 1,
+        # The LidarCore default is 0.4 m, and it does not mean what its name says
+        # here: with it at 0.4, beams whose true range was under ~0.5 m returned
+        # the -1 no-return sentinel 91% of the time [measured 2026-08-09, headless,
+        # robot at a wall] -- close obstacles simply vanished from /scan, which is
+        # exactly what an operator sees as "stuff close has no range". At 0.05 the
+        # near bin recovered to 89% valid and nothing else moved (overall validity
+        # 57% -> 88%). nearRangeM alone does NOT govern this; both are needed.
+        P + 'minDistBetweenEchosM': 0.05,
         # ROS LaserScan sweeps upward from angle_min, i.e. counter-clockwise.
         P + 'rotationDirection': 'CCW',
         P + 'scanType': 'ROTARY',
