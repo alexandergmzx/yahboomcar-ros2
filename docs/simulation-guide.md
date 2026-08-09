@@ -123,8 +123,10 @@ by construction: `simctl` refuses the car's domain structurally, and the hardwar
 launch defaults are untouched.
 
 Fun sessions open the **drive view** (`yahboomcar_config/rviz/drive.rviz`): a
-chase camera following `base_footprint`, whose fixed frame exists from the first
-second of bringup, so the view is never red. If `arena_fun.usd` exists, fun isaac
+chase camera following `base_footprint`, anchored to the `odom` world frame so the
+scan stays glued to the world while the camera follows the car (a robot-anchored
+fixed frame made the scan swim against the map — measured and reverted). simctl
+opens RViz only once `/odom` is flowing, so the view is never red. If `arena_fun.usd` exists, fun isaac
 sessions load it — **feather boxes** (0.02 kg vs the calibrated 0.12): the car
 punches through at full speed (zone entry measured at 1.05 m/s, penetration to
 0.07 m of the box centre). Build it once:

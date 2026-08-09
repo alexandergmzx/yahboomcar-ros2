@@ -18,7 +18,9 @@ Visualization Manager:
       Cell Size: 0.5
       Plane Cell Count: 16
       Color: 70; 70; 80
-      Reference Frame: <Fixed Frame>
+      # The grid rides with the car (world-aligned, robot-centred) so there is
+      # always floor under the chase camera without the grid swimming.
+      Reference Frame: base_footprint
 
     # ---- the car -----------------------------------------------------------------
     - Class: rviz_default_plugins/RobotModel
@@ -64,13 +66,16 @@ Visualization Manager:
 
   Enabled: true
   Global Options:
-    # base_footprint EXISTS FROM THE FIRST SECOND: it comes from bringup's static
-    # transform, before any sensor publishes. That is the whole point -- `map` needs
-    # SLAM (minutes on an Isaac boot) and `odom` needs the EKF's first output, and
-    # either leaves RViz sitting in a red "frame does not exist" state that reads as
-    # broken. A robot-centric fixed frame is also the honest choice for a DRIVE
-    # view: you are the car; the world moves around you.
-    Fixed Frame: base_footprint
+    # `odom`, a WORLD frame -- not base_footprint (tried, wrong, reverted): RViz
+    # renders every display relative to the fixed frame's CURRENT pose but
+    # transforms scans at their message stamp, so a fixed frame bolted to the robot
+    # makes each scan up to one scan-period stale against the robot's own motion --
+    # at fun-mode yaw rates that is tens of degrees of swing per frame, scan and map
+    # visibly disagreeing (Alex's report, 2026-08-10). The chase camera does NOT
+    # need a moving fixed frame; following the robot is entirely the view's
+    # Target Frame doing its job. simctl opens this view only after /odom is
+    # flowing, so the frame always exists by the time anyone looks.
+    Fixed Frame: odom
     Background Color: 34; 36; 43
     Frame Rate: 30
   Tools:

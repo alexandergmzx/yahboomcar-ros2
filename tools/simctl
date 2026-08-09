@@ -562,13 +562,14 @@ def cmd_start(args):
         #
         # BOOT ORDER (2026-08-08, Alex): the LIGHT components first, Isaac LAST.
         # Everything in the stack is subscription-driven and idles harmlessly until
-        # the firmware topics exist, so nothing is gained by staring at a blank
-        # desktop for Isaac's ~90-420 s load. RViz comes up in seconds and becomes
-        # the visible progress bar: RobotModel appears when bringup publishes the
-        # description, the scan and map displays sit empty/red until Isaac and SLAM
-        # feed them -- that is the boot order made visible, not a fault. Patrol
-        # still comes ABSOLUTELY LAST: the firmware model latches the last command,
-        # so commands must not accumulate before the robot exists.
+        # the firmware topics exist. RViz, however, opens only AFTER the stack wait:
+        # both views anchor to `odom` (a world frame -- a moving fixed frame makes
+        # scans swim against the map, measured and reverted 2026-08-10), and the EKF
+        # cannot produce `odom` until the firmware speaks, so an early RViz is
+        # minutes of a red "frame does not exist" -- the original complaint. The
+        # terminal prints are the boot progress. Patrol still comes ABSOLUTELY
+        # LAST: the firmware model latches the last command, so commands must not
+        # accumulate before the robot exists.
         isaac_py = os.path.expanduser('~/isaac/env_isaaclab/bin/python')
         if not os.path.exists(isaac_py):
             # Checked BEFORE anything launches: failing here used to leave nothing
@@ -586,10 +587,7 @@ def cmd_start(args):
             # Activates via its own lifecycle manager and then idles until /scan
             # exists; the /map evidence wait happens after Isaac is up.
             launch_slam(dom, log, '[4/7]')
-        if args.rviz:
-            launch_rviz(dom, '[5/7]',
-                        RVIZ_DRIVE if getattr(args, 'fun', False) else None)
-        print('  [6/7] Isaac Sim (~90 s to start'
+        print('  [5/7] Isaac Sim (~90 s to start'
               + (')...' if args.no_isaac_gui else '; a window will open)...'))
         print('        NOTE /scan lands on 12 Hz by CALIBRATION against a measured but')
         print('        unexplained 72-messages-per-render-second emission rate, not by')
@@ -657,10 +655,15 @@ def cmd_start(args):
         return 1
 
     if args.backend == 'isaac':
-        # The light components were all started BEFORE Isaac; the one thing that could
-        # not exist until the robot did is the SLAM output evidence.
+        # The light components were all started BEFORE Isaac. What could not exist
+        # until the robot did: the SLAM output evidence, and RViz -- which opens only
+        # now because both views anchor to `odom`, a frame the EKF cannot produce
+        # until the firmware speaks (see the boot-order comment above).
         if args.slam:
             wait_map(dom, log)
+        if args.rviz:
+            launch_rviz(dom, '[6/7]',
+                        RVIZ_DRIVE if getattr(args, 'fun', False) else None)
     else:
         if args.safety:
             launch_safety(args, dom, log, '[2/6]')
