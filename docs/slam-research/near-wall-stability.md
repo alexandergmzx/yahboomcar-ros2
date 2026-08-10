@@ -1,0 +1,268 @@
+# Near-wall SLAM stability: the mechanism, the survey, and the same-bag A/B
+
+**2026-08-10 afternoon. Context:** with rotation behaving at operator speeds, Alex's
+fun-mode sessions now destabilize when the robot gets close to a wall ("went really
+good until I got too close to a wall"). This document is the survey of the numeric
+methods that exist for exactly this failure, the measurement of which mechanism is
+actually active in this stack, and the same-bag A/B that tests the candidate fixes.
+Style per house rules: measured vs assumed marked, negative results in bold,
+rejected/failed arms kept.
+
+## The failure, located and measured
+
+`tools/…/wall_moment_probe.py` (scratchpad; preserved with the run artifacts) over
+three bags — Alex's organic run and two controlled wall-approach sessions (scripted
+approach → wall-follow → retreat, closed-loop on truth, governed via /cmd_vel_raw):
+
+| bag | worst map→odom jump | at wall distance | jumps >50 mm |
+|---|---|---|---|
+| organic `20260810-125354` | **746 mm / 21.0°** at t=204.6 s | 0.367 m | 5 |
+| controlled A `20260810-131057` | **3308 mm / 31.5°** | 0.085 m | — |
+| controlled B `20260810-131558` | **1875 mm / 20.8°** | 0.098 m | — |
+
+The coupling with wall distance is monotonic (organic bag, 600-scan sample):
+
+| truth dist to wall | scans | valid beams (med) | isotropy (med) | map→odom jump p95 |
+|---|---|---|---|---|
+| 1.0–2.0 m | 465 | 358 | 0.962 | 40 mm |
+| 0.6–1.0 m | 24 | 355 | 0.812 | 62 mm |
+| 0.3–0.6 m | 112 | 348 | **0.711** | **71 mm (max 746)** |
+| <0.3 m | 13 | 345 | 0.657 | 35 mm* |
+
+*the <0.3 m row is 13 scans; the catastrophic jump landed in the 0.3–0.6 band as the
+robot crossed it.
+
+**Beam starvation is substantial under sustained proximity but still not the
+driver [measured, corrected by the verification pass]**: the organic bag's
+brief pass kept ~345/358 valid beams, but the controlled contact bags lose
+32–41% of beams in the <0.3 m band (medians 211 and 243 of 358). Even so,
+200+ beams keep seeing the other three walls — enough constraint that pure
+starvation cannot explain a metre-scale re-anchor. What degrades alongside is
+the constraint GEOMETRY (normals isotropy 0.96 → 0.66) and, under ~0.12 m
+(`range_min`), the near wall's returns die entirely while the far walls
+remain — the scan is then consistent with a family of poses slid along the
+invisible wall.
+
+## Survey: what the field does about this
+
+- **Eigenvalue degeneracy sensing** (Zhang & Singh's line;
+  [real-time degeneracy sensing & compensation](https://arxiv.org/html/2412.07513),
+  [DARE-SLAM](https://arxiv.org/pdf/2102.05117)): eigendecompose the match
+  Hessian/covariance; treat directions whose eigenvalue drops below a floor as
+  unobservable — don't update along them, or inflate their covariance.
+  **This repo already implements exactly this** in
+  `yahboomcar_localization/laser_odometry_node.py` (covariance inflated along the
+  weak eigenvector, degenerate matches dropped, not published) — but it protects
+  only `/odom_laser`, which no sim path fuses. slam_toolbox has no equivalent.
+- **Degeneration-aware weighting** (same survey line): dynamically RAISE the
+  motion-prior weight when scan geometry is degenerate — i.e., the penalty terms
+  are the knob that already exists in slam_toolbox
+  ([params reference](https://github.com/SteveMacenski/slam_toolbox/blob/ros2/README.md)).
+- **Pre-filtering**: range floors and speckle/footprint filters ahead of the
+  matcher ([laser_filters practice](https://johntgz.github.io/2022/01/09/the_ultimate_guide_to_laser_filters/));
+  in-toolbox, `min_pass_through` suppresses speckle at the occupancy layer — the
+  escalation `docs/slam-research/findings.md` §4d pre-authorized and nobody had
+  tried yet.
+
+## The stack-specific insight: the penalty rationale has inverted
+
+`slam_toolbox.yaml`'s penalty block is deliberately LOOSE
+(`distance_variance_penalty 0.3` / `angle_variance_penalty 0.6` vs stock 0.5/1.0),
+documented as "odometry is the least trustworthy input available." That was written
+against the raw encoder lie. At the slow speeds where rotation now behaves, the
+prior is decent — and looseness is precisely the freedom the matcher uses to slide
+along a wall whose along-direction the scan cannot pin. §4a
+(`findings.md`) asked whether the loose penalties blunt matching; the arms below
+are its isolation test.
+
+## The A/B (same-bag replays, `replay_slam_bag.py`, domain 68, map→odom stripped uniformly)
+
+Arms:
+
+- **N0** — canonical `slam_toolbox.yaml`, bag as recorded (baseline).
+- **N1** — penalties to stock + floor raised: `distance_variance_penalty 0.5`,
+  `angle_variance_penalty 1.0`, `minimum_distance_penalty 0.7`.
+- **N2** — N1 + `min_pass_through: 3`, and the bag's `range_min` raised to
+  0.16 m (kills the flickering near bin the RTX lidar half-loses anyway —
+  validity 63–89% below 0.5 m).
+
+Scored by `score_slam_map` against the authored arena reference (the wall rows —
+spans and duplicate-wall extent — are exactly what a re-anchoring event inflates).
+
+### Controlled bag A (worst case: 0.085 m standoff, 3.3 m live jump)
+
+| arm | spans (m) | dup wall (m) | wall thick (m) | verdict |
+|---|---|---|---|---|
+| N0 | 9.36 × 7.20 | 0.46 | 0.040 | **FAIL** — the live failure reproduces offline |
+| N1 | 8.64 × 6.84 | 1.32 | 0.020 | **FAIL** |
+| N2 | 8.32 × 6.60 | 1.22 | 0.020 | **FAIL** |
+
+**The parameter hypothesis is FALSIFIED at close range**: stock-restored
+penalties (N1) and penalties + range-floor + speckle suppression (N2) do not
+rescue a <0.1 m wall encounter; all three maps show the same structure — one
+crisp room, then a FAN of progressively rotated wall copies (side-by-side
+render preserved with the artifacts). A fan is not a one-time re-anchor: the
+prior was continuously sweeping while scans matched onto each successive copy.
+
+## The actual mechanism: a wall-blocked body under spinning wheels, not geometry
+
+The fan demanded a rotating prior, and the bag has it. During bag A's jump
+window (t≈146–153 s), `/odom_raw` yaw rate vs truth yaw rate, per second:
+
+| t (s) | odom wz (rad/s) | truth wz (rad/s) | ratio |
+|---|---|---|---|
+| 146 | 0.026 | 0.004 | 6× |
+| 147 | 0.704 | 0.027 | **26×** |
+| 149 | 0.600 | 0.048 | 12× |
+| 152 | 0.701 | 0.059 | 12× |
+
+The free-floor encoder lie is ~2.9×. **In the blocked-at-the-wall regime it
+runs ~6–26×** (bag B independently: peak 26× at t=127, one 118× second at
+t=138 [verification pass]): the body barely rotates while the wheels spin
+at command, the encoders honestly report a rotation that never happened,
+the vendor EKF fuses it as pose AND twist, and slam_toolbox receives a
+prior sweeping tens of degrees per second. Whether the blocking constraint
+is literal chassis-wall contact is INFERRED from the kinematic mismatch,
+not directly measured (no contact signal was queried; the URDF half-extents
+leave ~0.5–1.5 cm of nominal clearance at the 0.085 m standoff — a shoved
+feather box in the gap is equally consistent). What is measured is the
+mismatch itself, and that suffices: the prior sweeps, the map fans. Fun
+mode's braking-off is the only reason a sub-0.35 m standoff is reachable.
+
+Penalty regimes at both tested points of the axis (loose canonical, stock
+N1) fail to veto the sweep while still permitting real motion — two points
+do not prove NO penalty setting could, but loosening and tightening both
+failing points away from that axis entirely. The isotropy degradation
+measured above is real but SECONDARY: geometry weakens exactly when the
+prior corrupts, removing the matcher's ability to resist.
+
+Two regimes, one channel: the organic bag's 746 mm event shows **no
+blocked-wheel signature** — its window reads 1.9–2.5× during a genuine fast
+rotation [verification pass re-probe], i.e. the ordinary free-floor lie at
+speed, mostly healed by loop closure (its offline N0 nearly passes). The
+catastrophic fan requires the sustained blocked regime, seen in both
+controlled bags. Same wheel-yaw channel, two severities.
+
+### Arm N4 — the fix candidate, tested offline
+
+The IMU is bolted to the BODY: wall-contact wheel spin never enters its yaw
+channel (Isaac publishes true body rate; the real ICM-42670-P measures the
+body too — same physics). `ekf_corrected.yaml` already fuses IMU yaw-rate
+and wheel vx as twist-only with a rejection threshold. Arm N4 rebuilds the
+bag's `odom→base_footprint` by dead-reckoning exactly that input set
+(IMU yaw integrated at 25 Hz, odom vx projected along it) and replays through
+the CANONICAL slam yaml:
+
+| bag | arm | spans (m) | dup wall (m) | verdict |
+|---|---|---|---|---|
+| A (worst) | N4 imu-yaw prior | **4.30 × 4.26** | **0.20** | near-PASS: span rows over the ±0.20 m bar by 0.10 / 0.06 m; every other row PASS (89.4% known, wall 0.060 m) |
+| B | N4 imu-yaw prior | 4.50 × 4.58 | 0.68 | partial rescue: spans re-scaled from 8.56 m to ~4.5, dup wall still FAIL |
+
+From 9.36 m of fanned room to 4.30 m with two rows centimetres off the bar —
+using the same scans, the same contact, the same canonical SLAM parameters,
+and an integrator far cruder than the real corrected EKF (25 Hz Euler,
+no rejection gate, no laser input). The yaw channel was the fault.
+
+### Cross-bag confirmation (organic + controlled B)
+
+| bag | N0 (canonical) | N1 (tight penalties) |
+|---|---|---|
+| organic (0.367 m near-miss) | 4.16 × 4.36, dup 0.16 — FAIL by one span row (+0.16 m) | 4.16 × 4.48, dup 0.16 — FAIL, **slightly worse** |
+| controlled B (0.098 m contact) | 8.56 × 4.42, dup 0.24 — FAIL | 8.64 × 4.70, dup 0.36 — FAIL, **slightly worse** |
+
+**N1 never changes a verdict, on any of the three bags.** Row-level effects
+are mixed — on bag A it shrank spans (9.36→8.64) while tripling duplicate
+wall (0.46→1.32); on the organic and B bags its span rows are worse by
+2.8% and 6.3%, beyond the 0.5% repeatability baseline (with the honest
+caveat that that baseline was measured between PASS-regime maps and its
+transfer to fan-failure maps is unestablished — no same-config replay
+replicate exists). The §4a question is answered at the level that matters:
+the loose penalty block is NOT the cause of the near-wall failure, and
+tightening it rescues nothing. Note also the organic bag's N0 nearly passes
+offline — Alex's live 746 mm event was a borderline transient largely
+healed by loop closure; the catastrophic regime requires the sustained
+blocked-wheel condition.
+
+## Verdict and recommendation
+
+**The near-wall instability is corrupted wheel odometry under an external
+constraint, not scan geometry and not SLAM parameters.** Ranked:
+
+1. **Convicted**: near-wall instability repeats across all 3 bags and both
+   live sessions; the blocked-wheel mechanism (yaw lie ~6–26× vs ~2.9×
+   free-floor, fused as pose and twist by the vendor EKF, prior sweeping
+   the map into a fan) is directly evidenced in the TWO controlled bags.
+   The organic event is the same wheel-yaw channel in its ordinary
+   free-floor regime at speed (1.9–2.5×) — milder, loop-closure-healed.
+2. **Falsified**: penalty tightening (N1) and range-floor + speckle (N2)
+   rescue nothing on any bag (verdict-level; row effects mixed, see
+   cross-bag table). Do NOT ship a `slam_toolbox_nearwall.yaml`; the
+   canonical yaml survives on evidence. (The §4d escalation remains untried
+   for its ORIGINAL sparse-map purpose; nothing here retires it there.)
+3. **Demonstrated**: structurally excluding the wheel-yaw channel (N4:
+   IMU yaw + wheel vx only) rescues the worst bag to centimetres of the
+   bar and re-scales bag B from 8.6 m to 4.5 m. The bag-B residual is
+   PLAUSIBLY the wheel-vx channel lying under the same blocked condition
+   (phantom forward travel) — plausible because it is the one channel N4
+   retains, but **unmeasured**: no vx-vs-truth probe was run, and that is
+   the first check for whoever picks this up.
+
+**Recommendation (Alex's call — touches the sim's default fusion, morning
+decision 5 now with teeth):** run sim sessions on the corrected-EKF fusion,
+with eyes open about what it is and is not. `ekf_corrected.yaml` is NOT
+N4's architecture: it still fuses wheel vyaw (its header says so — twist
+vx AND vyaw), merely gated by `odom0_twist_rejection_threshold: 1.542`,
+alongside IMU yaw-rate. Whether that Mahalanobis gate actually fires on a
+26× lie depends on the covariances the firmware stamps and was tested by
+no arm here — and when it fires it rejects the WHOLE odom twist (vx and
+vyaw together), a behavior difference from N4. The stronger variant, which
+IS N4's structure, is `odom0_config` with vyaw=false (wheel yaw excluded
+outright, rotation twist from the IMU alone) — one line, testable in the
+same A/B harness. The full corrected stack already exists in-tree: simctl
+launches `laser_odometry` unconditionally and `ekf_corrected.yaml` fuses
+`/odom_laser` as its pose input; only the bringup wiring (vendor `ekf.yaml`
+hardcoded) keeps sim sessions on the vulnerable config. Validation shape
+when approved: one fun wall-approach session per EKF variant (vendor /
+corrected-as-is / corrected+vyaw-off), scored per this document's method —
+the session-recording infrastructure makes each attempt a complete record.
+
+Secondary, cheaper mitigations, in order: keep fun-mode boxes/walls
+approaches above ~0.15 m when a usable map matters (operator guidance —
+below `range_min` the near wall is invisible regardless of fusion);
+a contact heuristic (odom-vs-IMU yaw-rate disagreement > 3× for > 0.5 s ⇒
+governor stop) would make contact self-announcing rather than silent.
+
+## Bounding factors, stated plainly
+
+- The Isaac near-field residual dropout (~10%, OPEN) bounds how good ANY
+  configuration can be under ~0.5 m; the range-floor arm sidesteps rather than
+  fixes it.
+- These are SIMULATOR measurements. The real lidar's near-field validity is
+  ~98.6%; the real car's odometry lies differently (~7.7% yaw). The penalty
+  question must be re-asked on hardware bags before any hardware retune —
+  the delivery plan's gates apply, and this document does not touch them.
+- A scan-geometry gate in front of slam_toolbox (drop scans below an isotropy
+  floor, the laser_odometry approach promoted to the SLAM input) was designed as
+  arm N3 and NOT RUN — parked unless N1/N2 prove insufficient, because a gate
+  that drops scans interacts with the governor's stale-scan stop and must be
+  designed with that coupling in mind.
+
+## Provenance and verification
+
+Sessions `20260810-131057-isaac-fun-d66` / `20260810-131558-isaac-fun-d66`
+(controlled, scripted approach; full session records incl. bags with
+/cmd_vel) and Alex's organic `20260810-125354-isaac-fun-d66`. All arm maps,
+scorer JSONs, the N0/N1/N2 fan render, the N0-vs-N4 comparison figure, the
+probe scripts and the arm parameter files are preserved under
+`MicroROS-assets/maps/near-wall-20260810/`.
+
+Every numeric claim in this document was adversarially re-checked by an
+independent three-lens verification pass (tables vs scorer JSONs; mechanism
+claims re-probed from the bags; overclaim hunt) before commit. Eight of its
+findings forced corrections — among them: the beam-count generalization was
+wrong (organic-only), the contact-signature range was trimmed (6–26×, not
+10–26×), the organic event carries NO blocked-wheel signature (1.9–2.5×,
+free-floor regime), physical contact is inferred rather than measured, and
+the corrected-EKF config was being credited with N4's structure it does not
+have. The pre-correction claims are in git history; the corrections are the
+document above.
