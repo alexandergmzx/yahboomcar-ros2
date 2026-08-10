@@ -1,0 +1,306 @@
+<!doctype html>
+<!-- The SLAM lens page. Served by tools/slam_lens.py from the same process/port.
+     Plain canvas + vanilla JS on purpose: no build step, no CDN, works on the
+     bench laptop. The React version of this is fleet-console's scheduled
+     "SLAM map view" panel; keep the drawing logic portable. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SLAM lens</title>
+<style>
+  :root {
+    --bg: #14161c; --panel: #1d2027; --ink: #d6d9e0; --dim: #7a8090;
+    --good: #4cc38a; --bad: #e5484d; --warn: #f0a13b;
+    --pose: #3fc1ff; --truth: #ffd23f; --odomg: #e06cff;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--ink);
+         font: 13px/1.45 system-ui, sans-serif; height: 100vh;
+         display: flex; flex-direction: column; overflow: hidden; }
+  header { display: flex; gap: 16px; align-items: baseline;
+           padding: 8px 14px; background: var(--panel); }
+  header h1 { font-size: 15px; font-weight: 600; }
+  header .conn { color: var(--dim); }
+  header .conn.down { color: var(--bad); font-weight: 600; }
+  #metrics { display: flex; gap: 10px; padding: 8px 14px; flex-wrap: wrap; }
+  .tile { background: var(--panel); border-radius: 8px; padding: 8px 12px;
+          min-width: 148px; border-left: 3px solid var(--dim); }
+  .tile.ok   { border-left-color: var(--good); }
+  .tile.bad  { border-left-color: var(--bad); }
+  .tile.na   { border-left-color: var(--dim); opacity: .75; }
+  .tile .k { color: var(--dim); font-size: 11px; text-transform: uppercase;
+             letter-spacing: .04em; }
+  .tile .v { font-size: 20px; font-variant-numeric: tabular-nums; }
+  .tile .s { color: var(--dim); font-size: 11px; }
+  .tile canvas { display: block; width: 100%; height: 22px; margin-top: 4px; }
+  main { flex: 1; position: relative; min-height: 0; }
+  #view { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #legend { position: absolute; right: 10px; top: 10px; background: #1d2027cc;
+            border-radius: 8px; padding: 8px 12px; font-size: 12px; }
+  #legend span { display: inline-block; width: 10px; height: 10px;
+                 border-radius: 2px; margin-right: 6px; }
+  footer { padding: 6px 14px; color: var(--dim); background: var(--panel);
+           font-variant-numeric: tabular-nums; white-space: nowrap;
+           overflow-x: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>SLAM lens</h1>
+  <div class="conn" id="conn">connecting…</div>
+  <div class="conn" id="hint">drag to pan · wheel to zoom · double-click to refit</div>
+</header>
+<div id="metrics"></div>
+<main>
+  <canvas id="view"></canvas>
+  <div id="legend">
+    <div><span style="background:var(--good)"></span>scan hit &nbsp;
+         <span style="background:var(--bad)"></span>scan miss</div>
+    <div><span style="background:var(--pose)"></span>SLAM pose (TF map→base)</div>
+    <div><span style="background:var(--truth)"></span>ground-truth ghost (aligned at start)</div>
+    <div><span style="background:var(--odomg)"></span>pure-odometry ghost (no SLAM correction)</div>
+  </div>
+</main>
+<footer id="status">waiting for data…</footer>
+<script>
+'use strict';
+// ---------------------------------------------------------------- state
+const S = {
+  map: null, mapCanvas: null,     // decoded occupancy grid
+  state: null,                    // latest snapshot
+  hist: [],                       // [t, fit, div_pos, yaw_ratio, stale_run]
+  trails: { pose: [], truth: [], odomg: [] },
+  view: { scale: 90, cx: 0, cy: 0, fitted: false },  // px/m, world center
+};
+const TRAIL_MAX = 3000;
+
+// -------------------------------------------------------------- metrics
+// Thresholds mirror the failure signatures this repo has measured:
+// fit < 0.5 = matcher losing the map; ratio outside [0.8, 1.2] = encoder
+// yaw lie (isaac measured ~2.9); stale_run >= 1 = render-pacing repeats
+// (a healthy backend measured 0/614); tf_fail_streak > 3 = the
+// slam_preflight streak bound that empties a message-filter queue.
+const TILES = [
+  { id:'fit',   k:'scan→map fit', f:m=>m.fit,
+    fmt:v=>v===null?'—':v.toFixed(2), bad:v=>v!==null&&v<0.5, hist:1,
+    sub:m=>m.fit===null?'no map / no scan yet':'1.0 = every endpoint on a wall' },
+  { id:'div',   k:'pose vs truth', f:m=>m.div_pos,
+    fmt:v=>v===null?'—':v.toFixed(2)+' m', bad:v=>v!==null&&v>0.30, hist:2,
+    sub:m=>m.div_yaw===null?'since lens start':`yaw err ${(m.div_yaw*57.2958).toFixed(0)}° · since lens start` },
+  { id:'ratio', k:'odom/truth yaw', f:m=>m.yaw_ratio,
+    fmt:v=>v===null?'—':v.toFixed(2)+'×', bad:v=>v!==null&&(v<0.8||v>1.2), hist:3,
+    sub:m=>m.yaw_ratio===null?'needs turning':`n=${m.yaw_n} turning samples` },
+  { id:'stale', k:'stale scans', f:m=>m.stale_run,
+    fmt:v=>v===null?'—':String(v), bad:v=>v!==null&&v>=1, hist:4,
+    sub:m=>`dup ${(100*(m.stale_frac||0)).toFixed(1)}% · max run ${m.stale_max}` },
+  { id:'tf',    k:'TF @ scan stamp', f:m=>m.tf_ok_frac,
+    fmt:v=>v===null?'—':(100*v).toFixed(0)+'%', bad:v=>v!==null&&v<0.99, hist:null,
+    sub:m=>`fail streak ${m.tf_fail_streak}` },
+];
+const metricsDiv = document.getElementById('metrics');
+for (const t of TILES) {
+  const el = document.createElement('div');
+  el.className = 'tile na'; el.id = 'tile-' + t.id;
+  el.innerHTML = `<div class="k">${t.k}</div><div class="v">—</div>
+                  <div class="s"></div>` +
+                 (t.hist !== null ? `<canvas width="140" height="22"></canvas>` : '');
+  metricsDiv.appendChild(el);
+}
+
+function drawSpark(cv, idx, bad) {
+  const ctx = cv.getContext('2d'), W = cv.width, H = cv.height;
+  ctx.clearRect(0, 0, W, H);
+  const pts = S.hist.slice(-300).map(r => r[idx]).filter(v => v !== null);
+  if (pts.length < 2) return;
+  let lo = Math.min(...pts), hi = Math.max(...pts);
+  if (hi - lo < 1e-9) { hi = lo + 1; }
+  ctx.strokeStyle = bad ? '#e5484d' : '#4cc38a';
+  ctx.lineWidth = 1.2; ctx.beginPath();
+  pts.forEach((v, i) => {
+    const x = i / (pts.length - 1) * W;
+    const y = H - 2 - (v - lo) / (hi - lo) * (H - 4);
+    i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function updateTiles(m) {
+  for (const t of TILES) {
+    const el = document.getElementById('tile-' + t.id);
+    const v = t.f(m);
+    el.querySelector('.v').textContent = t.fmt(v);
+    el.querySelector('.s').textContent = t.sub(m);
+    el.className = 'tile ' + (v === null ? 'na' : (t.bad(v) ? 'bad' : 'ok'));
+    if (t.hist !== null) drawSpark(el.querySelector('canvas'), t.hist, t.bad(v));
+  }
+}
+
+// ------------------------------------------------------------ map decode
+function decodeMap(mp) {
+  const data = new Int8Array(mp.w * mp.h);
+  let o = 0;
+  for (let i = 0; i < mp.rle.length; i += 2) {
+    data.fill(mp.rle[i], o, o + mp.rle[i + 1]); o += mp.rle[i + 1];
+  }
+  const cv = document.createElement('canvas');
+  cv.width = mp.w; cv.height = mp.h;
+  const ctx = cv.getContext('2d');
+  const img = ctx.createImageData(mp.w, mp.h);
+  for (let i = 0; i < data.length; i++) {
+    const v = data[i]; let r, g, b;
+    if (v < 0)       { r = 26; g = 28;  b = 35;  }   // unknown
+    else if (v >= 65){ r = 235; g = 220; b = 180; }  // occupied
+    else             { r = 45; g = 49;  b = 60;  }   // free
+    const j = i * 4;
+    img.data[j] = r; img.data[j+1] = g; img.data[j+2] = b; img.data[j+3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  S.map = mp; S.mapCanvas = cv;
+  if (!S.view.fitted) fitView();
+}
+
+function fitView() {
+  if (!S.map) return;
+  const mainEl = document.querySelector('main');
+  const wm = S.map.w * S.map.res, hm = S.map.h * S.map.res;
+  S.view.scale = Math.min(mainEl.clientWidth / wm, mainEl.clientHeight / hm) * 0.9;
+  S.view.cx = S.map.ox + wm / 2; S.view.cy = S.map.oy + hm / 2;
+  S.view.fitted = true;
+}
+
+// -------------------------------------------------------------- drawing
+const canvas = document.getElementById('view');
+const g = canvas.getContext('2d');
+
+function w2s(x, y) {   // world (map frame, y up) -> screen (y down)
+  return [canvas.width / 2 + (x - S.view.cx) * S.view.scale,
+          canvas.height / 2 - (y - S.view.cy) * S.view.scale];
+}
+
+function drawPose(p, color) {
+  const [sx, sy] = w2s(p[0], p[1]);
+  const a = -p[2], r = 9;
+  g.fillStyle = color; g.beginPath();
+  g.moveTo(sx + r * Math.cos(a), sy + r * Math.sin(a));
+  g.lineTo(sx + r * .55 * Math.cos(a + 2.5), sy + r * .55 * Math.sin(a + 2.5));
+  g.lineTo(sx + r * .55 * Math.cos(a - 2.5), sy + r * .55 * Math.sin(a - 2.5));
+  g.closePath(); g.fill();
+}
+
+function drawTrail(tr, color) {
+  if (tr.length < 2) return;
+  g.strokeStyle = color; g.globalAlpha = 0.55; g.lineWidth = 1.5; g.beginPath();
+  tr.forEach((p, i) => {
+    const [sx, sy] = w2s(p[0], p[1]);
+    i ? g.lineTo(sx, sy) : g.moveTo(sx, sy);
+  });
+  g.stroke(); g.globalAlpha = 1;
+}
+
+function render() {
+  const mainEl = document.querySelector('main');
+  if (canvas.width !== mainEl.clientWidth || canvas.height !== mainEl.clientHeight) {
+    canvas.width = mainEl.clientWidth; canvas.height = mainEl.clientHeight;
+  }
+  g.fillStyle = '#14161c'; g.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (S.mapCanvas) {
+    // Grid row 0 sits at oy (world y increases with rows): draw the map
+    // image flipped so world-y-up renders correctly.
+    const m = S.map;
+    const [sx, sy] = w2s(m.ox, m.oy);
+    const wpx = m.w * m.res * S.view.scale, hpx = m.h * m.res * S.view.scale;
+    g.save(); g.imageSmoothingEnabled = false;
+    g.translate(sx, sy); g.scale(1, -1);
+    g.drawImage(S.mapCanvas, 0, 0, wpx, hpx);
+    g.restore();
+  }
+
+  drawTrail(S.trails.odomg, getCSS('--odomg'));
+  drawTrail(S.trails.truth, getCSS('--truth'));
+  drawTrail(S.trails.pose,  getCSS('--pose'));
+
+  const st = S.state;
+  if (st) {
+    if (st.scan && st.scan.points.length) {
+      const hits = st.scan.hits;
+      for (let i = 0; i < st.scan.points.length; i++) {
+        const [sx, sy] = w2s(st.scan.points[i][0], st.scan.points[i][1]);
+        g.fillStyle = hits[i] ? getCSS('--good') : getCSS('--bad');
+        g.fillRect(sx - 1.5, sy - 1.5, 3, 3);
+      }
+    }
+    if (st.odom_ghost) drawPose(st.odom_ghost, getCSS('--odomg'));
+    if (st.truth_ghost) drawPose(st.truth_ghost, getCSS('--truth'));
+    if (st.pose) drawPose(st.pose, getCSS('--pose'));
+  }
+  requestAnimationFrame(render);
+}
+const cssCache = {};
+function getCSS(name) {
+  if (!cssCache[name]) cssCache[name] =
+    getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return cssCache[name];
+}
+
+// ----------------------------------------------------------- pan / zoom
+let drag = null;
+canvas.addEventListener('mousedown', e => { drag = [e.clientX, e.clientY]; });
+window.addEventListener('mouseup', () => { drag = null; });
+window.addEventListener('mousemove', e => {
+  if (!drag) return;
+  S.view.cx -= (e.clientX - drag[0]) / S.view.scale;
+  S.view.cy += (e.clientY - drag[1]) / S.view.scale;
+  drag = [e.clientX, e.clientY];
+});
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  S.view.scale *= e.deltaY < 0 ? 1.15 : 1 / 1.15;
+}, { passive: false });
+canvas.addEventListener('dblclick', fitView);
+
+// ------------------------------------------------------------ WebSocket
+const conn = document.getElementById('conn');
+const statusEl = document.getElementById('status');
+
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { conn.textContent = 'live'; conn.className = 'conn'; };
+  ws.onclose = () => {
+    conn.textContent = 'disconnected — retrying'; conn.className = 'conn down';
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === 'hello') { S.hist = msg.history || []; return; }
+    if (msg.type !== 'snapshot') return;
+    if (msg.map) decodeMap(msg.map);
+    const st = msg.state;
+    S.state = st;
+    const m = st.metrics;
+    S.hist.push([st.t, m.fit, m.div_pos, m.yaw_ratio, m.stale_run]);
+    if (S.hist.length > 3000) S.hist.shift();
+    for (const [key, p] of [['pose', st.pose], ['truth', st.truth_ghost],
+                            ['odomg', st.odom_ghost]]) {
+      if (p) {
+        const tr = S.trails[key];
+        if (!tr.length || Math.hypot(p[0]-tr[tr.length-1][0],
+                                     p[1]-tr[tr.length-1][1]) > 0.01)
+          tr.push(p);
+        if (tr.length > TRAIL_MAX) tr.shift();
+      }
+    }
+    updateTiles(m);
+    const r = st.rates;
+    statusEl.textContent =
+      `t=${st.t.toFixed(0)}s · rates: scan ${r.scan} · odom ${r.odom} · ` +
+      `odom_raw ${r.odom_raw} · truth ${r.truth} · map updates ${r.map} · ` +
+      `map seq ${st.map_seq}` +
+      (st.scan ? ` · scan age ${st.scan.age}s${st.scan.resolved ? '' : ' (TF UNRESOLVED — drawn at latest TF)'}` : ' · no scan');
+  };
+}
+connect();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
