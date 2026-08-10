@@ -49,6 +49,16 @@ times; box-level attribution needs a session whose walls land once).
     prediction was wrong, and the staleness instead presents as content lag
     (median best time-offset −0.08 s; 27% ≥0.2 s; 17/124 at the −0.6 s sweep
     limit; rms at best offset 0.021 m).
+- **Repeatability run (second Isaac boot, bag 97c7f1760b0ec827…): everything
+  replicated** — yaw lie 2.94×/2.99×, pacing bottomed 2.91/s, 0 duplicates,
+  lag tail p10 −0.36 s, relay drops 0. Arms: as-recorded **FAIL again**
+  (6.98 × 6.74 m, dup 1.42), truth-prior **PASS again** (4.14 × 4.14 m).
+  Formal repeatability arm3-vs-arm3b: spans 0.5% apart, IoU 0.776 — PASS.
+- **Lens grew a content-lag tile** during the night (commits ae7d9da,
+  3354ef3): time-offset walls-fit, sim-only, live-verified at both ends —
+  and its first live incident (a static robot reading "80% stale") was
+  caught, guarded (refuse when the pose barely moves across the window),
+  and pinned by test. Suite 69/69.
 
 ## Negative results tonight (bold per house style)
 
