@@ -61,9 +61,20 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _slam_lens_core import (                                   # noqa: E402
-    PoseAligner, StalenessTracker, YawRatioWindow, divergence,
-    occupied_mask_dilated, rle_encode, scan_endpoints, scan_map_fit,
-    transform_points)
+    PoseAligner, StalenessTracker, TruthHistory, YawRatioWindow, content_lag,
+    divergence, occupied_mask_dilated, rle_encode, scan_endpoints,
+    scan_map_fit, transform_points)
+from _layout import REPO                                        # noqa: E402
+
+# The content-lag metric needs the shared walls model (the same single source
+# the Isaac USD is built from). Sim-only by nature; the lens still runs
+# without it (tile reads em-dash), e.g. pointed at hardware.
+try:
+    sys.path.insert(0, os.path.join(REPO, 'yahboomcar_sim'))
+    from yahboomcar_sim.arena import raycast, segments_room     # noqa: E402
+    WALL_SEGS = segments_room()
+except ImportError:                                             # pragma: no cover
+    WALL_SEGS = None
 
 PAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'slam_lens.html')
 SNAPSHOT_HZ = 5.0
@@ -108,6 +119,9 @@ class LensNode:
         self.t0 = time.time()
         self.stale = StalenessTracker()
         self.yaw_win = YawRatioWindow()
+        self.truth_hist = TruthHistory()
+        self._lag = None              # (offset_s, rms_m) of the last sweep
+        self._lag_tick = 0
         self.truth_align = PoseAligner()      # truth frame -> map frame
         self.odom_align = PoseAligner()       # odom frame  -> map frame (frozen at t0)
         self.tf_results = deque(maxlen=TF_WINDOW)
@@ -150,10 +164,12 @@ class LensNode:
 
     def _on_truth(self, msg):
         p = msg.pose.pose
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         with self.lock:
             self.truth = (p.position.x, p.position.y, yaw_of(p.orientation))
             self.counts['truth'] += 1
             self.yaw_win.feed_truth_yaw(time.time(), self.truth[2])
+            self.truth_hist.feed(stamp, self.truth)
 
     def _on_odom(self, msg):
         p = msg.pose.pose
@@ -233,6 +249,25 @@ class LensNode:
                 scan, scan_rx = scans[-1]
                 tf_pose = self._lookup(self.args.map_frame, scan.header.frame_id)
 
+            # Content lag, every 3rd snapshot (a 15-offset walls-raycast
+            # sweep). Sim-only: needs the arena model and a truth history.
+            self._lag_tick += 1
+            if WALL_SEGS is not None and self._lag_tick % 3 == 0:
+                s_newest = scans[-1][0]
+                stamp_s = (s_newest.header.stamp.sec
+                           + s_newest.header.stamp.nanosec * 1e-9)
+                n_beams = len(s_newest.ranges)
+
+                def _ray(pose, _n=n_beams):
+                    return raycast((pose[0], pose[1]), pose[2], WALL_SEGS,
+                                   n_beams=_n)
+
+                with self.lock:
+                    self._lag = content_lag(
+                        s_newest.ranges, s_newest.range_min,
+                        s_newest.range_max, self.truth_hist.pose_at, _ray,
+                        stamp_s)
+
             if tf_pose is not None:
                 pts_l = scan_endpoints(scan.ranges, scan.angle_min,
                                        scan.angle_increment, scan.range_min,
@@ -293,6 +328,8 @@ class LensNode:
                 'stale_frac': _r3(stale_frac),
                 'tf_ok_frac': _r3(tf_ok),
                 'tf_fail_streak': self.tf_fail_streak,
+                'lag_s': _r3(self._lag[0]) if self._lag else None,
+                'lag_rms': _r3(self._lag[1]) if self._lag else None,
             },
             'map_seq': map_seq,
         }
@@ -331,7 +368,7 @@ async def serve(node: LensNode, args):
             latest['map'] = map_payload
             m = state['metrics']
             history.append([state['t'], m['fit'], m['div_pos'],
-                            m['yaw_ratio'], m['stale_run']])
+                            m['yaw_ratio'], m['stale_run'], m['lag_s']])
             await asyncio.sleep(period)
 
     async def handler(ws):

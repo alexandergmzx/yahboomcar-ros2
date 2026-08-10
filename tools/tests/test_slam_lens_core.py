@@ -226,3 +226,90 @@ def test_divergence_reports_separation():
 
 def test_aligner_none_before_first_sample():
     assert PoseAligner().truth_in_map((0, 0, 0)) is None
+
+
+# ------------------------------------------------------------ content lag
+
+from _slam_lens_core import TruthHistory, content_lag           # noqa: E402
+
+
+def _square_raycast(pose, n=360, half=2.0):
+    """Synthetic walls model: exact ranges to a 2*half square room."""
+    x, y, yaw = pose
+    out = np.empty(n)
+    for i in range(n):
+        a = yaw - math.pi + i * (2 * math.pi / n)
+        c, s = math.cos(a), math.sin(a)
+        best = np.inf
+        for wx in (half, -half):
+            if abs(c) > 1e-9:
+                t = (wx - x) / c
+                if t > 0 and abs(y + t * s) <= half + 1e-9:
+                    best = min(best, t)
+        for wy in (half, -half):
+            if abs(s) > 1e-9:
+                t = (wy - y) / s
+                if t > 0 and abs(x + t * c) <= half + 1e-9:
+                    best = min(best, t)
+        out[i] = best
+    return out
+
+
+def _spinning_history(rate=0.5, seconds=12.0, dt=0.05):
+    h = TruthHistory()
+    t, yaw = 0.0, 0.0
+    while t <= seconds:
+        h.feed(t, (0.3, -0.2, yaw))
+        yaw = wrap_angle(yaw + rate * dt)
+        t += dt
+    return h
+
+
+def test_truth_history_interpolates_and_windows():
+    h = _spinning_history()
+    p = h.pose_at(6.025)                      # between samples
+    assert p is not None
+    assert h.pose_at(-5.0) is None            # before window
+    assert h.pose_at(50.0) is None            # after window
+
+
+def test_content_lag_zero_for_fresh_content():
+    # Scan generated from the pose AT its stamp must fit best near offset 0.
+    h = _spinning_history()
+    stamp = 8.0
+    ranges = _square_raycast(h.pose_at(stamp))
+    best = content_lag(ranges, 0.12, 8.0, h.pose_at, _square_raycast, stamp)
+    assert best is not None
+    assert abs(best[0]) <= 0.051
+    assert best[1] < 0.02
+
+
+def test_content_lag_reads_stale_content():
+    # THE Isaac render-pacing signature: content from 0.30 s before the
+    # stamp, under a body turning at 0.5 rad/s, must read ~-0.30 s.
+    h = _spinning_history()
+    stamp = 8.0
+    ranges = _square_raycast(h.pose_at(stamp - 0.30))
+    best = content_lag(ranges, 0.12, 8.0, h.pose_at, _square_raycast, stamp)
+    assert best is not None
+    assert best[0] == pytest.approx(-0.30, abs=0.051)
+
+
+def test_content_lag_none_without_truth():
+    empty = TruthHistory()
+    ranges = np.full(360, 2.0)
+    assert content_lag(ranges, 0.12, 8.0, empty.pose_at,
+                       _square_raycast, 8.0) is None
+
+
+def test_content_lag_survives_boxes_short_of_walls():
+    # A displaced box (returns SHORT of the wall) must be excluded, not
+    # counted as content error — same walls-only rule as the scan relay.
+    h = _spinning_history()
+    stamp = 8.0
+    ranges = _square_raycast(h.pose_at(stamp)).copy()
+    ranges[40:80] = 0.6                        # a fat box somewhere close
+    best = content_lag(ranges, 0.12, 8.0, h.pose_at, _square_raycast, stamp)
+    assert best is not None
+    assert abs(best[0]) <= 0.051
+    assert best[1] < 0.02

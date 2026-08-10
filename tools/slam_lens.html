@@ -90,9 +90,15 @@ const TILES = [
   { id:'ratio', k:'odom/truth yaw', f:m=>m.yaw_ratio,
     fmt:v=>v===null?'—':v.toFixed(2)+'×', bad:v=>v!==null&&(v<0.8||v>1.2), hist:3,
     sub:m=>m.yaw_ratio===null?'needs turning':`n=${m.yaw_n} turning samples` },
-  { id:'stale', k:'stale scans', f:m=>m.stale_run,
+  { id:'stale', k:'dup scans (2D)', f:m=>m.stale_run,
     fmt:v=>v===null?'—':String(v), bad:v=>v!==null&&v>=1, hist:4,
     sub:m=>`dup ${(100*(m.stale_frac||0)).toFixed(1)}% · max run ${m.stale_max}` },
+  // Isaac's render-pacing staleness is NOT duplication (measured 0/3330
+  // bit-identical while 27% of content was >=0.2 s old): only the
+  // time-offset fit against the walls model can see it. Sim-only tile.
+  { id:'lag',   k:'content lag (sim)', f:m=>m.lag_s,
+    fmt:v=>v===null?'—':v.toFixed(2)+' s', bad:v=>v!==null&&v<=-0.2, hist:5,
+    sub:m=>m.lag_s===null?'needs truth + arena model':`walls-fit rms ${m.lag_rms===null?'—':m.lag_rms+' m'}` },
   { id:'tf',    k:'TF @ scan stamp', f:m=>m.tf_ok_frac,
     fmt:v=>v===null?'—':(100*v).toFixed(0)+'%', bad:v=>v!==null&&v<0.99, hist:null,
     sub:m=>`fail streak ${m.tf_fail_streak}` },
@@ -278,7 +284,7 @@ function connect() {
     const st = msg.state;
     S.state = st;
     const m = st.metrics;
-    S.hist.push([st.t, m.fit, m.div_pos, m.yaw_ratio, m.stale_run]);
+    S.hist.push([st.t, m.fit, m.div_pos, m.yaw_ratio, m.stale_run, m.lag_s]);
     if (S.hist.length > 3000) S.hist.shift();
     for (const [key, p] of [['pose', st.pose], ['truth', st.truth_ghost],
                             ['odomg', st.odom_ghost]]) {

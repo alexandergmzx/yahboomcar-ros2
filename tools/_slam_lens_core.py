@@ -286,3 +286,79 @@ def divergence(map_base_pose, truth_in_map_pose):
     dy = map_base_pose[1] - truth_in_map_pose[1]
     dyaw = abs(wrap_angle(map_base_pose[2] - truth_in_map_pose[2]))
     return math.hypot(dx, dy), dyaw
+
+
+# ------------------------------------------------------- content lag (sim)
+
+class TruthHistory:
+    """Recent ground-truth poses, interpolatable at any time in the window.
+
+    Feeds the content-lag metric: the 2026-08-10 Isaac diagnosis showed that
+    render-pacing staleness does NOT present as duplicate scans (0/3330
+    bit-identical at 2.92 renders/s) but as scans whose CONTENT fits the
+    truth pose of an earlier time (27% >= 0.2 s stale). Only a time-offset
+    fit can see it, and that needs a truth-pose history to evaluate at
+    (stamp + offset).
+    """
+
+    def __init__(self, window_s: float = 15.0):
+        self.window_s = window_s
+        self._q = deque()          # (t, x, y, yaw)
+
+    def feed(self, t: float, pose) -> None:
+        self._q.append((t, pose[0], pose[1], pose[2]))
+        while self._q and t - self._q[0][0] > self.window_s:
+            self._q.popleft()
+
+    def pose_at(self, t: float):
+        """Linear interpolation (yaw shortest-arc). None outside the window."""
+        q = self._q
+        if not q or t < q[0][0] - 0.05 or t > q[-1][0] + 0.05:
+            return None
+        lo, hi = 0, len(q) - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if q[mid][0] < t:
+                lo = mid + 1
+            else:
+                hi = mid
+        b = q[lo]
+        a = q[lo - 1] if lo > 0 else b
+        dt = b[0] - a[0]
+        w = 0.0 if dt <= 1e-9 else min(1.0, max(0.0, (t - a[0]) / dt))
+        dyaw = wrap_angle(b[3] - a[3])
+        return (a[1] + w * (b[1] - a[1]), a[2] + w * (b[2] - a[2]),
+                wrap_angle(a[3] + w * dyaw))
+
+
+DEFAULT_LAG_OFFSETS = tuple(round(-0.6 + 0.05 * i, 2) for i in range(15))  # -0.6..0.1
+
+
+def content_lag(ranges, range_min, range_max, pose_at, raycast_at,
+                stamp, offsets=DEFAULT_LAG_OFFSETS, min_beams=80,
+                wall_slack=0.45):
+    """Best time offset explaining the scan against a walls model.
+
+    -> (best_offset_s, rms_at_best_m) or None when unanswerable (no truth
+    pose in window, too few scoreable beams). `raycast_at(pose) -> expected
+    ranges array` is injected so this stays importable without the arena
+    (and testable against synthetic rooms). Beams far SHORT of the wall
+    (movable boxes, wherever they are today) are excluded per offset via
+    `wall_slack`, the same walls-only reasoning as the scan relay.
+    """
+    r = np.asarray(ranges, dtype=np.float64)
+    best = None
+    for off in offsets:
+        pose = pose_at(stamp + off)
+        if pose is None:
+            continue
+        exp = np.asarray(raycast_at(pose), dtype=np.float64)
+        ok = (np.isfinite(r) & (r > range_min) & (r <= range_max)
+              & np.isfinite(exp) & (r >= exp - wall_slack))
+        if int(ok.sum()) < min_beams:
+            continue
+        d = r[ok] - exp[ok]
+        rms = float(np.sqrt(np.mean(d * d)))
+        if best is None or rms < best[1]:
+            best = (float(off), rms)
+    return best
