@@ -217,3 +217,30 @@ Morning-decisions additions:
    for now, deliberately — deleting evidence is an operator's call.
 10. **Alex's noon lens needed SIGKILL** (SIGTERM ignored after ~30 min
    idle) — shutdown robustness after long idle, one reproduction, unfiled.
+
+## Afternoon addendum 2 (~13:00–14:30): near-wall stability answered
+
+Alex: rotation now behaves; the map destabilizes near walls. Full study in
+`docs/slam-research/near-wall-stability.md` (every number adversarially
+verified by a 3-lens pass before commit; 8 corrections applied and listed).
+
+One line: **the wall doesn't break SLAM — blocked wheels do.** With the body
+constrained at the wall (fun braking off), the encoder yaw lie runs ~6–26×
+(vs 2.9× free-floor); the vendor EKF fuses the sweep; the map fans. Proven
+by 9 same-bag replay arms over 3 bags: penalties (N1) and range-floor+
+speckle (N2) rescue nothing — **§4a answered: the loose penalty block is
+not the cause** — while excluding the wheel-yaw channel (N4, IMU-yaw prior)
+takes the worst bag from 9.36 m of fanned room to 4.30 m, centimetres off
+the bar. No canonical yaml change is warranted; none was made.
+
+Morning decisions, appended:
+
+11. **EKF fusion for sim sessions** (upgrades decision 5): A/B the three
+    variants — vendor / `ekf_corrected.yaml` as-is (gate untested under
+    the blocked regime) / corrected + `odom0` vyaw=false (N4's structure,
+    one line) — one fun wall-approach session each, scored per the study.
+12. **Measure the wheel-vx lie under the blocked regime** (the bag-B
+    residual's untested attribution; first check for whoever picks this up).
+13. **Contact self-announcement**: odom-vs-IMU yaw-rate disagreement >3×
+    for >0.5 s ⇒ governor stop — makes the blocked regime loud instead of
+    silently corrupting the map.
