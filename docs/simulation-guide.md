@@ -155,6 +155,28 @@ AND `tools/build_arena.py` (the Isaac room), so the backends cannot drift apart.
 had: until 2026-08-08 the 2D room carried three mid-room boxes while Isaac had four by
 the corners, and no SLAM map could match both expectations at once.
 
+### Watching SLAM properly: the lens
+
+```bash test:skip
+./tools/slam_lens.py             # then open http://localhost:8765/  (domain 66)
+./tools/slam_lens.py --domain 68 --sim-time    # watching a replay
+```
+
+One browser canvas with the map, the scan endpoints at their TF-resolved pose
+(colored hit/miss against the map), the SLAM pose, a ground-truth ghost, and a
+pure-odometry ghost — plus four live metrics (scan→map fit, pose-vs-truth,
+odom/truth yaw ratio, scan staleness, TF@stamp) each tied to a failure this
+repo has measured. RViz shows you *a* picture; the lens shows you whether the
+sensor, the prior, and the map still agree, which is the question a smeared
+map actually poses. Negative-controlled on 2026-08-10 (injected `--slip 0.4`
+read 1.666× on the yaw tile — theory says 1.667). Read-only: it subscribes
+and looks up TF, publishes nothing, so it can watch any session without being
+able to disturb it. KNOWN LIMIT: the stale-scans tile counts bit-identical
+messages, which catches 2D-style duplication but NOT Isaac's render-pacing
+content lag (measured 2026-08-10: 0/3330 bit-identical while ~27% of scans
+carried ≥0.2 s-old content) — on Isaac, read the fit tile and the run report's
+content-lag probe instead.
+
 ---
 
 ## Two Jazzy breakages found here, that would each have cost a floor session

@@ -40,7 +40,10 @@ raycast, median 0.080). Any fix has to be per-scan, not per-session.
 
 - **Time dilation / stamp lies** — stamps advance at wall rate (slope 1.0000 on /scan
   and /odom_raw); forward pose-path vs twist·stamped-dt ratio 0.999. Dead.
-- **Duplicate scans (stale content, fresh stamp)** — 0/614 bit-identical pairs. Dead.
+- **Duplicate scans (stale content, fresh stamp)** — 0/614 bit-identical pairs. Dead
+  as DUPLICATES — but see the 2026-08-10 addendum below: at runaway-low render
+  pacing the staleness is real and does NOT present as bit-identical messages.
+  0/614 was measured at ~10 renders/s and does not generalize downward.
 - **Content world-locked in orientation** — an early probe showed content rotating at
   0.061 rad/s under commanded 0.5, which fit world-locking; a counter-rotation relay
   built on it made things worse. The probe had compared content against /odom_raw
@@ -145,3 +148,55 @@ friction/feedforward pair so the wheels genuinely spin near-truth. Either touche
 measured constants the feedforward tests pin — Alex's call. Until then: **the Isaac
 backend validates the stack against clean scans, but its SLAM maps are NOT
 usable evidence**; the 2D backend remains the SLAM validation rig.
+
+## 2026-08-10 addendum: the render-pacing runaway (new, distinct third cause)
+
+Found reading the 2026-08-09 `--fun` session log after Alex reported the smear
+again, then REPRODUCED tonight in a patrol-driven headless fun session
+(`docs/slam-runs/isaac-fun-20260810.md` is the full run report; bag
+`MicroROS-assets/bags/isaac-fun-slam-20260810`).
+
+**The fault:** `run_ros`'s closed loop trims render pacing by
+`render_hz * (SCAN_HZ / measured)` on the assumption that the published /scan
+rate is proportional to render rate. It is not, below some pacing: both nights
+the loop walked monotonically down — 23.08 → 3.43/s (08-09), and 6.57 → 2.92/s
+(tonight) — while the measured /scan rate stayed ≈ 12.8-13.4 Hz, i.e. the
+measured rate barely responds to pacing in this regime, so the controller keeps
+dividing and heads for its 2.0/s floor. At 2.92 renders/s against a ~12.8 Hz
+publish rate, ~4.4 published revolutions share each rendered world state.
+
+**How the staleness actually presents [measured tonight, 3331-scan bag]:**
+
+- **NOT as duplicates.** 0/3330 bit-identical consecutive pairs AND 0/3330
+  near-identical (max |Δr| < 5 mm over valid beams) — the RTX pipeline
+  re-assembles a fresh-looking revolution every message even when the world
+  state under it has not been re-rendered. The "0/614, Dead" line above was
+  true at ~10 renders/s and is the wrong test at 3.
+- **As content lag.** Fitting each scan against the walls-raycast at the truth
+  pose evaluated at (stamp + offset), sweeping offset −0.6..+0.2 s: median best
+  offset **−0.08 s**, but **~27% of scans fit best at −0.2 s or older**, with
+  17/124 pinned at the −0.6 s sweep limit — matching the ~0.34 s render period
+  of tonight's runaway pacing. rms at best offset 0.021 m (the content is
+  CLEAN, it is merely OLD under a fresh stamp).
+
+During a 0.6 rad/s patrol turn, a 0.4 s-stale scan injects ~14° of orientation
+error into the matcher while its stamp claims freshness — on top of, and
+independent from, the 2.9× encoder yaw prior. The relay cannot catch this
+(walls match fine at the OLD pose too under its one-sided bound), and the
+`_counts['scan']`-based "0.0 of 12 Hz" WARNING spam in the same log is a
+separate reporting bug (the OmniGraph never publishes /scan — the relay child
+does — so the counter is always zero; 30 false warnings per session).
+
+**Not fixed tonight (diagnose-only session).** Proposed shape, morning call:
+floor `render_hz` at `SCAN_HZ` (never fewer renders than published revolutions)
+and treat a trim that moved pacing >2× without moving the measured rate ≥10% as
+controller divergence — hold pacing and say so, rather than dividing again.
+
+**Rank, from the same night's replay attribution** (full table in
+`docs/slam-runs/isaac-fun-20260810.md`): a replay of the same bag with the
+odometry prior rebuilt from ground truth — content lag and shoved fun boxes
+left fully intact — scored **PASS on every row** (4.16 × 4.16 m, dup wall
+0.10 m), while the as-recorded arm reproduced the FAIL (7.24 × 7.08 m, dup
+1.10 m). So the encoder-yaw prior above remains the DOMINANT cause; this
+pacing fault is real but second-order for map quality at patrol speeds —
+fix it for sensor honesty, not as the smear cure.
