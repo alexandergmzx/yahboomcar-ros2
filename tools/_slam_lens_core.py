@@ -340,12 +340,27 @@ def content_lag(ranges, range_min, range_max, pose_at, raycast_at,
     """Best time offset explaining the scan against a walls model.
 
     -> (best_offset_s, rms_at_best_m) or None when unanswerable (no truth
-    pose in window, too few scoreable beams). `raycast_at(pose) -> expected
-    ranges array` is injected so this stays importable without the arena
-    (and testable against synthetic rooms). Beams far SHORT of the wall
-    (movable boxes, wherever they are today) are excluded per offset via
-    `wall_slack`, the same walls-only reasoning as the scan relay.
+    pose in window, too few scoreable beams, or A STATIC ROBOT). `raycast_at
+    (pose) -> expected ranges array` is injected so this stays importable
+    without the arena (and testable against synthetic rooms). Beams far
+    SHORT of the wall (movable boxes, wherever they are today) are excluded
+    per offset via `wall_slack`, the same walls-only reasoning as the relay.
+
+    THE STATIC GUARD IS NOT OPTIONAL: when the pose barely changes across
+    the offset window, every offset fits equally and argmin returns noise —
+    observed live 2026-08-10 (post-patrol static robot read "80% stale,
+    median −0.45 s", which was pure sweep degeneracy, not staleness). If
+    the pose moved less than ~half a map cell / a degree-ish across the
+    whole window, the question has no answer and None is the honest one.
     """
+    p_lo = pose_at(stamp + offsets[0])
+    p_hi = pose_at(stamp + offsets[-1])
+    if p_lo is None or p_hi is None:
+        return None
+    moved = math.hypot(p_hi[0] - p_lo[0], p_hi[1] - p_lo[1])
+    turned = abs(wrap_angle(p_hi[2] - p_lo[2]))
+    if moved < 0.02 and turned < 0.02:
+        return None
     r = np.asarray(ranges, dtype=np.float64)
     best = None
     for off in offsets:

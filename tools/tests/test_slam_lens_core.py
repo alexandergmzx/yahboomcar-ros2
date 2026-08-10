@@ -302,6 +302,18 @@ def test_content_lag_none_without_truth():
                        _square_raycast, 8.0) is None
 
 
+def test_content_lag_none_when_static():
+    # A static robot makes the offset sweep degenerate (every offset fits
+    # the same pose) — observed live 2026-08-10 reading "80% stale" on a
+    # parked robot. The metric must refuse, not hallucinate.
+    h = TruthHistory()
+    for i in range(240):
+        h.feed(i * 0.05, (0.3, -0.2, 0.7))
+    ranges = _square_raycast((0.3, -0.2, 0.7))
+    assert content_lag(ranges, 0.12, 8.0, h.pose_at,
+                       _square_raycast, 8.0) is None
+
+
 def test_content_lag_survives_boxes_short_of_walls():
     # A displaced box (returns SHORT of the wall) must be excluded, not
     # counted as content error — same walls-only rule as the scan relay.
