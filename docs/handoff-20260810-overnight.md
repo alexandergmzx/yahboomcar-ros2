@@ -244,3 +244,30 @@ Morning decisions, appended:
 13. **Contact self-announcement**: odom-vs-IMU yaw-rate disagreement >3×
     for >0.5 s ⇒ governor stop — makes the blocked regime loud instead of
     silently corrupting the map.
+
+## Evening addendum (~16:40–17:10): the EKF fix attempt — honest negative
+
+Alex: still unstable; approved implementing the corrected-EKF fix with a
+validate-then-flip gate. Result: **the gate refused the flip, correctly.**
+
+- Landed: `--ekf {vendor,corrected,corrected-novyaw,n4-pure}` on simctl's
+  Isaac path (default vendor, UNCHANGED); `ekf_corrected_novyaw.yaml`
+  (variant) + `ekf_n4pure.yaml` (diagnostic); `/odom_laser` now in session
+  bags. Config package built, 84+9 tests green.
+- Measured live: both corrected variants FAIL the wall A/B and are MORE
+  jumpy than vendor away from walls (23 and 73 jumps >100 mm vs vendor's
+  handful). Convicted from the n4-pure bag: the EKF attenuates the honest
+  IMU yaw rate to **0.727× (corr 0.531)** — the offline N4 rescue integrated
+  at gain 1.0, and that difference is the whole offline/live gap. No
+  sign/frame error (ruled out).
+- Study updated with the live table and the specific next lead
+  (docs/slam-research/near-wall-stability.md, "Live A/B" section).
+
+Decision 11 UPDATED, not closed: the EKF-fusion switch is blocked on one
+measured question — why does ekf_filter_node low-pass a clean 25 Hz yaw-rate
+input by 27%? Diagnose OFFLINE against bag `20260810-165133` (process noise
+vs stamped measurement covariance vs the 10 Hz filter rate) before any
+further live session. Until then: the practical stability guidance for fun
+driving stands — the instability is the wheel channel under blocked-body
+conditions plus, in the corrected variants, this filter attenuation; vendor
+remains the default and the wall remains the boundary.

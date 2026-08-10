@@ -632,8 +632,27 @@ def cmd_start(args):
             return 2
         print('  [1/7] real bringup stack (idles until the robot exists)...')
         bringup_log = os.path.join(log, 'simctl-bringup.log')
-        p_stack = sh('ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py',
-                     dom, log=bringup_log)
+        # EKF selection (near-wall study, docs/slam-research/near-wall-stability.md):
+        # the vendor ekf.yaml fuses the wheel-yaw channel that lies ~6-26x with the
+        # body blocked at a wall, and the map fans. The corrected bringup accepts
+        # ekf_config:= and simctl already runs laser_odometry (the corrected
+        # config's /odom_laser pose input), so the swap is pure wiring.
+        ekf = getattr(args, 'ekf', 'vendor')
+        if ekf == 'vendor':
+            bringup_cmd = 'ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py'
+        else:
+            variant = {'corrected-novyaw': 'ekf_corrected_novyaw.yaml',
+                       'n4-pure': 'ekf_n4pure.yaml'}.get(ekf, 'ekf_corrected.yaml')
+            # Source path, deliberately: robot_localization reads any absolute
+            # file, and the novyaw variant must work without waiting for a
+            # colcon rebuild of the installed share.
+            cfg = os.path.join(REPO, 'yahboomcar_config', 'param', variant)
+            bringup_cmd = ('ros2 launch yahboomcar_config bringup_corrected_launch.py '
+                           f'ekf_config:={cfg}')
+            print(f'        EKF: {ekf} ({variant})')
+        p_stack = sh(bringup_cmd, dom, log=bringup_log)
+        srec.write_manifest(sess, {'flags': {**(srec.read_manifest(sess) or {}).get('flags', {}),
+                                             'ekf': ekf}})
         if args.safety:
             launch_safety(args, dom, log, '[2/7]')
         launch_laser_odometry(dom, log, '[3/7]')
@@ -1195,6 +1214,14 @@ def main():
     s.add_argument('--no-bag', dest='bag', action='store_false',
                    help='skip the default session bag (recorded so a "the map '
                         'went weird" moment is diagnosable after the fact)')
+    s.add_argument('--ekf', choices=['vendor', 'corrected', 'corrected-novyaw',
+                                     'n4-pure'],
+                   default='vendor',
+                   help='EKF fusion for the ISAAC path (2D keeps the vendor '
+                        'composition -- its bringup is bundled and it has no '
+                        'contact physics). corrected-novyaw excludes the wheel '
+                        'yaw channel that lies 6-26x when the body is blocked '
+                        'at a wall [near-wall-stability.md]')
     s.add_argument('--no-rviz', dest='rviz', action='store_false')
     s.add_argument('--no-slam', dest='slam', action='store_false')
     s.add_argument('--no-safety', dest='safety', action='store_false')

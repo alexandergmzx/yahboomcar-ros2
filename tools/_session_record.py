@@ -54,7 +54,10 @@ MIN_FREE_GB_FOR_BAG = 5.0
 # "the map went weird" with "what was commanded".
 SESSION_BAG_TOPICS = ('/scan', '/tf', '/tf_static', '/odom', '/odom_raw',
                       '/imu', '/sim/ground_truth', '/cmd_vel', '/cmd_vel_raw',
-                      '/battery')
+                      '/battery', '/odom_laser')
+# /odom_laser joined 2026-08-10 evening: the corrected-EKF live A/B failed in
+# a way the offline arm could not have (its pose input is /odom_laser, which
+# no bag recorded) — the suspect must be on the record to be convictable.
 
 
 def sessions_root(root: str | None = None) -> str:

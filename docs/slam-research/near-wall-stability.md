@@ -266,3 +266,39 @@ free-floor regime), physical contact is inferred rather than measured, and
 the corrected-EKF config was being credited with N4's structure it does not
 have. The pre-correction claims are in git history; the corrections are the
 document above.
+
+## Live A/B (same evening): the offline rescue does NOT transfer as-configured
+
+`simctl --ekf {vendor,corrected,corrected-novyaw,n4-pure}` was implemented and
+two live wall-approach sessions run (all auto-recorded; /odom_laser added to
+session bags for the second):
+
+| live variant | map (stop) | dup wall | worst jump | jumps >100 mm |
+|---|---|---|---|---|
+| vendor (baseline bags) | 9.36 × 7.20 | 0.46 | 3308 mm | few (5 >50 mm organic) |
+| corrected-novyaw (`20260810-164606`) | 5.62 × 8.50 | 0.54 | 1259 mm | **23** |
+| n4-pure (`20260810-165133`) | 5.92 × 9.26 | 1.46 | 2240 mm | **73** |
+
+**Both corrected variants FAIL live, and instability scales with IMU reliance**
+— the opposite of the offline ranking. The bag convicts the difference:
+raw IMU yaw rate is honest (median ratio to truth 1.012, corr 0.763 while
+turning) but the EKF's yaw OUTPUT under-rotates at **0.727× with corr 0.531**.
+The offline N4 arm integrated the IMU rate at gain 1.0; the live filter
+low-pass-filters it, and with no absolute yaw source the attenuation never
+recovers — a permanently lagging prior that slam_toolbox fights everywhere,
+not only at walls. **No sign/frame error** (ruled out by the same probe).
+
+Consequences, applied:
+
+- **The vendor default was NOT flipped** — the win criteria did their job.
+  `--ekf` ships as an EXPERIMENTAL flag, default `vendor`, so nothing changes
+  without opt-in. The param variants stay, labeled (novyaw: variant;
+  n4pure: diagnostic-only, nothing bounds drift).
+- The offline causality stands (same-bag N4 rescue is a replay fact); what
+  failed is THIS EKF CONFIGURATION's transfer of it. The next lead is
+  specific and measured: find why `ekf_filter_node` attenuates a clean
+  25 Hz yaw-rate measurement by ~27% (process-noise vs measurement-covariance
+  balance; the sim IMU's stamped covariances; `frequency: 10` against a
+  25 Hz input) — offline, against the recorded n4-pure bag, BEFORE any
+  further live sessions. Tuning it blind live would be exactly the
+  tune-before-diagnose failure the delivery plan forbids.
