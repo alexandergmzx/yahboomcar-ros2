@@ -411,6 +411,28 @@ async def serve(node: LensNode, args):
         await stop.wait()
         print('slam_lens: ROS context shut down, exiting', flush=True)
 
+    # File the metric history with the session it watched (audit 2026-08-10:
+    # live metrics used to die with the process). Fail-open: a dump problem
+    # must never turn a clean shutdown into a traceback.
+    try:
+        import _session_record as srec
+        dump = args.dump or None
+        if dump is None:
+            sess = srec.latest_session_dir(
+                int(os.environ.get('ROS_DOMAIN_ID', args.domain)))
+            if sess:
+                dump = os.path.join(
+                    sess, f'lens-history-{time.strftime("%Y%m%d-%H%M%S")}.json')
+        if dump and history:
+            with open(dump, 'w') as f:
+                json.dump({'columns': ['t', 'fit', 'div_pos', 'yaw_ratio',
+                                       'stale_run', 'lag_s'],
+                           'snapshot_hz': SNAPSHOT_HZ,
+                           'history': list(history)}, f)
+            print(f'slam_lens: metric history -> {dump}', flush=True)
+    except Exception as e:
+        print(f'slam_lens: history dump failed ({e})', flush=True)
+
 
 def main():
     ap = argparse.ArgumentParser(
@@ -427,6 +449,9 @@ def main():
     ap.add_argument('--base-frame', default='base_footprint')
     ap.add_argument('--sim-time', action='store_true',
                     help='use /clock (replays only, same rule as replay_slam_bag)')
+    ap.add_argument('--dump', default='',
+                    help='where to write the metric history on exit (default: '
+                         'the domain\'s latest session dir, if one exists)')
     args = ap.parse_args()
 
     os.environ.setdefault('ROS_DOMAIN_ID', str(args.domain))

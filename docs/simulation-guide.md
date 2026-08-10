@@ -155,6 +155,40 @@ AND `tools/build_arena.py` (the Isaac room), so the backends cannot drift apart.
 had: until 2026-08-08 the 2D room carried three mid-room boxes while Isaac had four by
 the corners, and no SLAM map could match both expectations at once.
 
+### What a session leaves behind
+
+Since 2026-08-10, `simctl start … stop` records itself — the audit trigger
+was a manual fun session whose close-box destabilization could not be
+diagnosed afterwards because it left **no bag, no saved map, no `/cmd_vel`
+record**, and the next `start` used to overwrite the previous session's
+logs (`sh()` wrote flat names with mode `'w'`; the overnight diagnosis
+sessions survived only by hand-copying).
+
+Every session now gets one directory, named by its correlation id:
+
+```text
+MicroROS-assets/logs/sessions/<stamp>-<backend>[-fun]-d<domain>/
+  session.json        flags, git SHA, bag path+sha256, map, duration,
+                      health counters (queue-full drops, relay drops,
+                      pacing trims, laser-odometry degeneracies)
+  events.log          ISO-stamped timeline: start, bag open/close, map
+                      save, stop — append-only
+  simctl-*.log        every component's log, no longer overwritten
+  map-<id>.{yaml,pgm} saved at stop while slam_toolbox is still alive
+  lens-history-*.json the SLAM lens's metric ring, filed on lens exit
+```
+
+The bag (in `MicroROS-assets/bags/<id>/`, mcap, 1 GB splits) carries the
+sensor topics AND `/cmd_vel` + `/cmd_vel_raw` — the command stream is what
+lets "the map went weird at t=93 s" be correlated with what was being
+commanded at t=93 s. `--no-bag` opts out; recording is skipped (and says
+so, and writes it in the manifest) below 5 GB of free disk. Recording is
+fail-open everywhere: a recording problem lands in `session.json`'s
+`errors` list and never breaks the session it was recording. The flat
+`logs/simctl-*.log` names remain valid as symlinks to the newest session.
+Counters distinguish "no evidence" (`null`, log absent) from "zero events"
+(`0`) — a 2D session reports `relay_dropped_scans: null`, not a fake zero.
+
 ### Watching SLAM properly: the lens
 
 ```bash test:skip
@@ -173,9 +207,17 @@ read 1.666× on the yaw tile — theory says 1.667). Read-only: it subscribes
 and looks up TF, publishes nothing, so it can watch any session without being
 able to disturb it. KNOWN LIMIT: the stale-scans tile counts bit-identical
 messages, which catches 2D-style duplication but NOT Isaac's render-pacing
-content lag (measured 2026-08-10: 0/3330 bit-identical while ~27% of scans
-carried ≥0.2 s-old content) — on Isaac, read the fit tile and the run report's
-content-lag probe instead.
+behavior (measured 2026-08-10: 0/3330 bit-identical). The content-lag tile is
+sim-only and must refuse static motion; a parked robot makes time-offset fitting
+unobservable. Guarded bag analysis found median −0.04 s and did not demonstrate
+material lag. Treat the tile as diagnostic context, not a map-failure verdict.
+
+Manual sessions are **not archived automatically**. `simctl` writes rolling
+files such as `MicroROS-assets/logs/simctl-isaac.log` and `simctl-slam.log`, and
+the next start overwrites them. If a manual speed, turn or obstacle interaction
+will support a diagnosis, start a timestamped bag first and save the map under
+a unique name; the rolling logs alone do not record command speed or box
+distance.
 
 ---
 

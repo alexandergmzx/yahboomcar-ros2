@@ -69,7 +69,17 @@ order (robots are zeroed BEFORE teardown):
 
 `simctl start` runs the canonical SLAM launch itself — do **not** launch
 `slam_launch.py` again on top: two `/slam_toolbox` nodes fight over
-`map→odom` and the map flickers apart. Inspect a running session with:
+`map→odom` and the map flickers apart.
+
+**Every session records itself.** A start creates a session directory
+(`MicroROS-assets/logs/sessions/<id>/` — the id correlates everything), all
+component logs land inside it (the flat `logs/simctl-*.log` names stay valid
+as symlinks), a capped bag records the sensor AND command topics
+(`--no-bag` to opt out; skipped automatically under 5 GB free disk), the map
+is saved at stop, and `session.json` carries flags, git SHA, bag checksum
+and the session's health counters. See "What a session leaves behind" in
+[docs/simulation-guide.md](docs/simulation-guide.md). Inspect a running
+session with:
 
 ```bash test:sim
 ./tools/simctl status
