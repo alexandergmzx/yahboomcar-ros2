@@ -642,7 +642,8 @@ def cmd_start(args):
             bringup_cmd = 'ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py'
         else:
             variant = {'corrected-novyaw': 'ekf_corrected_novyaw.yaml',
-                       'n4-pure': 'ekf_n4pure.yaml'}.get(ekf, 'ekf_corrected.yaml')
+                       'n4-pure': 'ekf_n4pure.yaml',
+                       'pn-fix': 'ekf_sim_pnfix.yaml'}.get(ekf, 'ekf_corrected.yaml')
             # Source path, deliberately: robot_localization reads any absolute
             # file, and the novyaw variant must work without waiting for a
             # colcon rebuild of the installed share.
@@ -1215,7 +1216,7 @@ def main():
                    help='skip the default session bag (recorded so a "the map '
                         'went weird" moment is diagnosable after the fact)')
     s.add_argument('--ekf', choices=['vendor', 'corrected', 'corrected-novyaw',
-                                     'n4-pure'],
+                                     'n4-pure', 'pn-fix'],
                    default='vendor',
                    help='EKF fusion for the ISAAC path (2D keeps the vendor '
                         'composition -- its bringup is bundled and it has no '

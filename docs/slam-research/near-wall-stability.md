@@ -302,3 +302,41 @@ Consequences, applied:
   25 Hz input) — offline, against the recorded n4-pure bag, BEFORE any
   further live sessions. Tuning it blind live would be exactly the
   tune-before-diagnose failure the delivery plan forbids.
+
+## Numeric identification (night session 2026-08-10n): the 0.727× convicted
+
+Offline system-identification harness (scratchpad `ekf_offline_harness.py`,
+preserved with the artifacts): the REAL corrected chain (madgwick + ekf_node
++ statics, `use_sim_time`) fed the recorded n4-pure bag's sensors on domain
+68, EKF output probed live, transfer computed vs the bag's ground truth.
+**Instrument gate passed first**: the harness reproduces the live phenomenon
+(ratio 0.760 vs live 0.727) and adds the decisive number — the EKF yaw
+output lags truth by **2.8 s**. A SLAM prior 2.8 s behind a turning robot
+can only fan.
+
+One hypothesis per arm, bounded list, all run:
+
+| arm | change | ratio | corr | lag |
+|---|---|---|---|---|
+| baseline | ekf_n4pure as-is | 0.760 | 0.702 | 2.80 s |
+| H1 | stamp IMU cov (0.02 rad/s)² | **0.612** | 0.619 | 2.9 s — **worse**: the stamped variance exceeds the zero-substitution epsilon, LOWERING trust |
+| **H2a** | process noise q(yaw,vyaw) ×10 | 1.008 | 0.935 | 0.22 s |
+| **H2b** | process noise q(yaw,vyaw) ×100 | **1.001** | **0.994** | **0.02 s** |
+| H3 | filter frequency 10→25 Hz | 0.731 | 0.610 | 2.84 s — dead |
+| H4 | fuse raw /imu (bypass madgwick) | 0.757 | 0.702 | 2.80 s — **madgwick exonerated** |
+| H5 | dynamic_process_noise on | 0.759 | 0.684 | 2.78 s — dead |
+
+**The cause is the process-noise/measurement-covariance balance, exactly as
+robot_localization's own reference params warn** (the [ADVANCED] note at
+`/opt/ros/jazzy/share/robot_localization/params/ekf.yaml:178-188`: fused
+velocity is a weighted average of prediction and measurement; "sluggish
+convergence... especially noticeable with LIDAR data during rotations";
+remedy = inflate process noise). Our corrected configs never set
+`process_noise_covariance`, so the defaults (q_yaw 0.06, q_vyaw 0.02) let
+the constant-velocity prediction dominate a clean 25 Hz gyro. At ×100 the
+filter finally believes its sensor: unit gain, 20 ms lag — the offline-N4
+behavior achieved INSIDE robot_localization, no custom node needed.
+
+Alex's framing was right: this was a numerical-methods problem — a filter
+gain mis-set by four orders of magnitude of variance ratio — not a robotics
+problem.
