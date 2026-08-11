@@ -227,12 +227,13 @@ sim-only and must refuse static motion; a parked robot makes time-offset fitting
 unobservable. Guarded bag analysis found median −0.04 s and did not demonstrate
 material lag. Treat the tile as diagnostic context, not a map-failure verdict.
 
-Manual sessions are **not archived automatically**. `simctl` writes rolling
-files such as `MicroROS-assets/logs/simctl-isaac.log` and `simctl-slam.log`, and
-the next start overwrites them. If a manual speed, turn or obstacle interaction
-will support a diagnosis, start a timestamped bag first and save the map under
-a unique name; the rolling logs alone do not record command speed or box
-distance.
+Manual sessions ARE archived automatically since 2026-08-10 — see "What a
+session leaves behind" above. (This paragraph previously warned the opposite:
+rolling logs overwritten per start, no bag, no command record. That world is
+gone; the warning survived here by accident and contradicted the section
+above — caught by Alex's audit. The one thing still worth doing by hand for
+a diagnosis-worthy moment: note the wall-clock time, so the session's
+events.log and bag can be cut to the right window quickly.)
 
 ---
 
