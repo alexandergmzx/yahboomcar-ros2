@@ -1,0 +1,39 @@
+# Reference geometry for the SIMULATED arena (both backends) — the authored
+# ground truth score_slam_map.py scores a simulator map against.
+#
+# NOT a tape measure, and does not pretend to be one: these numbers are the
+# construction constants in yahboomcar_sim/yahboomcar_sim/arena.py (ROOM_W,
+# ROOM_H, BOX_SIZE, ARENA_BOXES), the single source both backends build from
+# — the 2D simulator raycasts these exact segments, and tools/build_arena.py
+# authors the Isaac USD walls with their INSIDE faces flush at +/-2.0 m
+# (build_arena.py, "Perimeter walls, inside faces flush with +/-half").
+# Authored-before-the-run satisfies the reference-before-artifact rule the
+# same way a tape measure does for a physical room; what it can NEVER stand
+# in for is a physical-room reference — a map scored against this file is
+# SIMULATOR evidence only, never delivery evidence for physical SLAM
+# (docs/slam-delivery-plan.md).
+#
+# Boxes are DELIBERATELY not spans or features here: they are movable by
+# design (and fun mode exists to shove them), so only the never-moving walls
+# are scoreable geometry. Box smear is assessed separately, per run, against
+# the canonical positions in the notes.
+
+spans:
+  - name: room_depth_y
+    axis: y
+    metres: 4.0           # arena.py ROOM_H; inner wall face to inner wall face
+  - name: room_width_x
+    axis: x
+    metres: 4.0           # arena.py ROOM_W
+
+# No doorway: the arena is a closed room. `features` intentionally absent.
+
+notes: |
+  Simulated 4.0 x 4.0 m room shared by both backends (yahboomcar_sim.arena is
+  the single source; build_arena.py imports it for the Isaac USD). Four 0.30 m
+  boxes at (1.45, 1.45), (-1.45, 1.30), (1.35, -1.40), (-1.30, -1.45) —
+  canonical spawn positions, deliberately not 4-fold symmetric. Boxes are
+  movable: canonical arena boxes are 0.12 kg-scale props, arena_fun.usd boxes
+  are 0.02 kg feathers that any --fun session will have displaced. Wall
+  thickness in Isaac is 0.05 m with inside faces at +/-2.0; the 2D backend's
+  walls are zero-thickness segments at +/-2.0.

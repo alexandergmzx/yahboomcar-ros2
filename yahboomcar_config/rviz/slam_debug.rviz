@@ -135,10 +135,15 @@ Visualization Manager:
 
   Enabled: true
   Global Options:
-    # `map` while SLAM is running. If the map frame does not exist yet, RViz shows
-    # nothing at all and reports a TF error -- switch to `odom` to confirm the robot and
-    # scan are alive before blaming SLAM.
-    Fixed Frame: map
+    # `odom`, NOT `map` (changed 2026-08-09): with `map` as the fixed frame, RViz sits
+    # in a red "Frame [map] does not exist" error for as long as SLAM has not produced
+    # output -- minutes on an Isaac boot, where RViz now opens first on purpose -- and
+    # a red frame reads as a broken robot. `odom` exists as soon as the EKF publishes,
+    # every display still renders (the map is transformed through map->odom), and
+    # SLAM's corrections appear as the MAP stepping instead of the scan stepping,
+    # which is the more honest picture anyway: the correction is a revision of the
+    # map's opinion, not a sensor glitch (see rviz-guide.md, signature 3).
+    Fixed Frame: odom
     Background Color: 48; 48; 48
     Frame Rate: 30
   Tools:

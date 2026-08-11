@@ -57,11 +57,20 @@ import time
 # Extraction-aware layout (fleet D-12, session 4; single definition since the
 # 2026-08-08 audit found 18 tools with private stale copies): see tools/_layout.py.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _layout import REPO, WS_SETUP, ASSETS, _first_existing     # noqa: E402
+from _layout import (REPO, WS_SETUP, ASSETS, BAG_DIR, USD_DIR,            # noqa: E402
+                     _first_existing)
+from _dds_shm import stale_segments                              # noqa: E402
+# Session recording (audit 2026-08-10: the 12:02 close-box session left no bag,
+# no map, no /cmd_vel, and each start DESTROYED the previous session's logs).
+# One correlation id per session, everything filed under it. tools/_session_record.py.
+import _session_record as srec                                   # noqa: E402
 RVIZ_SLAM = _first_existing([
     os.path.join(REPO, 'yahboomcar_config', 'rviz', 'slam_debug.rviz'),
     os.path.join(REPO, 'yahboomcar_ws', 'src', 'yahboomcar_nav', 'rviz',
                  'slam_debug.rviz')])
+# The driving view: chase camera on base_footprint, fixed frame that exists from the
+# first second, map drawn behind when SLAM runs. What --fun sessions open.
+RVIZ_DRIVE = os.path.join(REPO, 'yahboomcar_config', 'rviz', 'drive.rviz')
 # ONE definition of the car's domain, shared with every guarded tool. Two copies of
 # this number would eventually disagree, and the one that was wrong would be the
 # structural refusal.
@@ -207,37 +216,9 @@ def running(patterns, domain=None):
     return pids
 
 
-def _mapped_shm_files():
-    """Every /dev/shm file currently mapped by a live process."""
-    live = set()
-    for maps in glob.glob('/proc/[0-9]*/maps'):
-        try:
-            with open(maps) as f:
-                for line in f:
-                    i = line.find('/dev/shm/')
-                    if i != -1:
-                        live.add(line[i:].strip())
-        except OSError:
-            continue          # process exited, or not ours to read
-    return live
-
-
-def stale_segments():
-    """Segments NO live process is using. The word 'stale' has to be earned.
-
-    This used to glob every /dev/shm/fastrtps* unconditionally, so `simctl stop` deleted
-    the shared memory of simulations it was not stopping. Demonstrated: with Isaac
-    running on domain 66, `simctl stop --domain 67` removed 147 segments and Isaac's
-    /scan went from 12.9 Hz to SILENT while its process stayed alive -- DDS transport
-    destroyed under a running participant, with nothing logged anywhere.
-
-    That is the same defect the domain-scoped kill was added to fix: an operation whose
-    blast radius exceeds its stated scope. Scoping the kills and leaving this global just
-    moved the problem somewhere quieter.
-    """
-    all_segs = glob.glob('/dev/shm/fastrtps*') + glob.glob('/dev/shm/sem.fastrtps*')
-    live = _mapped_shm_files()
-    return [s for s in all_segs if s not in live]
+# stale_segments()/_mapped_shm_files() moved to tools/_dds_shm.py (2026-08-10) when
+# replay_slam_bag.py needed the same logic and started out with an unscoped copy of it.
+# The incident that made staleness something to EARN is recorded there.
 
 
 def _tail(path, n=15):
@@ -447,20 +428,21 @@ def wait_map(dom, log):
         print(f'        Look at {os.path.join(log, "simctl-slam.log")}')
 
 
-def launch_rviz(dom, step):
-    print(f'  {step} RViz...')
+def launch_rviz(dom, step, cfg=None):
+    cfg = cfg or RVIZ_SLAM
+    print(f'  {step} RViz ({os.path.basename(cfg)})...')
     env = dict(os.environ)
     env.setdefault('DISPLAY', ':0')
     # simctl never starts Nav2 in any backend or flag combination, so the leaner
     # SLAM-only view is always correct here; nav2_debug.rviz's Nav2-only displays
     # (costmaps, plans, the Navigation 2 panel) would just sit as empty/warning
-    # entries with no publisher. Pass a different config by hand if you also start
-    # Nav2 yourself alongside a simctl session.
+    # entries with no publisher. Fun sessions get the drive view (chase camera).
+    # Pass a different config by hand if you also start Nav2 yourself.
     subprocess.Popen(
         ['bash', '-c',
          f'source /opt/ros/jazzy/setup.bash && source {WS_SETUP} && '
          f'export ROS_DOMAIN_ID={dom} && '
-         f'rviz2 -d {RVIZ_SLAM}'],
+         f'rviz2 -d {cfg}'],
         start_new_session=True, env=env,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(8)
@@ -482,6 +464,38 @@ def launch_patrol(args, dom, log, step):
     sh(f'python3 {REPO}/tools/sim_patrol.py --domain {dom}{extra}', dom,
        log=os.path.join(log, 'simctl-patrol.log'))
     time.sleep(6)
+
+
+def start_session_bag(args, dom, sess):
+    """Default-on session recording: the bag that makes a session diagnosable
+    after the fact. FAIL-OPEN — a recording failure is written down in the
+    manifest and never breaks the session it was meant to record."""
+    if not args.bag:
+        srec.write_manifest(sess, {'bag': {'requested': False}})
+        srec.log_event(sess, 'bag recording OFF by --no-bag')
+        return
+    free = srec.free_disk_gb(BAG_DIR if os.path.isdir(BAG_DIR) else ASSETS)
+    if free < srec.MIN_FREE_GB_FOR_BAG:
+        print(f'  !! session bag SKIPPED: {free:.1f} GB free is under the '
+              f'{srec.MIN_FREE_GB_FOR_BAG:.0f} GB floor')
+        srec.write_manifest(sess, {'bag': {'requested': True,
+                                           'skipped_low_disk_gb': round(free, 1)}})
+        srec.log_event(sess, f'bag SKIPPED, low disk ({free:.1f} GB free)')
+        return
+    bag_dir = os.path.join(BAG_DIR, srec.session_id(sess))
+    topics = ' '.join(srec.SESSION_BAG_TOPICS)
+    # Capped and split (the 4am disk rule), mcap like every bag here. The
+    # recorder outlives this process; stop finds its pid in the manifest and
+    # closes it with SIGINT so metadata.yaml gets written (an unclosed bag is
+    # not replayable, which would silently defeat the whole point).
+    p = sh(f'ros2 bag record -s mcap -o {bag_dir} '
+           f'--max-bag-size 1073741824 {topics}', dom,
+           log=os.path.join(sess, 'simctl-bag.log'))
+    print(f'        session bag: {bag_dir}')
+    srec.write_manifest(sess, {'bag': {'requested': True, 'path': bag_dir,
+                                       'recorder_pid': p.pid,
+                                       'topics': list(srec.SESSION_BAG_TOPICS)}})
+    srec.log_event(sess, f'bag recording started -> {bag_dir} (pid {p.pid})')
 
 
 def cmd_start(args):
@@ -519,6 +533,15 @@ def cmd_start(args):
             print('  FUN MODE: patrol suppressed -- fun is a DRIVING mode, and an '
                   'autonomous patrol')
             print('  with obstacle braking off is just a wall-grinder.')
+        # SLAM STAYS ON. It was forced off here for a few hours on 2026-08-10 -- "crash
+        # maps are garbage and their corrections yank the view" -- and that removed the
+        # map from the one view built for watching yourself drive. Alex reported it as
+        # "still no map on rviz". The view-yanking half of that reasoning was really the
+        # FIXED FRAME (drive.rviz now anchors to odom, so a correction moves the map
+        # while the robot and scan stay put) and the scan filter starving /scan; both
+        # are fixed. The other half -- a crash map is not EVIDENCE -- is a
+        # documentation matter, not a reason to delete what somebody wants to look at.
+        # `--no-slam` remains for anyone who genuinely wants pure driving.
         print('  *** FUN MODE (simulation only) ***')
         print('  Obstacle braking OFF, caps at the firmware maxima (1.0 m/s fwd and '
               'reverse,')
@@ -528,6 +551,25 @@ def cmd_start(args):
               '--backend isaac;')
         print('  the 2d backend has no contact physics. Drive with: '
               './tools/simctl teleop')
+        if args.slam:
+            print('  MAP: SLAM runs, so the map builds while you drive '
+                  '(--no-slam turns it off).')
+            if args.backend == 'isaac':
+                if getattr(args, 'ekf', 'pn-fix') == 'vendor':
+                    print('        --ekf vendor: turns WILL smear (/odom_raw yaw '
+                          'over-reports ~3x under')
+                    print('        turn slip; the default pn-fix fusion fixes '
+                          'this -- near-wall-stability.md).')
+                else:
+                    print('        Turns track under the default pn-fix fusion '
+                          '[measured, live-approved 2026-08-10].')
+                    print('        Sustained wall-grind under 0.3 m is still '
+                          'rough (decisions 12/15).')
+            print('        A fun-mode map is for looking at. It is never evidence.')
+        print('  SPEED: the vendor keyboard STARTS AT 0.2 m/s -- press q repeatedly '
+              'to raise')
+        print('  it toward the 1.0 m/s cap (each press +10%). Slow fun is usually '
+              'just this.')
 
     # Discovery remains as the SECOND layer, for a car provisioned onto another domain.
     print('  checking who is on this domain (up to ~15 s)...')
@@ -543,6 +585,32 @@ def cmd_start(args):
         print('  ./tools/simctl stop')
         return 2
 
+    # SESSION RECORD, from here on: refusals above leave nothing behind, but a
+    # start that gets this far is a session, even if it dies during bringup —
+    # a failed start's logs are evidence too. `log` becomes the session dir,
+    # which routes every component log into it without touching the helpers.
+    fun = getattr(args, 'fun', False)
+    sess = srec.new_session_dir(args.backend, fun, dom)
+    log = sess
+    try:
+        git_sha = subprocess.run(['git', '-C', REPO, 'rev-parse', '--short', 'HEAD'],
+                                 capture_output=True, text=True).stdout.strip()
+    except OSError:
+        git_sha = ''
+    srec.write_manifest(sess, {
+        'started': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+        'backend': args.backend, 'domain': dom, 'robot': getattr(args, 'robot', 'robot1'),
+        'git_sha': git_sha,
+        'flags': {'fun': fun, 'safety': args.safety, 'slam': args.slam,
+                  'rviz': args.rviz, 'patrol': args.patrol,
+                  'slip': getattr(args, 'slip', 0.0),
+                  'max_speed': getattr(args, 'max_speed', None),
+                  'bag': getattr(args, 'bag', True)},
+    })
+    srec.log_event(sess, f'start: backend={args.backend} fun={fun} domain={dom} '
+                         f'git={git_sha}')
+    print(f'  session: {srec.session_id(sess)}')
+
     if getattr(args, 'robot', 'robot1') == 'robot2':
         return start_robot2(args, dom, log)
 
@@ -554,13 +622,14 @@ def cmd_start(args):
         #
         # BOOT ORDER (2026-08-08, Alex): the LIGHT components first, Isaac LAST.
         # Everything in the stack is subscription-driven and idles harmlessly until
-        # the firmware topics exist, so nothing is gained by staring at a blank
-        # desktop for Isaac's ~90-420 s load. RViz comes up in seconds and becomes
-        # the visible progress bar: RobotModel appears when bringup publishes the
-        # description, the scan and map displays sit empty/red until Isaac and SLAM
-        # feed them -- that is the boot order made visible, not a fault. Patrol
-        # still comes ABSOLUTELY LAST: the firmware model latches the last command,
-        # so commands must not accumulate before the robot exists.
+        # the firmware topics exist. RViz, however, opens only AFTER the stack wait:
+        # both views anchor to `odom` (a world frame -- a moving fixed frame makes
+        # scans swim against the map, measured and reverted 2026-08-10), and the EKF
+        # cannot produce `odom` until the firmware speaks, so an early RViz is
+        # minutes of a red "frame does not exist" -- the original complaint. The
+        # terminal prints are the boot progress. Patrol still comes ABSOLUTELY
+        # LAST: the firmware model latches the last command, so commands must not
+        # accumulate before the robot exists.
         isaac_py = os.path.expanduser('~/isaac/env_isaaclab/bin/python')
         if not os.path.exists(isaac_py):
             # Checked BEFORE anything launches: failing here used to leave nothing
@@ -569,8 +638,28 @@ def cmd_start(args):
             return 2
         print('  [1/7] real bringup stack (idles until the robot exists)...')
         bringup_log = os.path.join(log, 'simctl-bringup.log')
-        p_stack = sh('ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py',
-                     dom, log=bringup_log)
+        # EKF selection (near-wall study, docs/slam-research/near-wall-stability.md):
+        # the vendor ekf.yaml fuses the wheel-yaw channel that lies ~6-26x with the
+        # body blocked at a wall, and the map fans. The corrected bringup accepts
+        # ekf_config:= and simctl already runs laser_odometry (the corrected
+        # config's /odom_laser pose input), so the swap is pure wiring.
+        ekf = getattr(args, 'ekf', 'vendor')
+        if ekf == 'vendor':
+            bringup_cmd = 'ros2 launch yahboomcar_bringup yahboomcar_bringup_launch.py'
+        else:
+            variant = {'corrected-novyaw': 'ekf_corrected_novyaw.yaml',
+                       'n4-pure': 'ekf_n4pure.yaml',
+                       'pn-fix': 'ekf_sim_pnfix.yaml'}.get(ekf, 'ekf_corrected.yaml')
+            # Source path, deliberately: robot_localization reads any absolute
+            # file, and the novyaw variant must work without waiting for a
+            # colcon rebuild of the installed share.
+            cfg = os.path.join(REPO, 'yahboomcar_config', 'param', variant)
+            bringup_cmd = ('ros2 launch yahboomcar_config bringup_corrected_launch.py '
+                           f'ekf_config:={cfg}')
+            print(f'        EKF: {ekf} ({variant})')
+        p_stack = sh(bringup_cmd, dom, log=bringup_log)
+        srec.write_manifest(sess, {'flags': {**(srec.read_manifest(sess) or {}).get('flags', {}),
+                                             'ekf': ekf}})
         if args.safety:
             launch_safety(args, dom, log, '[2/7]')
         launch_laser_odometry(dom, log, '[3/7]')
@@ -578,9 +667,7 @@ def cmd_start(args):
             # Activates via its own lifecycle manager and then idles until /scan
             # exists; the /map evidence wait happens after Isaac is up.
             launch_slam(dom, log, '[4/7]')
-        if args.rviz:
-            launch_rviz(dom, '[5/7]')
-        print('  [6/7] Isaac Sim (~90 s to start'
+        print('  [5/7] Isaac Sim (~90 s to start'
               + (')...' if args.no_isaac_gui else '; a window will open)...'))
         print('        NOTE /scan lands on 12 Hz by CALIBRATION against a measured but')
         print('        unexplained 72-messages-per-render-second emission rate, not by')
@@ -593,8 +680,19 @@ def cmd_start(args):
                   'you)')
         gui = '' if args.no_isaac_gui else ' --gui'
         isaac_log = os.path.join(log, 'simctl-isaac.log')
-        p_isaac = sh(f'{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}', dom,
-                     log=isaac_log)
+        arena_env = ''
+        if getattr(args, 'fun', False):
+            # Feather-box variant, built NEXT TO the canonical arena -- calibration
+            # results only ever come from arena.usd, so fun never contaminates them.
+            if os.path.exists(os.path.join(USD_DIR, 'arena_fun.usd')):
+                arena_env = 'YAHBOOM_ARENA_USD=arena_fun.usd '
+                print('        FUN arena: feather boxes (arena_fun.usd)')
+            else:
+                print('        (no arena_fun.usd built -- normal 0.12 kg boxes. Build '
+                      'the fun variant:')
+                print('         build_arena.py --box-mass 0.02 --out arena_fun.usd)')
+        p_isaac = sh(f'{arena_env}{isaac_py} {REPO}/tools/sim_runner.py --ros{gui}',
+                     dom, log=isaac_log)
         # Isaac keeps its own wait so an Isaac-side death and a bringup-side death
         # stay distinguishable (the 2026-08-08 repair's whole point). Bringup is
         # already up in this order, so it rides along in the procs dict: its exit
@@ -611,6 +709,8 @@ def cmd_start(args):
                     ('/odom_raw', 'Odometry', True)]),
                 420, {'sim_runner (Isaac)': p_isaac, 'bringup launch': p_stack},
                 [isaac_log, bringup_log]):
+            srec.add_manifest_error(sess, 'Isaac readiness wait failed; aborted')
+            srec.log_event(sess, 'ABORT: Isaac readiness wait failed')
             return 1
         stack_procs = {'sim_runner (Isaac)': p_isaac, 'bringup launch': p_stack}
         stack_logs = [bringup_log, isaac_log]
@@ -634,13 +734,28 @@ def cmd_start(args):
                 ('/scan', 'LaserScan', True),
                 ('/odom', 'Odometry', False)]),
             stack_budget, stack_procs, stack_logs):
+        srec.add_manifest_error(sess, 'stack wait failed; session aborted at bringup')
+        srec.log_event(sess, 'ABORT: stack wait failed')
         return 1
 
+    # The stack is up: record it. Placed here so the bag has the whole driven
+    # session but none of the multi-minute bringup silence.
+    try:
+        start_session_bag(args, dom, sess)
+    except Exception as e:                                   # fail-open, by design
+        print(f'  !! session bag failed to start: {e}')
+        srec.add_manifest_error(sess, f'bag start failed: {e}')
+
     if args.backend == 'isaac':
-        # The light components were all started BEFORE Isaac; the one thing that could
-        # not exist until the robot did is the SLAM output evidence.
+        # The light components were all started BEFORE Isaac. What could not exist
+        # until the robot did: the SLAM output evidence, and RViz -- which opens only
+        # now because both views anchor to `odom`, a frame the EKF cannot produce
+        # until the firmware speaks (see the boot-order comment above).
         if args.slam:
             wait_map(dom, log)
+        if args.rviz:
+            launch_rviz(dom, '[6/7]',
+                        RVIZ_DRIVE if getattr(args, 'fun', False) else None)
     else:
         if args.safety:
             launch_safety(args, dom, log, '[2/6]')
@@ -649,11 +764,19 @@ def cmd_start(args):
             launch_slam(dom, log, '[4/6]')
             wait_map(dom, log)
         if args.rviz:
-            launch_rviz(dom, '[5/6]')
+            launch_rviz(dom, '[5/6]',
+                        RVIZ_DRIVE if getattr(args, 'fun', False) else None)
 
     if args.patrol:
         launch_patrol(args, dom, log,
                       '[7/7]' if args.backend == 'isaac' else '[6/6]')
+
+    # Old habits keep working: the flat logs/simctl-*.log names now point INTO
+    # this session's directory instead of being the next session's victims.
+    srec.repoint_flat_symlinks(
+        sess, [f for f in os.listdir(sess) if f.startswith('simctl-')],
+        root=os.path.join(ASSETS, 'logs'))
+    srec.log_event(sess, 'bringup complete, session up')
 
     print()
     print('  up. ./tools/simctl status   to inspect,   ./tools/simctl stop   to tear down')
@@ -663,13 +786,19 @@ def cmd_start(args):
 # ------------------------------------------------------------------------- stop
 def cmd_stop(args):
     print('=== simctl stop ===')
+    # The session this stop is closing, if the start was session-aware. Every
+    # session step below is FAIL-OPEN: recording problems get written into the
+    # manifest, and the teardown itself never depends on them.
+    sess = srec.latest_session_dir(args.domain)
+    if sess:
+        srec.log_event(sess, 'stop: begun')
 
     # STEP 1: silence whatever is COMMANDING motion. Zeroing first does not work -- a
     # driver republishing at 20 Hz just overrides the zeros. Measured: the stop step
     # reported vx = 0.18 because the patrol was still commanding, and the robot only
     # halted when it was killed afterwards, which is precisely the accident this
     # ordering is meant to prevent.
-    print('  [1/5] silencing command sources (they would republish over the zeros)')
+    print('  [1/7] silencing command sources (they would republish over the zeros)')
     src = running(COMMAND_SOURCES, domain=args.domain)
     for p in src:
         try:
@@ -685,7 +814,7 @@ def cmd_stop(args):
     print(f'        {len(src)} command source(s) stopped')
 
     # STEP 2: now the zeros can actually land, and the governor (still alive) holds them.
-    print('  [2/5] stopping the robots, and verifying they are at rest')
+    print('  [2/7] stopping the robots, and verifying they are at rest')
     for dom, label in ((args.domain, 'simulation'), (CAR_DOMAIN, 'real car')):
         if dom == CAR_DOMAIN and args.no_car:
             print(f'        domain {dom} ({label}): skipped (--no-car)')
@@ -716,7 +845,72 @@ def cmd_stop(args):
               f'governor')
         print(f'        or deadman running on {CAR_DOMAIN} is left alone)')
 
-    print('  [3/5] killing simulation processes')
+    # STEP 3: close the session bag BEFORE the process sweep — SIGINT to the
+    # recorder's process group is what makes rosbag2 write metadata.yaml, and
+    # an unclosed bag is not replayable, which silently defeats recording.
+    print('  [3/7] closing the session bag')
+    manifest = srec.read_manifest(sess) if sess else None
+    bag_info = (manifest or {}).get('bag', {})
+    if bag_info.get('recorder_pid'):
+        pid = bag_info['recorder_pid']
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGINT)
+        except (ProcessLookupError, PermissionError):
+            pass
+        bag_dir = bag_info.get('path', '')
+        meta = os.path.join(bag_dir, 'metadata.yaml')
+        closed = False
+        for _ in range(20):                        # up to 10 s for the flush
+            if os.path.exists(meta):
+                closed = True
+                break
+            time.sleep(0.5)
+        sha = srec.bag_checksum(bag_dir) if closed else ''
+        print(f'        bag {"closed" if closed else "DID NOT CLOSE"}: {bag_dir}')
+        if sess:
+            srec.write_manifest(sess, {'bag': {**bag_info, 'closed': closed,
+                                               'sha256': sha}})
+            srec.log_event(sess, f'bag closed={closed} sha={sha[:16]}')
+            if not closed:
+                srec.add_manifest_error(sess, 'bag recorder did not write metadata.yaml')
+    else:
+        print('        no session bag to close')
+
+    # STEP 4: save the map while slam_toolbox is still alive. Skipped, and said
+    # so, when the session ran --no-slam.
+    print('  [4/7] saving the session map')
+    slam_on = bool(((manifest or {}).get('flags') or {}).get('slam'))
+    if sess and slam_on:
+        map_base = os.path.join(sess, f'map-{srec.session_id(sess)}')
+        p = sh(f'ros2 run nav2_map_server map_saver_cli -f {map_base}',
+               args.domain, log=os.path.join(sess, 'simctl-mapsave.log'),
+               background=True)
+        saved = False
+        for _ in range(24):                        # 12 s budget
+            if p.poll() is not None:
+                break
+            time.sleep(0.5)
+        if p.poll() is None:
+            kill_tree_pid = p.pid
+            try:
+                os.killpg(os.getpgid(kill_tree_pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        saved = (os.path.exists(map_base + '.yaml')
+                 and os.path.exists(map_base + '.pgm'))
+        print(f'        map {"saved" if saved else "NOT saved"}: {map_base}.yaml')
+        srec.write_manifest(sess, {'map_saved': saved,
+                                   'map_yaml': map_base + '.yaml' if saved else ''})
+        srec.log_event(sess, f'map saved={saved}')
+        if not saved:
+            srec.add_manifest_error(sess, 'map save failed or timed out (12 s)')
+    else:
+        why = 'session ran --no-slam' if sess else 'no session record found'
+        print(f'        skipped ({why})')
+        if sess:
+            srec.write_manifest(sess, {'map_saved': False, 'map_skipped': why})
+
+    print('  [5/7] killing simulation processes')
     pids = running(SIM_PROCS, domain=args.domain)
     for p in pids:
         try:
@@ -736,7 +930,7 @@ def cmd_stop(args):
           f'(domain {args.domain} only)')
 
     # Stale segments silently block new DDS participants: nodes just never appear.
-    print('  [4/5] clearing stale DDS shared memory')
+    print('  [6/7] clearing stale DDS shared memory')
     seg = stale_segments()
     for f in seg:
         try:
@@ -745,10 +939,30 @@ def cmd_stop(args):
             pass
     print(f'        {len(seg)} segments removed, {len(stale_segments())} left')
 
-    print('  [5/5] resetting the ros2 daemon (it caches a stale node list)')
+    print('  [7/7] resetting the ros2 daemon (it caches a stale node list)')
     subprocess.run(['bash', '-c',
                     'source /opt/ros/jazzy/setup.bash && ros2 daemon stop'],
                    capture_output=True)
+
+    # Finalize the session record: stop time, duration, and the health
+    # counters a morning reader currently greps by hand. Fail-open.
+    if sess:
+        try:
+            m = srec.read_manifest(sess) or {}
+            fields = {'stopped': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                      'counters': srec.session_log_counters(sess)}
+            try:
+                t0 = time.mktime(time.strptime(m.get('started', '')[:19],
+                                               '%Y-%m-%dT%H:%M:%S'))
+                fields['duration_s'] = round(time.time() - t0, 1)
+            except (ValueError, OverflowError):
+                pass
+            srec.write_manifest(sess, fields)
+            srec.log_event(sess, 'stop: complete')
+            print(f'  session record: {sess}/session.json')
+        except Exception as e:
+            print(f'  !! session finalize failed: {e}')
+
     print()
     print('  stopped.')
     return 0
@@ -771,6 +985,20 @@ def cmd_status(args):
                 print(f'      {want:20s} up   ({why})')
     print(f'  rviz2 instances: {len(running(["rviz2"]))}')
     print(f'  stale DDS segments: {len(stale_segments())}')
+    sess = srec.latest_session_dir(args.domain)
+    if sess:
+        m = srec.read_manifest(sess) or {}
+        bag = m.get('bag', {})
+        rec = 'off'
+        if bag.get('recorder_pid'):
+            try:
+                os.kill(bag['recorder_pid'], 0)
+                rec = f'RECORDING (pid {bag["recorder_pid"]})'
+            except (ProcessLookupError, PermissionError):
+                rec = 'closed' if bag.get('closed') else 'recorder gone (unclosed?)'
+        print(f'  session: {srec.session_id(sess)}'
+              + ('  [stopped]' if m.get('stopped') else '  [live]')
+              + f'  bag: {rec}')
     out = ros_eval(
         'from nav_msgs.msg import Odometry\n'
         'rclpy.init(); n=Node("simctl_status"); p=[]\n'
@@ -785,6 +1013,8 @@ def cmd_status(args):
 
 
 def cmd_patrol(args):
+    print('  (watching in RViz? The drive view\'s chase camera follows every spin --')
+    print('   the saved "Overhead" view in the Views panel is the one for spectating.)')
     return sh(f'python3 {REPO}/tools/sim_patrol.py --domain {args.domain}',
               args.domain, background=False).returncode
 
@@ -809,9 +1039,15 @@ def sim_target(domain):
         'while time.time()<end:\n'
         '    time.sleep(1.0)\n'
         '    names=[x for x,_ in n.get_node_names_and_namespaces()]\n'
-        '    topics=[t for t,_ in n.get_topic_names_and_types()]\n'
         '    real="YB_Car_Node" in names\n'
-        '    sim="fake_robot" in names or "/sim/ground_truth" in topics\n'
+        # PUBLISHERS of ground truth, not the topic's existence: a topic
+        # appears in the graph for a mere SUBSCRIBER too, and slam_lens (a
+        # read-only viewer, left open across sessions by design) subscribes
+        # to /sim/ground_truth -- with the topic test, a forgotten lens tab
+        # made every start refuse with "already running" [found 2026-08-10,
+        # first afternoon with the lens in routine use].
+        '    sim=("fake_robot" in names or\n'
+        '         len(n.get_publishers_info_by_topic("/sim/ground_truth"))>0)\n'
         '    if real: break\n'
         '    if sim:\n'
         '        if sim_at is None: sim_at=time.time()\n'
@@ -882,6 +1118,11 @@ def cmd_teleop(args):
         # Clear anything they latched before the keyboard takes over.
         zero_domain(args.domain, seconds=2.0)
         print('  silenced; the keyboard is now the only command source')
+
+    # The single most common "the car is slow" report is the vendor keyboard's own
+    # start speed, not any governor: it begins at 0.2 m/s / 1.0 rad/s and q raises
+    # both 10% per press (its own limits: 1.0 / 5.0).
+    print("  keyboard starts at 0.2 m/s -- press q repeatedly to go faster")
 
     gov_up = bool(running(['cmd_vel_governor'], domain=args.domain))
     if args.direct and gov_up:
@@ -977,6 +1218,19 @@ def main():
                         'stays armed, patrol is\n'
                         '                         suppressed. Real collisions only '
                         'on --backend isaac.')
+    s.add_argument('--no-bag', dest='bag', action='store_false',
+                   help='skip the default session bag (recorded so a "the map '
+                        'went weird" moment is diagnosable after the fact)')
+    s.add_argument('--ekf', choices=['vendor', 'corrected', 'corrected-novyaw',
+                                     'n4-pure', 'pn-fix'],
+                   default='pn-fix',
+                   help='EKF fusion for the ISAAC path (2D keeps the vendor '
+                        'composition -- bundled bringup, no contact physics). '
+                        'DEFAULT pn-fix since 2026-08-10 (Alex-approved after '
+                        'live driving): IMU-owned yaw with identified process '
+                        'noise -- transfer 1.001/lag 20 ms vs the vendor '
+                        'chain\'s 2.8 s lag [near-wall-stability.md]. '
+                        '--ekf vendor restores the old behaviour.')
     s.add_argument('--no-rviz', dest='rviz', action='store_false')
     s.add_argument('--no-slam', dest='slam', action='store_false')
     s.add_argument('--no-safety', dest='safety', action='store_false')

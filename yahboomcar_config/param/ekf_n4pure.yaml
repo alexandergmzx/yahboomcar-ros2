@@ -1,0 +1,136 @@
+# Corrected EKF, N4-PURE DIAGNOSTIC variant (novyaw + odom1 removed). Identical to ekf_corrected.yaml except
+# odom0's vyaw is excluded (see the odom0 block for the measured reason: the
+# 6-26x blocked-wheel yaw lie, docs/slam-research/near-wall-stability.md).
+# SIM-VALIDATED ONLY until a hardware bag says otherwise; the canonical
+# corrected config remains ekf_corrected.yaml. Variant lives NEXT TO the
+# canonical file, never in place of it (house rule).
+#
+# The header below is inherited verbatim from ekf_corrected.yaml so the two
+# files diff cleanly on exactly the one change.
+#
+# Corrected EKF configuration. The vendor's ekf.yaml is left untouched alongside this
+# one so the course PDFs stay correct and the two can be A/B'd on the same bag.
+#
+# WHAT IS WRONG WITH THE VENDOR CONFIG
+# ------------------------------------
+# 1. It fuses BOTH pose and twist from /odom_raw:
+#        odom0_config: [true, true, false,     <- x, y
+#                       false, false, true,    <- yaw
+#                       true, true, false,     <- vx, vy
+#                       false, false, true, ...] <- vyaw
+#    Pose is the integral of twist. Feeding both puts one measurement in twice, and the
+#    filter treats two perfectly correlated inputs as two independent ones. The result is
+#    a covariance that shrinks faster than the evidence justifies -- the filter becomes
+#    confident, not accurate. (Julier & Uhlmann's covariance-intersection work exists
+#    precisely because naive fusion of correlated estimates is inconsistent.)
+#
+# 2. It fuses BOTH yaw and yaw-rate from the IMU:
+#        imu0_config: [..., true (yaw), ..., true (vyaw), ...]
+#    Same double-count, and worse here: the ICM-42670-P is a 6-axis IMU with NO
+#    magnetometer, so its "yaw" is not an observation of anything absolute. It is the
+#    gyro integrated by the driver. Fusing it as an orientation measurement feeds
+#    integrated drift back in wearing the clothes of an independent fix.
+#
+# 3. Two sources of yaw, both dead-reckoned. Neither /odom_raw yaw nor IMU yaw is
+#    world-referenced, so averaging them cannot bound drift -- it only averages two
+#    drifting estimates while reporting the confidence of a redundant pair.
+#
+# 4. It fuses vy, which is identically zero on this chassis. A commanded strafe produces
+#    exactly zero on every /odom_raw axis (measured), so vy is a constant, not a
+#    measurement.
+#
+# WHAT THIS CONFIG DOES INSTEAD
+# -----------------------------
+# * /odom_raw contributes TWIST ONLY (vx, vyaw). It is a velocity sensor; let it be one.
+# * /imu contributes YAW RATE ONLY. No absolute yaw, because there is none to have.
+# * /odom_laser contributes POSE (x, y, yaw) -- the only world-referenced input available,
+#   and the only one that can bound drift rather than accumulate it.
+#
+# STATUS: BENCH-VALIDATED UNDER PURE SLIP, NOT VALIDATED IN MOTION.
+#
+# Measured 2026-08-06 with the car elevated and the body held still, wheels commanded to
+# 0.15 m/s for 15 s, so the true displacement was zero (tools/ekf_ab_test.py, prediction
+# recorded before the run, both runs bagged):
+#
+#     vendor ekf.yaml    2239 mm reported   <- tracked the commanded wheel distance to 0.5%
+#     this config           6 mm reported
+#     truth                 0 mm
+#
+# That confirms one specific claim: a world-referenced input stops the filter believing a
+# wheel that is lying. It says NOTHING about real motion, where the lidar has its own
+# errors and the wheels are mostly honest. Do not treat this as validated for driving,
+# and do not use it for anything safety-bearing until it has been run on a floor.
+# See docs/sensor-fusion-research.md.
+
+ekf_filter_node:
+    ros__parameters:
+        use_sim_time: false
+        frequency: 10.0
+        sensor_timeout: 0.1
+        two_d_mode: true
+        transform_time_offset: 0.0
+        transform_timeout: 0.0
+        print_diagnostics: true          # on, unlike the vendor: this config is on trial
+        debug: false
+        publish_tf: true
+        publish_acceleration: false
+        reset_on_time_jump: true
+
+        odom_frame: odom
+        base_link_frame: base_footprint
+        world_frame: odom
+
+        # --- wheel encoders: VELOCITY ONLY -------------------------------------------
+        # Order is [x, y, z, roll, pitch, yaw, vx, vy, vz, vroll, vpitch, vyaw,
+        #           ax, ay, az].
+        # Pose entries are all false: fusing them alongside the twist below would be the
+        # vendor's double-count. vy stays false because it is identically zero on a
+        # differential chassis, not because it is unmeasured.
+        #
+        # THE ONE CHANGE vs ekf_corrected.yaml: wheel vyaw is FALSE. The near-wall
+        # study (docs/slam-research/near-wall-stability.md) measured the encoder yaw
+        # channel lying at ~6-26x truth with the body blocked at a wall (one 118 s
+        # sample; free-floor lie is ~2.9x). The Mahalanobis gate above it is untested
+        # against that regime and rejects the whole twist when it fires; excluding
+        # the channel is structural. Rotation twist comes from the IMU alone (below),
+        # which is bolted to the BODY and cannot see wheel spin. This is the offline
+        # arm-N4 architecture, which rescued the worst blocked-wheel bag from 9.36 m
+        # of fanned room to 4.30 m [measured, same-bag replay].
+        odom0: /odom_raw
+        odom0_config: [false, false, false,
+                       false, false, false,
+                       true,  false, false,
+                       false, false, false,
+                       false, false, false]
+        odom0_queue_size: 10
+        odom0_nodelay: false
+        odom0_differential: false
+        odom0_relative: false
+        odom0_twist_rejection_threshold: 1.542
+
+        # --- lidar odometry: REMOVED in this diagnostic variant ------------
+        # The live novyaw A/B failed with 23 jumps >100 mm scattered across
+        # the session (vendor wall baseline: 5 total) -- the one live input
+        # the offline N4 rescue never had is /odom_laser fused as pose, whose
+        # own docstring marks it UNVALIDATED IN MOTION. This variant is the
+        # offline N4 architecture exactly: IMU yaw rate + wheel vx, nothing
+        # else. Diagnostic only, never a default candidate as-is (nothing
+        # bounds drift), used to separate "laser pose destabilizes" from
+        # "EKF dynamics differ from the offline integrator".
+        # --- IMU: YAW RATE ONLY ------------------------------------------------------
+        # No absolute yaw: there is no magnetometer, so the driver's yaw is the gyro
+        # integrated, and fusing it would be feeding this filter its own drift back.
+        imu0: /imu/data
+        imu0_config: [false, false, false,
+                      false, false, false,
+                      false, false, false,
+                      false, false, true,
+                      false, false, false]
+        imu0_nodelay: false
+        imu0_differential: false
+        imu0_relative: false
+        imu0_queue_size: 10
+        imu0_twist_rejection_threshold: 1.542
+        imu0_remove_gravitational_acceleration: true
+
+        use_control: false

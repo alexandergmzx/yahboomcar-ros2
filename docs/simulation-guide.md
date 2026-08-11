@@ -117,16 +117,123 @@ Obstacle braking OFF (the governor's stop/slow distances go to 0, making the obs
 rules unreachable), speed caps at the firmware maxima (1.0 m/s forward **and**
 reverse, 5.0 rad/s yaw). It is a governor *preset*, not a bypass: the deadman stays
 armed, a stale scan still stops the robot, and teleop keeps the single-writer
-discipline. The patrol is suppressed — fun is a driving mode. Real collisions (the
-0.12 kg cardboard boxes shove satisfyingly) exist only on the isaac backend; the 2D
-simulator has no contact physics. Simulation-only by construction: `simctl` refuses
-the car's domain structurally, and the hardware launch defaults are untouched.
+discipline. The patrol is suppressed — fun is a driving mode. **SLAM runs, so the map
+builds while you drive** (`--no-slam` turns it off); on `--backend isaac` the map will
+smear on turns, because `/odom_raw` yaw over-reports ~3× under turn slip — an open
+finding in [`slam-research/isaac-scan-quality.md`](slam-research/isaac-scan-quality.md).
+**A fun-mode map is for looking at. It is never evidence.** Real collisions exist only
+on the isaac backend; the 2D simulator has no contact physics.
+
+> SLAM was briefly forced OFF in fun mode (2026-08-10) on the argument that a crash map
+> is garbage and its corrections yank the view. That removed the map from the one view
+> built for watching yourself drive, and it was reported as "still no map on rviz". The
+> view-yanking was really the fixed frame (now `odom`) and the scan filter starving
+> `/scan`; both are fixed. A crash map not being *evidence* is a documentation matter,
+> which is what the sentence above is. Simulation-only
+by construction: `simctl` refuses the car's domain structurally, and the hardware
+launch defaults are untouched.
+
+Fun sessions open the **drive view** (`yahboomcar_config/rviz/drive.rviz`): a
+chase camera following `base_footprint`, anchored to the `odom` world frame so the
+scan stays glued to the world while the camera follows the car (a robot-anchored
+fixed frame made the scan swim against the map — measured and reverted). simctl
+opens RViz only once `/odom` is flowing, so the view is never red. If `arena_fun.usd` exists, fun isaac
+sessions load it — **feather boxes** (0.02 kg vs the calibrated 0.12): the car
+punches through at full speed (zone entry measured at 1.05 m/s, penetration to
+0.07 m of the box centre). Build it once:
+
+```bash test:skip
+~/isaac/env_isaaclab/bin/python tools/build_arena.py --box-mass 0.02 --out arena_fun.usd
+```
+
+Calibration results only ever come from the canonical `arena.usd`; the fun variant
+lives next to it, never in place of it.
 
 The arena defaults to the planned 4×4 m room with four 0.3 m boxes near the corners,
 defined once in `yahboomcar_sim/arena.py` and imported by `tools/arena_observability.py`
 AND `tools/build_arena.py` (the Isaac room), so the backends cannot drift apart. They
 had: until 2026-08-08 the 2D room carried three mid-room boxes while Isaac had four by
 the corners, and no SLAM map could match both expectations at once.
+
+### What a session leaves behind
+
+Since 2026-08-10, `simctl start … stop` records itself — the audit trigger
+was a manual fun session whose close-box destabilization could not be
+diagnosed afterwards because it left **no bag, no saved map, no `/cmd_vel`
+record**, and the next `start` used to overwrite the previous session's
+logs (`sh()` wrote flat names with mode `'w'`; the overnight diagnosis
+sessions survived only by hand-copying).
+
+Every session now gets one directory, named by its correlation id:
+
+```text
+MicroROS-assets/logs/sessions/<stamp>-<backend>[-fun]-d<domain>/
+  session.json        flags, git SHA, bag path+sha256, map, duration,
+                      health counters (queue-full drops, relay drops,
+                      pacing trims, laser-odometry degeneracies)
+  events.log          ISO-stamped timeline: start, bag open/close, map
+                      save, stop — append-only
+  simctl-*.log        every component's log, no longer overwritten
+  map-<id>.{yaml,pgm} saved at stop while slam_toolbox is still alive
+  lens-history-*.json the SLAM lens's metric ring, filed on lens exit
+```
+
+The bag (in `MicroROS-assets/bags/<id>/`, mcap, 1 GB splits) carries the
+sensor topics AND `/cmd_vel` + `/cmd_vel_raw` — the command stream is what
+lets "the map went weird at t=93 s" be correlated with what was being
+commanded at t=93 s. `--no-bag` opts out; recording is skipped (and says
+so, and writes it in the manifest) below 5 GB of free disk. Recording is
+fail-open everywhere: a recording problem lands in `session.json`'s
+`errors` list and never breaks the session it was recording. The flat
+`logs/simctl-*.log` names remain valid as symlinks to the newest session.
+Counters distinguish "no evidence" (`null`, log absent) from "zero events"
+(`0`) — a 2D session reports `relay_dropped_scans: null`, not a fake zero.
+
+### The Isaac session's EKF (default: pn-fix, since 2026-08-10)
+
+Isaac sessions run `yahboomcar_config` `bringup_corrected_launch.py` with
+`ekf_sim_pnfix.yaml` by default: wheel-vx + IMU-yaw twist fusion with the
+numerically identified process noise (the vendor chain attenuated a clean
+25 Hz gyro to 0.727× with a 2.8 s lag; the identified matrix reads
+transfer 1.001 / lag 20 ms — full derivation and live A/B in
+`docs/slam-research/near-wall-stability.md`). Approved as default by Alex
+after live driving. `--ekf vendor` restores the vendor fusion (and its turn
+smear) for comparison; `corrected`, `corrected-novyaw` and `n4-pure` remain
+as study variants. SIM-ONLY: the 2D backend keeps its bundled vendor
+composition (no contact physics, nothing to fix), and the hardware fusion
+question is separate — the real gyro is intermittently faulty and any
+gyro-leaning fusion there is gated on `sensor_health.py --rotate-window`.
+
+### Watching SLAM properly: the lens
+
+```bash test:skip
+./tools/slam_lens.py             # then open http://localhost:8765/  (domain 66)
+./tools/slam_lens.py --domain 68 --sim-time    # watching a replay
+```
+
+One browser canvas with the map, the scan endpoints at their TF-resolved pose
+(colored hit/miss against the map), the SLAM pose, a ground-truth ghost, and a
+pure-odometry ghost — plus four live metrics (scan→map fit, pose-vs-truth,
+odom/truth yaw ratio, scan staleness, TF@stamp) each tied to a failure this
+repo has measured. RViz shows you *a* picture; the lens shows you whether the
+sensor, the prior, and the map still agree, which is the question a smeared
+map actually poses. Negative-controlled on 2026-08-10 (injected `--slip 0.4`
+read 1.666× on the yaw tile — theory says 1.667). Read-only: it subscribes
+and looks up TF, publishes nothing, so it can watch any session without being
+able to disturb it. KNOWN LIMIT: the stale-scans tile counts bit-identical
+messages, which catches 2D-style duplication but NOT Isaac's render-pacing
+behavior (measured 2026-08-10: 0/3330 bit-identical). The content-lag tile is
+sim-only and must refuse static motion; a parked robot makes time-offset fitting
+unobservable. Guarded bag analysis found median −0.04 s and did not demonstrate
+material lag. Treat the tile as diagnostic context, not a map-failure verdict.
+
+Manual sessions ARE archived automatically since 2026-08-10 — see "What a
+session leaves behind" above. (This paragraph previously warned the opposite:
+rolling logs overwritten per start, no bag, no command record. That world is
+gone; the warning survived here by accident and contradicted the section
+above — caught by Alex's audit. The one thing still worth doing by hand for
+a diagnosis-worthy moment: note the wall-clock time, so the session's
+events.log and bag can be cut to the right window quickly.)
 
 ---
 

@@ -13,6 +13,7 @@ question "does the odometry agree with an independent sensor?"
 Only meaningful for a bag recorded WITH TRACTION. Elevated, the IMU correctly reads zero
 and the comparison is vacuous.
 """
+import os
 import sys
 
 from rosbag2_py import ConverterOptions, SequentialReader, StorageOptions
@@ -35,14 +36,14 @@ while r.has_next():
 if not odom or not imu:
     sys.exit('need both /odom_raw and /imu')
 
-# Nearest-neighbour resample of the IMU onto odom timestamps (odom is the slower stream).
-pairs = []
-j = 0
-for t, w_odom in odom:
-    while j + 1 < len(imu) and abs(imu[j + 1][0] - t) < abs(imu[j][0] - t):
-        j += 1
-    if abs(imu[j][0] - t) < 0.15:      # only accept close matches
-        pairs.append((w_odom, imu[j][1]))
+# Nearest-neighbour resample of the IMU onto odom timestamps (odom is the slower
+# stream). Shared implementation: the private copy of this loop deadlocked on
+# timestamp ties (strict `<` never crossed equal-stamp runs; audit 2026-08-10
+# measured 8/7,541 pairs on a bag where nearly all should pair) — see
+# tools/_pairing.py for the fix and its test.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _pairing import nearest_pairs                              # noqa: E402
+pairs = nearest_pairs(odom, imu, max_dt=0.15)
 
 turning = [(a, b) for a, b in pairs if abs(a) > 0.2]   # where the robot was rotating
 print(f'samples paired      : {len(pairs)}')

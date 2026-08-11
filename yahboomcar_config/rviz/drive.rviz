@@ -1,0 +1,114 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.5
+    Tree Height: 400
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    # ---- the floor under the game ------------------------------------------------
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.5
+      Plane Cell Count: 16
+      Color: 70; 70; 80
+      # The grid rides with the car (world-aligned, robot-centred) so there is
+      # always floor under the chase camera without the grid swimming.
+      Reference Frame: base_footprint
+
+    # ---- the car -----------------------------------------------------------------
+    - Class: rviz_default_plugins/RobotModel
+      Name: RobotModel
+      Enabled: true
+      Description Topic:
+        Value: /robot_description
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Reliable
+      Alpha: 1.0
+
+    # ---- what the lidar sees, styled for driving ---------------------------------
+    # BEST_EFFORT: the firmware publishes sensor QoS; a Reliable subscriber shows an
+    # empty display with no error whatsoever.
+    - Class: rviz_default_plugins/LaserScan
+      Name: LaserScan
+      Enabled: true
+      Topic:
+        Value: /scan
+        Depth: 5
+        Durability Policy: Volatile
+        Reliability Policy: Best Effort
+      Size (m): 0.045
+      Style: Flat Squares
+      Decay Time: 0
+      Color: 255; 170; 0
+      Color Transformer: FlatColor
+
+    # ---- the map, when SLAM is running; silently idle when it is not -------------
+    # Draw Behind, like nav2's default view, so the scan and the model stay on top.
+    - Class: rviz_default_plugins/Map
+      Name: Map
+      Enabled: true
+      Topic:
+        Value: /map
+        Depth: 1
+        Durability Policy: Transient Local
+        Reliability Policy: Reliable
+      Alpha: 0.6
+      Color Scheme: map
+      Draw Behind: true
+
+  Enabled: true
+  Global Options:
+    # `odom`, a WORLD frame -- not base_footprint (tried, wrong, reverted): RViz
+    # renders every display relative to the fixed frame's CURRENT pose but
+    # transforms scans at their message stamp, so a fixed frame bolted to the robot
+    # makes each scan up to one scan-period stale against the robot's own motion --
+    # at fun-mode yaw rates that is tens of degrees of swing per frame, scan and map
+    # visibly disagreeing (Alex's report, 2026-08-10). The chase camera does NOT
+    # need a moving fixed frame; following the robot is entirely the view's
+    # Target Frame doing its job. simctl opens this view only after /odom is
+    # flowing, so the frame always exists by the time anyone looks.
+    Fixed Frame: odom
+    Background Color: 34; 36; 43
+    Frame Rate: 30
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Views:
+    Current:
+      # The game camera: follows base_footprint's position AND heading in the XY
+      # plane, sitting behind and above the car (stock plugin; no extras needed).
+      Class: rviz_default_plugins/ThirdPersonFollower
+      Name: Chase
+      Target Frame: base_footprint
+      Distance: 3.0
+      Pitch: 0.55
+      Yaw: 3.1416
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+    Saved:
+      - Class: rviz_default_plugins/TopDownOrtho
+        Name: Overhead
+        Scale: 120
+        Target Frame: base_footprint
+        X: 0
+        Y: 0
+        Angle: 0
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 950
+  Width: 1500
+  Hide Left Dock: false
+  Hide Right Dock: true
