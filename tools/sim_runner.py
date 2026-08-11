@@ -94,6 +94,47 @@ YAW_LOSS = 0.52
 YAW_CMD_CAP = 4.31
 
 
+def trim_render_pacing(render_hz, measured, scan_hz, blend, trim_log):
+    """One trim step of the closed-loop render pacing. Pure, pytest-testable.
+
+    -> (new_render_hz, note or None). `trim_log` is the caller's list of
+    (render_hz, measured) pairs, appended here, used for the guard.
+
+    TWO FIXES [2026-08-10n, decision 2; measured trail in
+    docs/slam-research/near-wall-stability.md and isaac-scan-quality.md]:
+
+    FLOOR = scan_hz, not 2.0. Below one render per published revolution, a
+    revolution assembles across a render boundary and carries beams from two
+    world states -- at the 2.92-3.4/s the old floor allowed, that seam is a
+    ~0.33 s / tens-of-cm discontinuity INSIDE single scans at driving speed
+    (measured: walls-fit rms 0.023 -> 0.074 m slow -> fast; map jumps to
+    1.0 m p95). The 12 Hz contract is now enforced as a floor on renders,
+    and the calibrated emission constant only ever trims DOWN toward it.
+
+    DIVERGENCE GUARD: the loop assumes /scan rate is proportional to render
+    rate; measured across four sessions, pacing walked 23.08->3.43, 6.57->
+    2.92, 8.22->2.91, 6.57->3.0 while the measured rate barely moved (~13
+    Hz flat) -- dividing again on an unresponsive plant is how the runaway
+    happened. If cumulative pacing moved >2x while the measured rate moved
+    <10% across the same window, HOLD and say so once.
+    """
+    trim_log.append((render_hz, measured))
+    if len(trim_log) >= 4:
+        hz0, m0 = trim_log[-4]
+        if hz0 > 0 and measured > 0 and m0 > 0:
+            pacing_moved = max(hz0, render_hz) / max(1e-9, min(hz0, render_hz))
+            rate_moved = abs(measured - m0) / m0
+            if pacing_moved > 2.0 and rate_moved < 0.10:
+                return render_hz, (
+                    'pacing HELD: moved {:.1f}x over the last 4 trims while the '
+                    'measured rate moved {:.0f}% -- the proportional assumption '
+                    'is invalid here; not dividing again'.format(
+                        pacing_moved, rate_moved * 100))
+    new_hz = render_hz * (scan_hz / measured)
+    out = max(float(scan_hz), min(40.0, (1 - blend) * render_hz + blend * new_hz))
+    return out, None
+
+
 def compensate_yaw(wz):
     """Measured slip-compensation feedforward: desired body yaw -> wheel-differential
     command. Pure function so the constants are pytest-testable outside Isaac."""
@@ -900,6 +941,8 @@ def run_ros(sim, app, args, say):
     last_trim = _time.time()
     last_render_wall = 0.0
     scan_measured = None
+    trim_log = []                 # (render_hz, measured) pairs for the guard
+    trim_held = False             # say the HOLD message once, not per trim
     try:
         while True:
             t = _time.time() - t0
@@ -951,12 +994,16 @@ def run_ros(sim, app, args, say):
                     measured, ts = float(hz_s), float(ts_s)
                     if now - ts < 12.0 and 2.0 < measured < 100.0:
                         scan_measured = measured
-                        new_hz = render_hz * (SCAN_HZ / measured)
-                        render_hz = max(2.0, min(
-                            40.0, (1 - trim_blend) * render_hz + trim_blend * new_hz))
-                        if abs(measured - SCAN_HZ) > 0.06 * SCAN_HZ:
-                            say(f'  scan rate measured {measured:.1f} Hz -> render '
-                                f'pacing trimmed to {render_hz:.2f}/s')
+                        render_hz, note = trim_render_pacing(
+                            render_hz, measured, SCAN_HZ, trim_blend, trim_log)
+                        if note and not trim_held:
+                            trim_held = True
+                            say(f'  {note}')
+                        elif note is None:
+                            trim_held = False
+                            if abs(measured - SCAN_HZ) > 0.06 * SCAN_HZ:
+                                say(f'  scan rate measured {measured:.1f} Hz -> '
+                                    f'render pacing trimmed to {render_hz:.2f}/s')
                 except (OSError, ValueError):
                     pass          # probe not up yet; keep the current pacing
             if now - last_report >= 10.0:
@@ -978,8 +1025,12 @@ def run_ros(sim, app, args, say):
                     say(f'  WARNING: only {rtf:.2f}x realtime. The robot is moving in '
                         'slow motion relative to the wall-clock rates above, so any '
                         'timing taken from this run is meaningless.')
-                for k, wanted in (('scan', SCAN_HZ), ('odom', ODOM_HZ),
-                                  ('imu', IMU_HZ)):
+                # NOT 'scan': the OmniGraph never publishes /scan (the relay
+                # child does), so _counts['scan'] is structurally zero and the
+                # old loop printed a false '0.0 of 12 Hz' warning every 10 s
+                # for the whole session [decision 4]. The probe-measured line
+                # above is the real /scan number.
+                for k, wanted in (('odom', ODOM_HZ), ('imu', IMU_HZ)):
                     if c[k] / t < wanted * 0.9:
                         say(f'  WARNING: /{k} is only making {c[k]/t:.1f} of '
                             f'{wanted:.0f} Hz -- this machine cannot sustain the '
