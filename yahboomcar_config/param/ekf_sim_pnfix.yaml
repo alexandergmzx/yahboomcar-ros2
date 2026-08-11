@@ -124,7 +124,16 @@ ekf_filter_node:
         odom0_nodelay: false
         odom0_differential: false
         odom0_relative: false
-        odom0_twist_rejection_threshold: 1.542
+        # NO odom twist rejection gate. The inherited 1.542 Mahalanobis
+        # threshold REJECTED the 1.0 m/s step and never recovered -- Alex's
+        # audit measured EKF/truth linear speed 0.02x at speed while raw
+        # wheels stayed 0.95x honest; the same-bag no-gate A/B (2026-08-11,
+        # bag 20260810-202951) proved it: path ratio 0.47 gated -> 0.99
+        # ungated, yaw unchanged (0.958 vs 0.950). In SIM the gate's one
+        # theoretical job (clipping the wall-contact vx lie) is unproven and
+        # its measured cost was losing translation at fun speeds. Hardware
+        # may re-add a gate with a threshold identified against real bags.
+        # (imu0's gate below is untouched: not implicated, yaw measured fine.)
 
         # --- lidar odometry: REMOVED in this diagnostic variant ------------
         # The live novyaw A/B failed with 23 jumps >100 mm scattered across

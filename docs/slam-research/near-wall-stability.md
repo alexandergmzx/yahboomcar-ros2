@@ -440,3 +440,31 @@ live and the map survived** — the drop path's first live catch, closing the
 2026-08-09 "never observed live post-fix" caveat. Corruption rate vs render
 rate is now a measurable curve someone should draw before narrowing the trim
 ceiling (parked, decision 19).
+
+## The gate deadlock (Alex's audit, proven 2026-08-11): decision 18 mostly dissolves
+
+Alex's independent audit measured EKF/truth linear speed **0.02×** at 1.0 m/s
+while raw wheels stayed 0.95× honest, and named the suspect:
+`odom0_twist_rejection_threshold: 1.542` rejecting the speed step and never
+recovering. The same-bag no-gate A/B (their bag `20260810-202951`) proves it:
+
+| arm | yaw ratio / corr | path EKF / truth | path ratio |
+|---|---|---|---|
+| gated (as merged) | 0.958 / 0.648 | 8.04 / 17.09 m | **0.47** |
+| no-gate | 0.950 / 0.646 | 16.92 / 17.09 m | **0.99** |
+
+One line, zero yaw cost. Removed from `ekf_sim_pnfix.yaml` (imu0's gate
+retained — not implicated). **Live max-speed confirmation**
+(`20260811-001243`, patrol 1.0 m/s + 1.0 rad/s): path ratio **0.969**, map
+4.20 × 4.24 / dup 0.26 — the best max-speed map of the arc (pre-fix
+5.70 × 6.66; the audit session 5.06 × 5.70), formally FAIL by 0.06 m of
+duplicate wall at full fun aggression. Decision 18's "aggression layer" was
+therefore mostly the gate blacking out translation (the NOVX arm's
+near-empty map was this same condition, self-inflicted); what remains at
+max aggression is the 0.06 m dup margin, not a mystery mechanism.
+
+Instrument notes, honestly earned tonight: the harness probe undersampled
+under load (spin_once-per-loop; now executor-threaded) — earlier medians
+stand because the baseline reproduced the independently-measured live
+number, but sparse-burst bags need the fixed probe; and duplicate recv
+stamps (the audit's tie class) also NaN'd `np.gradient` until deduped.

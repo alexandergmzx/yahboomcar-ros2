@@ -355,3 +355,13 @@ pacing settled at 17.7/s and the seam corruption woke at that rate — the
 relay's drop path FIRED LIVE for the first time (400 drops, map survived),
 closing the 08-09 caveat. NEW decision 19: draw corruption-rate-vs-render-
 rate before narrowing the trim ceiling toward SCAN_HZ.
+
+## 2026-08-11 early: the gate deadlock — audit hypothesis proven, fixed, confirmed
+
+Alex's audit suspect (`odom0_twist_rejection_threshold` deadlocking on the
+1.0 m/s step) PROVEN by same-bag A/B: path ratio 0.47 gated → 0.99 ungated,
+yaw unchanged. Gate removed from ekf_sim_pnfix.yaml (imu0 gate retained);
+live max-speed confirm: path 0.969, best max-aggression map of the arc
+(4.20×4.24/dup 0.26, 0.06 m over the dup bar). Decision 18 largely
+dissolves into this; residual is margin, not mystery. Branch
+gate-fix-20260811, ready for Alex's merge call.
