@@ -271,3 +271,53 @@ further live session. Until then: the practical stability guidance for fun
 driving stands — the instability is the wheel channel under blocked-body
 conditions plus, in the corrected variants, this filter attenuation; vendor
 remains the default and the wall remains the boundary.
+
+## Night session 2 (2026-08-10n, branch `ekf-numerics-20260810n`): the numerics
+
+Alex's directive: research/test/try the numeric-methods angle overnight.
+**Alex was right — the whole failure was a filter gain.** Full trail in
+`docs/slam-research/near-wall-stability.md` (two new sections); artifacts in
+`MicroROS-assets/maps/near-wall-20260810/ekf-numerics/`.
+
+- **Identified**: offline system-id harness (reproduced the live 0.727x
+  first, then measured the missing number: EKF yaw lags truth 2.8 s). Six
+  bounded arms → process noise convicted (upstream's own [ADVANCED] warning);
+  q(yaw,vyaw)x100 → transfer 1.001 / corr 0.994 / lag 0.02 s. H1 covariance
+  stamping made it WORSE (epsilon substitution), madgwick exonerated.
+- **Offline map gates: all three bags rescued** by the fixed filter's real
+  TF (wallA 4.22x4.22, wallB 4.20x4.22, organic FULL PASS 4.16x4.18 — a bag
+  even vendor failed). Laser-pose fusion measured HARMFUL at high trust
+  (0.415) → excluded from the promoted sim config `ekf_sim_pnfix.yaml`.
+- **Live G3: dominance without the gate.** pn-fix beat vendor everywhere
+  (worst wall jump 3308→236 mm, patrol MAP at truth-prior quality 4.16x4.20 (its TF stream still shows 8 jumps >100mm in open space — see study),
+  open-space p95 22 mm) but missed the absolute bar (<100 mm jumps, map
+  PASS) in two wall attempts — residual confined to the <0.3 m grind band
+  where wheel-vx feeds phantom translation. **Arm closed per bounded
+  retries; the Isaac default REMAINS vendor.** Commits: dcce295 (+ final
+  study/handoff commit).
+
+Morning decisions, updated/added:
+
+11. → RESOLVED into 14: the corrected-EKF question is now the pn-fix question.
+14. **Flip Isaac default to `--ekf pn-fix`?** The dominance table says yes,
+    the absolute gate (set in the session plan before the runs; not repo-registered — noted) said not-tonight. Alex's call with the
+    table in front of them. If flipped: README+guide updates + one more
+    confirmation pair.
+15. **Contact-gated vx trust**: the last band's fix — zero wheel-vx trust
+    when odom-vs-IMU yaw disagreement exceeds ~3x (decision 13's alarm as a
+    fusion gate). Would attack the only regime pn-fix doesn't fix.
+16. **map_saver race**: stop's map save failed 2/3 sessions tonight
+    ("Failed to spin map subscription", 2 s internal timeout); maps were
+    recovered offline from session bags each time. Fix shape: retry once
+    or pass a longer timeout in simctl's step 4/7.
+17. **Hardware note**: everything tonight is SIM-validated. The pn-fix
+    reasoning (process-noise vs measurement-covariance balance) transfers
+    to hardware IN PRINCIPLE, but the real gyro is intermittently faulty
+    (the D-06/gyro-zero constraint) — a fusion leaning this hard on the
+    gyro NEEDS the sensor_health rotate-window gate before every hardware
+    session, and the laser-pose question must be re-asked there.
+
+Session hygiene: 3 live sessions (of 4 budgeted), lock taken/PID'd/released
+each time, verified dead each teardown; domains 66/68 only; bags capped;
+all sessions auto-recorded; Alex's four audit-edit files remain uncommitted
+and untouched; suite green at every commit.

@@ -325,6 +325,7 @@ One hypothesis per arm, bounded list, all run:
 | H3 | filter frequency 10→25 Hz | 0.731 | 0.610 | 2.84 s — dead |
 | H4 | fuse raw /imu (bypass madgwick) | 0.757 | 0.702 | 2.80 s — **madgwick exonerated** |
 | H5 | dynamic_process_noise on | 0.759 | 0.684 | 2.78 s — dead |
+| novyaw+pn | H2b matrix + /odom_laser pose (odom1) kept | **0.415** | 0.629 | −0.02 s — the laser-pose input HALVES the yaw transfer at high measurement trust; THIS row is why `ekf_sim_pnfix.yaml` has no odom1 (one bag, one config — hardware must re-ask) |
 
 **The cause is the process-noise/measurement-covariance balance, exactly as
 robot_localization's own reference params warn** (the [ADVANCED] note at
@@ -338,5 +339,53 @@ filter finally believes its sensor: unit gain, 20 ms lag — the offline-N4
 behavior achieved INSIDE robot_localization, no custom node needed.
 
 Alex's framing was right: this was a numerical-methods problem — a filter
-gain mis-set by four orders of magnitude of variance ratio — not a robotics
-problem.
+gain, corrected by a measured ×100 on two process-noise terms — not a
+robotics problem.
+
+## Live G3 (night session): dominance without the gate — default NOT flipped
+
+`--ekf pn-fix` (`ekf_sim_pnfix.yaml`, committed dcce295), three live sessions
+(all auto-recorded; the map_saver 2 s subscription race hit twice — maps
+recovered offline from the session bags, infra nit filed):
+
+| metric | vendor live wall | pn-fix wall #1 (`182351`) | pn-fix wall #2 (`183430`) |
+|---|---|---|---|
+| worst map→odom jump | 3308 mm / 31.5° | 550 mm / 8.0° | **236 mm / 1.7°** |
+| jumps >100 mm | (fans) | 23 | 18 |
+| stop/recovered map | 9.36 × 7.20, dup 0.46 | 4.96 × 4.58, dup 0.34 | 4.50 × 4.58, dup 0.28 |
+| open-space jump p95 | 199 / 228 mm (wall bags A/B; the organic free-drive bag reads 40 mm) | 23 mm | 22 mm |
+| patrol map (`182829`) | 7.24 × 7.08 FAIL | — | 4.16 × 4.20, dup 0.14 — ≈ the truth-prior gold standard (4.16 × 4.16) |
+
+**pn-fix strictly dominates vendor in every measured dimension** — worst
+jump 14× smaller, patrol at gold-standard quality, open space better —
+and the residual instability is CONCENTRATED toward the wall (wall #2:
+p95 210 mm under 0.3 m, 143 mm at 0.3–0.6 m, 22–31 mm beyond 0.6 m — the
+probe's ±1 s window smears contact events into neighbour bins). It is not
+strictly confined: the patrol session's TF stream shows 8 jumps >100 mm in
+open space (worst 179 mm at 0.76 m) even though its MAP is gold-standard —
+the map is the deliverable and the map is clean, but "stable everywhere but
+the wall" would overstate the TF stream. The leading explanation for the
+in-band residual remains the wheel-vx channel feeding phantom translation
+during the grind — PLAUSIBLE and still UNMEASURED (no vx-vs-truth probe
+exists yet; it is decision 12 for a reason).
+But the G3 criteria (map PASS-or-≤0.05 m over, near-wall jumps <100 mm —
+set in the session plan before the live runs, though only in the plan file,
+not repo-registered: future gates belong in the run report BEFORE execution)
+were **not met in two attempts, and the arm is closed** per the bounded-retry
+rule. The Isaac default therefore REMAINS `vendor` tonight;
+flipping on a dominance argument instead of the agreed bar is a morning
+decision, not a 3 A.M. one.
+
+What would close the gap, in evidence order: (a) don't grind the wall —
+away from it pn-fix's MAPS are already at gold-standard quality (its TF
+stream still carries occasional >100 mm corrections, see above);
+(b) a contact detector zeroing wheel-vx trust during the blocked regime
+(odom-vs-IMU disagreement, decision 13's alarm made into a fusion gate);
+(c) the delivery-plan-grade fix nobody simulated yet: braking ON sessions
+never enter the band at all.
+
+*(Night-session sections verified by a second adversarial two-lens pass:
+25 claims checked, 7 corrections forced and applied — among them the vendor
+open-space provenance cell, the omitted novyaw+pn arm row, the "confined"
+overstatement against the patrol TF stream, and the unregistered-gate
+wording. Pre-correction text is in git history.)*
