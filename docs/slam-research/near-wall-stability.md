@@ -389,3 +389,54 @@ never enter the band at all.
 open-space provenance cell, the omitted novyaw+pn arm row, the "confined"
 overstatement against the patrol TF stream, and the unregistered-gate
 wording. Pre-correction text is in git history.)*
+
+## The speed layer (evening round, Alex driving): scan fixed, aggression layer named
+
+Alex live-approved pn-fix ("it autocorrects the map to keep tracking the real
+car") and reported: at higher speed "the scan destabilized first, then the
+rest of SLAM." Their session bag (`20260810-190343`) pinned it: pacing had
+bottomed at 3.0 renders/s again, and the slow→fast walls-fit rms went
+0.023 → 0.074 m — at 3 renders/s a 12 Hz revolution assembles across a
+~0.33 s render boundary, a tens-of-cm discontinuity INSIDE single scans at
+driving speed. (Content lag as originally framed did NOT spike at speed —
+lag_frac was 0.034 in fast windows; the seam discontinuity is the correct
+mechanism, and the earlier "content lag" framing is superseded by it.)
+
+**Fix landed (decisions 2+4 closed, commit f1c1902):** trim policy extracted
+pure + tested (8 tests; two of the four recorded walks are replay fixtures, the other two cited in the docstring); floor =
+SCAN_HZ makes the downward walk structurally impossible; a divergence guard
+covers the remaining upward regime; the false '0.0 of 12 Hz' warning is
+gone. **Live validation (`20260810-195417`, scripted external patrol via sim_patrol at 0.6 m/s + 1.0 rad/s under fun mode — the manifest reads patrol:false because fun suppresses simctl's OWN patrol, and max_speed:0.35 does not govern fun; commit f1c1902's 'fast patrol' shorthand carries the same nuance):
+pacing held 12.0 all session, relay drops 10→1, fast-window fit rms
+0.026 ≈ slow quality — the scan layer Alex reported is FIXED.**
+
+**The layer behind it, named and parked:** at that same aggression the MAP
+still fails (5.70 × 6.66, jump p95 ~950 mm, with clean scans). Two offline
+arms on the same bag both died: F25 (filter at 25 Hz) made it WORSE
+(dup wall 2.80 — noisier prior); NOVX (drop wheel vx, gyro-only prior)
+lost tracking to a near-empty map — slam_toolbox here cannot live without a
+translation prior. Shared clue: the EKF-vs-truth yaw CORRELATION collapses
+to ~0.5 at this aggression even at unit ratio — and the plant itself is
+chaotic there (achieved-yaw variance 0.48/0.18/0.05 rad/s across sessions
+at fixed command, long documented). Caveat for the next pass: the pn-fix
+baseline transfer on THIS bag was not separately harnessed (the live
+session was pn-fix; its offline control is missing — run it first).
+Suspects, in order: skid-regime wheel-vx lie (still unmeasured — the
+decision-12 probe covers it), plant chaos at commanded 1.0 rad/s fun
+turns (beyond anything the floor procedure would command), EKF vx noise
+pollution at aggression. This is a NEW question, not a regression in the scoped sense: fun-at-max
+never passed a map gate in any era. The full no-regression sweep (organic
+and normal-speed patrol re-run under the new stack) has NOT been done —
+only the unit suite and the wall session below back the claim so far.
+
+**Wall no-regression under the full new stack** (`20260810-200741`, pn-fix
+default + pacing floor): worst near-wall jump **204 mm / 2.3°** — the best
+wall result of the whole arc (pre-pacing best 236, vendor 3308) — 10 jumps
+>100 mm, map 4.24 × 4.24 / dup 0.20. No regression anywhere; strict
+improvement. Two riders: pacing settled HIGH this session (17.7 renders/s —
+the floor plus an under-reading rate probe trims upward now), and at that
+rate the seam corruption woke up: **the relay dropped 400 corrupted scans
+live and the map survived** — the drop path's first live catch, closing the
+2026-08-09 "never observed live post-fix" caveat. Corruption rate vs render
+rate is now a measurable curve someone should draw before narrowing the trim
+ceiling (parked, decision 19).

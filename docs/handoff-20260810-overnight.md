@@ -321,3 +321,37 @@ Session hygiene: 3 live sessions (of 4 budgeted), lock taken/PID'd/released
 each time, verified dead each teardown; domains 66/68 only; bags capped;
 all sessions auto-recorded; Alex's four audit-edit files remain uncommitted
 and untouched; suite green at every commit.
+
+## Evening round 2 (Alex driving, ~19:00–20:30): approved, defaulted, next layer named
+
+Alex live-verdict on pn-fix: "behaves great... it autocorrects the map to
+keep tracking the real car" → **decision 14 APPROVED and executed**: pn-fix
+is the Isaac default (06238db; vendor one flag away; banner/README/guide
+updated; suites green). Decision 11 closed into it.
+
+Alex's fast-speed report ("the scan destabilized first") diagnosed from
+their own session bag and FIXED: the pacing runaway's intra-scan seam
+(decisions 2+4 closed, f1c1902 — floor at SCAN_HZ, divergence guard, false
+warning gone; 8 new tests; live-held 12.0 renders/s with fast-window scan
+quality at slow-window levels).
+
+NEW decision 18 — **the aggression layer**: at 0.6 m/s + 1.0 rad/s fun
+turns the map still fails with clean scans (jump p95 ~950 mm); F25 and
+NOVX arms both dead offline (worse / lost tracking); yaw corr collapses to
+~0.5 at unit ratio; plant itself chaotic at that command level. First
+moves for the next session: the missing pn-fix offline control on bag
+20260810-195417, then the decision-12 vx probe extended to skid regimes.
+Note: this aggression exceeds anything the floor procedure commands on the
+real car — a scope question ("should fun-at-maximum map?") rides along, as
+it did for the boxes (decision 3).
+
+Also landed on the way: slam_lens port-fallback (an operator lens tab on
+8765 is normal and never ours to kill — found by the README suite
+colliding with Alex's live tab).
+
+Round-2 wall no-regression (`20260810-200741`, full new stack): worst jump
+**204 mm** — best of the arc — map 4.24×4.24/dup 0.20 PASS-shaped. Rider:
+pacing settled at 17.7/s and the seam corruption woke at that rate — the
+relay's drop path FIRED LIVE for the first time (400 drops, map survived),
+closing the 08-09 caveat. NEW decision 19: draw corruption-rate-vs-render-
+rate before narrowing the trim ceiling toward SCAN_HZ.
