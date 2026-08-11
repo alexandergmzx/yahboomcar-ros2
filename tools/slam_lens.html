@@ -93,9 +93,9 @@ const TILES = [
   { id:'stale', k:'dup scans (2D)', f:m=>m.stale_run,
     fmt:v=>v===null?'—':String(v), bad:v=>v!==null&&v>=1, hist:4,
     sub:m=>`dup ${(100*(m.stale_frac||0)).toFixed(1)}% · max run ${m.stale_max}` },
-  // Isaac's render-pacing staleness is NOT duplication (measured 0/3330
-  // bit-identical while 27% of content was >=0.2 s old): only the
-  // time-offset fit against the walls model can see it. Sim-only tile.
+  // Isaac's render-pacing behavior is NOT duplication (0/3330 bit-identical).
+  // The sim-only time-offset fit asks a different question, but must refuse a
+  // static robot; guarded bag analysis did not demonstrate material lag.
   { id:'lag',   k:'content lag (sim)', f:m=>m.lag_s,
     fmt:v=>v===null?'—':v.toFixed(2)+' s', bad:v=>v!==null&&v<=-0.2, hist:5,
     sub:m=>m.lag_s===null?'needs truth + arena model':`walls-fit rms ${m.lag_rms===null?'—':m.lag_rms+' m'}` },

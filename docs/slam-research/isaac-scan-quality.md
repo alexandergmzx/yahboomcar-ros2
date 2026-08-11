@@ -41,9 +41,10 @@ raycast, median 0.080). Any fix has to be per-scan, not per-session.
 - **Time dilation / stamp lies** — stamps advance at wall rate (slope 1.0000 on /scan
   and /odom_raw); forward pose-path vs twist·stamped-dt ratio 0.999. Dead.
 - **Duplicate scans (stale content, fresh stamp)** — 0/614 bit-identical pairs. Dead
-  as DUPLICATES — but see the 2026-08-10 addendum below: at runaway-low render
-  pacing the staleness is real and does NOT present as bit-identical messages.
-  0/614 was measured at ~10 renders/s and does not generalize downward.
+  as DUPLICATES. The 2026-08-10 addendum initially claimed non-duplicate
+  content lag at runaway-low render pacing, but guarded re-analysis retracted
+  that claim too. 0/614 was measured at ~10 renders/s and still does not by
+  itself generalize downward.
 - **Content world-locked in orientation** — an early probe showed content rotating at
   0.061 rad/s under commanded 0.5, which fit world-locking; a counter-rotation relay
   built on it made things worse. The probe had compared content against /odom_raw
@@ -149,7 +150,7 @@ measured constants the feedforward tests pin — Alex's call. Until then: **the 
 backend validates the stack against clean scans, but its SLAM maps are NOT
 usable evidence**; the 2D backend remains the SLAM validation rig.
 
-## 2026-08-10 addendum: the render-pacing runaway (new, distinct third cause)
+## 2026-08-10 addendum: render-pacing runaway (controller defect; map impact unproven)
 
 Found reading the 2026-08-09 `--fun` session log after Alex reported the smear
 again, then REPRODUCED tonight in a patrol-driven headless fun session
@@ -163,26 +164,27 @@ the loop walked monotonically down — 23.08 → 3.43/s (08-09), and 6.57 → 2.
 (tonight) — while the measured /scan rate stayed ≈ 12.8-13.4 Hz, i.e. the
 measured rate barely responds to pacing in this regime, so the controller keeps
 dividing and heads for its 2.0/s floor. At 2.92 renders/s against a ~12.8 Hz
-publish rate, ~4.4 published revolutions share each rendered world state.
+publish rate, there are ~4.4 published scan messages per render invocation.
+That ratio demonstrates the controller's bad assumption; it does not by itself
+prove that those messages carry an unchanged or old world state.
 
-**How the staleness actually presents [measured tonight, 3331-scan bag]:**
+**What the scan-age probes establish [corrected after audit]:**
 
 - **NOT as duplicates.** 0/3330 bit-identical consecutive pairs AND 0/3330
   near-identical (max |Δr| < 5 mm over valid beams) — the RTX pipeline
-  re-assembles a fresh-looking revolution every message even when the world
-  state under it has not been re-rendered. The "0/614, Dead" line above was
-  true at ~10 renders/s and is the wrong test at 3.
-- **As content lag.** Fitting each scan against the walls-raycast at the truth
-  pose evaluated at (stamp + offset), sweeping offset −0.6..+0.2 s: median best
-  offset **−0.08 s**, but **~27% of scans fit best at −0.2 s or older**, with
-  17/124 pinned at the −0.6 s sweep limit — matching the ~0.34 s render period
-  of tonight's runaway pacing. rms at best offset 0.021 m (the content is
-  CLEAN, it is merely OLD under a fresh stamp).
+  re-assembles a fresh-looking revolution every message. This means duplicate
+  detection cannot answer whether content is old; it does not prove staleness.
+- **The first content-lag result is RETRACTED.** The scratch time-offset probe
+  did not reject a static robot, where every offset is equally plausible. It
+  reported −0.08 s median, 34/124 at ≤−0.2 s and 17 at the −0.6 s limit.
+  Applying the later mandatory motion/history guard excludes 47 samples
+  (46 static + one history-boundary) and yields median −0.04 s, p10 −0.14 s,
+  only 1/77 at ≤−0.2 s and no
+  −0.6 s hits. Run 2 independently yields median −0.04 s, p10 −0.146 s and
+  2/78 at ≤−0.2 s. Those results do not demonstrate material content lag.
 
-During a 0.6 rad/s patrol turn, a 0.4 s-stale scan injects ~14° of orientation
-error into the matcher while its stamp claims freshness — on top of, and
-independent from, the 2.9× encoder yaw prior. The relay cannot catch this
-(walls match fine at the OLD pose too under its one-sided bound), and the
+The earlier “up to 14° per stale scan” impact is therefore also retracted. The
+controller still diverges and should be fixed for simulator honesty, while the
 `_counts['scan']`-based "0.0 of 12 Hz" WARNING spam in the same log is a
 separate reporting bug (the OmniGraph never publishes /scan — the relay child
 does — so the counter is always zero; 30 false warnings per session).
@@ -194,9 +196,20 @@ controller divergence — hold pacing and say so, rather than dividing again.
 
 **Rank, from the same night's replay attribution** (full table in
 `docs/slam-runs/isaac-fun-20260810.md`): a replay of the same bag with the
-odometry prior rebuilt from ground truth — content lag and shoved fun boxes
-left fully intact — scored **PASS on every row** (4.16 × 4.16 m, dup wall
+odometry prior rebuilt from ground truth — the recorded scans and shoved fun
+boxes left intact — scored **PASS on every geometry row** (4.16 × 4.16 m, dup wall
 0.10 m), while the as-recorded arm reproduced the FAIL (7.24 × 7.08 m, dup
-1.10 m). So the encoder-yaw prior above remains the DOMINANT cause; this
-pacing fault is real but second-order for map quality at patrol speeds —
-fix it for sensor honesty, not as the smear cure.
+1.10 m). So the odometry prior remains the DOMINANT cause, with yaw strongly
+identified by the 2.82–2.95× turn error versus ~5% straight-line scale error
+and Alex's manual observations that maps break on ordinary/faster turns but are
+substantially more stable at low speed. Low speed plausibly reduces slip and
+per-scan angular disagreement; this is not yet a bagged speed-controlled A/B.
+
+Alex's follow-up also found a separate close-box boundary at low speed. It is
+not yet attributable among physical contact/additional slip, motion of the
+0.02 kg fun box, and residual near-field lidar dropout. The only surviving
+manual log set has no command or box-distance recording, bag, or map. It shows
+2/2885 laser-odometry degeneracies, one scan-relay rejection, and 89 SLAM queue
+drops—context, not correlation. The pacing fault remains real, but this session
+did not demonstrate that it harms map quality; fix it for sensor honesty, not
+as the smear cure.

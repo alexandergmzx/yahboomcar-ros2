@@ -293,12 +293,13 @@ def divergence(map_base_pose, truth_in_map_pose):
 class TruthHistory:
     """Recent ground-truth poses, interpolatable at any time in the window.
 
-    Feeds the content-lag metric: the 2026-08-10 Isaac diagnosis showed that
-    render-pacing staleness does NOT present as duplicate scans (0/3330
-    bit-identical at 2.92 renders/s) but as scans whose CONTENT fits the
-    truth pose of an earlier time (27% >= 0.2 s stale). Only a time-offset
-    fit can see it, and that needs a truth-pose history to evaluate at
-    (stamp + offset).
+    Feeds the content-lag metric. Duplicate scans cannot establish content age
+    on Isaac (0/3330 bit-identical at 2.92 renders/s), so this time-offset fit
+    asks whether scan content matches an earlier truth pose. The first live-bag
+    analysis overstated lag because it included a static robot; guarded
+    re-analysis found median -0.04 s and only 1/77 and 2/78 moving samples at
+    >=0.2 s across the two runs. That incident is why both history bounds and
+    the static-motion refusal below are part of the metric contract.
     """
 
     def __init__(self, window_s: float = 15.0):
