@@ -189,6 +189,21 @@ fail-open everywhere: a recording problem lands in `session.json`'s
 Counters distinguish "no evidence" (`null`, log absent) from "zero events"
 (`0`) — a 2D session reports `relay_dropped_scans: null`, not a fake zero.
 
+### The Isaac session's EKF (default: pn-fix, since 2026-08-10)
+
+Isaac sessions run `yahboomcar_config` `bringup_corrected_launch.py` with
+`ekf_sim_pnfix.yaml` by default: wheel-vx + IMU-yaw twist fusion with the
+numerically identified process noise (the vendor chain attenuated a clean
+25 Hz gyro to 0.727× with a 2.8 s lag; the identified matrix reads
+transfer 1.001 / lag 20 ms — full derivation and live A/B in
+`docs/slam-research/near-wall-stability.md`). Approved as default by Alex
+after live driving. `--ekf vendor` restores the vendor fusion (and its turn
+smear) for comparison; `corrected`, `corrected-novyaw` and `n4-pure` remain
+as study variants. SIM-ONLY: the 2D backend keeps its bundled vendor
+composition (no contact physics, nothing to fix), and the hardware fusion
+question is separate — the real gyro is intermittently faulty and any
+gyro-leaning fusion there is gated on `sensor_health.py --rotate-window`.
+
 ### Watching SLAM properly: the lens
 
 ```bash test:skip

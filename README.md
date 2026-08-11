@@ -101,18 +101,18 @@ run by the README suite:
 ```bash test:skip
 ./tools/simctl start --backend isaac --no-isaac-gui
 ./tools/simctl start --backend isaac --fun     # feather boxes, braking off, caps at firmware maxima
-./tools/simctl start --backend isaac --fun --ekf pn-fix   # EXPERIMENTAL fusion, see below
+./tools/simctl start --backend isaac --ekf vendor   # the pre-2026-08-10 fusion, for comparison
 ```
 
-`--ekf pn-fix` runs the numerically identified EKF fusion instead of the
-vendor config: IMU-owned yaw with corrected process noise (transfer 1.001 /
-lag 20 ms vs the vendor chain's 2.8 s lag —
-[the study](docs/slam-research/near-wall-stability.md)). Measured live:
-worst near-wall map jump 3308 → 236 mm, patrol map at truth-prior quality.
-It is NOT the default: it missed the absolute wall-grind gate (residual
-instability under 0.3 m standoff, suspected wheel-vx contact lie —
-unmeasured), so `vendor` remains default until the morning decision.
-Expect visibly stabler turning; still avoid grinding the walls.
+Isaac sessions default to the **pn-fix EKF fusion** (Alex-approved after live
+driving, 2026-08-10): IMU-owned yaw with numerically identified process
+noise — transfer 1.001 / lag 20 ms where the vendor chain lagged 2.8 s
+([the study](docs/slam-research/near-wall-stability.md)). Measured live:
+worst near-wall map jump 3308 → 236 mm, patrol map at truth-prior quality,
+turns track instead of smearing. Known remaining edge: sustained wall-grind
+under 0.3 m standoff (suspected wheel-vx contact lie — unmeasured, decision
+12). `--ekf vendor` restores the old behaviour; SIM-validated only — the
+hardware fusion question is separate and gyro-gated.
 
 Isaac SLAM maps are **not usable evidence** (see
 [status](#status-delivered-and-not-delivered)). The full backend comparison,

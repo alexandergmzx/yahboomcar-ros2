@@ -403,9 +403,28 @@ async def serve(node: LensNode, args):
         return None      # anything else: proceed with the WebSocket handshake
 
     asyncio.create_task(sampler())
-    async with websockets.serve(handler, args.host, args.port,
-                                process_request=process_request):
-        print(f'slam_lens: http://{args.host}:{args.port}/   '
+    # A lens is often already open on the default port (an operator tab from
+    # the previous session -- normal, and never ours to kill). Walk forward a
+    # few ports instead of dying on EADDRINUSE.
+    server = None
+    port = args.port
+    for candidate in range(args.port, args.port + 6):
+        try:
+            server = await websockets.serve(handler, args.host, candidate,
+                                            process_request=process_request)
+            port = candidate
+            break
+        except OSError:
+            continue
+    if server is None:
+        print(f'slam_lens: ports {args.port}-{args.port + 5} all busy; exiting',
+              flush=True)
+        return
+    async with server:
+        if port != args.port:
+            print(f'slam_lens: port {args.port} busy (another lens?), '
+                  f'using {port}', flush=True)
+        print(f'slam_lens: http://{args.host}:{port}/   '
               f'(domain {os.environ.get("ROS_DOMAIN_ID", "?")}, '
               f'map {args.map_topic}, scan {args.scan_topic})', flush=True)
         await stop.wait()

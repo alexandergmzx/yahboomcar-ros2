@@ -555,10 +555,16 @@ def cmd_start(args):
             print('  MAP: SLAM runs, so the map builds while you drive '
                   '(--no-slam turns it off).')
             if args.backend == 'isaac':
-                print('        On isaac it WILL smear on turns: /odom_raw yaw '
-                      'over-reports ~3x under')
-                print('        turn slip [open finding, '
-                      'docs/slam-research/isaac-scan-quality.md].')
+                if getattr(args, 'ekf', 'pn-fix') == 'vendor':
+                    print('        --ekf vendor: turns WILL smear (/odom_raw yaw '
+                          'over-reports ~3x under')
+                    print('        turn slip; the default pn-fix fusion fixes '
+                          'this -- near-wall-stability.md).')
+                else:
+                    print('        Turns track under the default pn-fix fusion '
+                          '[measured, live-approved 2026-08-10].')
+                    print('        Sustained wall-grind under 0.3 m is still '
+                          'rough (decisions 12/15).')
             print('        A fun-mode map is for looking at. It is never evidence.')
         print('  SPEED: the vendor keyboard STARTS AT 0.2 m/s -- press q repeatedly '
               'to raise')
@@ -1217,12 +1223,14 @@ def main():
                         'went weird" moment is diagnosable after the fact)')
     s.add_argument('--ekf', choices=['vendor', 'corrected', 'corrected-novyaw',
                                      'n4-pure', 'pn-fix'],
-                   default='vendor',
+                   default='pn-fix',
                    help='EKF fusion for the ISAAC path (2D keeps the vendor '
-                        'composition -- its bringup is bundled and it has no '
-                        'contact physics). corrected-novyaw excludes the wheel '
-                        'yaw channel that lies 6-26x when the body is blocked '
-                        'at a wall [near-wall-stability.md]')
+                        'composition -- bundled bringup, no contact physics). '
+                        'DEFAULT pn-fix since 2026-08-10 (Alex-approved after '
+                        'live driving): IMU-owned yaw with identified process '
+                        'noise -- transfer 1.001/lag 20 ms vs the vendor '
+                        'chain\'s 2.8 s lag [near-wall-stability.md]. '
+                        '--ekf vendor restores the old behaviour.')
     s.add_argument('--no-rviz', dest='rviz', action='store_false')
     s.add_argument('--no-slam', dest='slam', action='store_false')
     s.add_argument('--no-safety', dest='safety', action='store_false')
