@@ -37,6 +37,7 @@ backend-internal truth: this process is part of the simulated firmware, using th
 simulator's own state to emit its own sensor honestly. The stack sees only /scan.
 """
 import math
+import json
 import os
 import sys
 import threading
@@ -73,6 +74,43 @@ MIN_VALID_BEAMS = 200
 FAIL_OPEN_FRACTION = 0.9
 FAIL_OPEN_WINDOW = 300
 
+# WHICH ROOM. `segments_room()` is the stock 4 x 4 m test arena, and it is still
+# the default -- every fleet caller keeps exactly the behaviour it had.
+#
+# It is not the only arena any more. A caller that loads a different world can
+# name a JSON file of wall segments here, in the same [[[x1,y1],[x2,y2]], ...]
+# form `raycast` already takes, and the corruption filter then works there too.
+#
+# WITHOUT it, on any other arena, this node is not a filter. Measured on the
+# corridor scenario across 56 of 62 Isaac sessions: essentially every beam
+# "sees through the wall" of a room that is not the room, so /scan publishes
+# NOTHING for the ~21 s it takes to fill the fail-open window, and then passes
+# raw scans -- including the phase-corrupted revolutions this node exists to
+# drop -- to slam_toolbox, both costmaps and the governor for the rest of the
+# run. Silent in both halves: the blackout looks like a slow twin, and the
+# passthrough looks like a working filter.
+WALLS_ENV = 'SCAN_RELAY_WALLS_JSON'
+
+
+def load_walls():
+    """The wall model to validate scans against: the stock room, or a caller's.
+
+    Fail CLOSED on a bad path, deliberately. A missing or malformed file means
+    the caller believes it supplied geometry and did not, and falling back to
+    the 4 x 4 m room there would reproduce exactly the silent-blackout failure
+    this exists to end.
+    """
+
+    path = os.environ.get(WALLS_ENV)
+    if not path:
+        return segments_room(), f'stock {segments_room.__module__} room'
+    with open(path) as handle:
+        raw = json.load(handle)
+    walls = [((float(a[0]), float(a[1])), ((float(b[0]), float(b[1])))) for a, b in raw]
+    if not walls:
+        raise ValueError(f'{path} carries no wall segments')
+    return walls, f'{len(walls)} segments from {path}'
+
 
 def yaw_of(q):
     return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
@@ -103,7 +141,8 @@ class ScanFilter(Node):
         super().__init__('scan_frame_relay')
         self._lock = threading.Lock()
         self._pose = None                   # (x, y, yaw), newest truth
-        self._walls = segments_room()
+        self._walls, source = load_walls()
+        self.get_logger().info(f'wall model: {source}')
         self._recent = []                   # last FAIL_OPEN_WINDOW pass/fail bools
         self._fail_open = False
         self._dropped = 0
