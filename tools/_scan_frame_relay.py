@@ -68,7 +68,19 @@ BEYOND_WALL_TOL_M = 0.25
 IMPOSSIBLE_GATE = 0.10
 # The RTX pipeline emits -1.0 as a no-return sentinel; a few appear even in good
 # scans. Excluded from the test, and a scan that is MOSTLY sentinel is junk alone.
-MIN_VALID_BEAMS = 200
+#
+# 200 of 360 is a CLOSED ROOM's number. In the 4 x 4 m test arena every beam
+# finds a wall inside range; in an open scene most of a revolution can see
+# nothing at all. Measured on the corridor over 5293 scans: median 175 valid
+# beams, mean 181, min 72 -- so this gate alone rejects 64.3% of perfectly good
+# scans, before any geometry is considered. That, not the wall model, is what
+# kept the filter failing open there after it was given the right walls: replayed
+# against the corridor's own geometry only 1.1% of those scans are actually
+# impossible.
+#
+# Overridable for the same reason the wall model is, and defaulting to 200 so
+# every existing fleet caller is unchanged.
+MIN_VALID_BEAMS = int(os.environ.get('SCAN_RELAY_MIN_VALID_BEAMS', '200'))
 # Fail-open only on near-total failure over a long window: geometry mismatch fails
 # ~100%; corruption bursts (36 measured) and bad mixtures (~50%) never reach this.
 FAIL_OPEN_FRACTION = 0.9
