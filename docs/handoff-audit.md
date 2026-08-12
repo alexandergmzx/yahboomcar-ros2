@@ -55,6 +55,17 @@ and was wrong:
 
 ## Known defects, open
 
+> **CALIBRATED 2026-08-12: `WHEEL_R` is now 0.0489, not 0.0458.** Measured from
+> thirteen recorded robot1 corridor transits — straight-window median 0.9366 of
+> ground truth over seven bags, none reaching parity. **Every robot1 SIM
+> measurement recorded before that date predates this calibration**, so any
+> distance, speed or odometry figure quoted from an earlier Isaac session is
+> ~6.5% off in the direction that constant moved. Hardware is unaffected: this
+> constant lives in the Isaac path only. The 1.87x anomaly below is NOT
+> explained by the calibration — it is fleet OI-23.
+>
+> Evidence: corridor-twin `docs/evidence/robot-a-gate/NOTES-odometry-scale.md`.
+
 - **Effective rolling radius in sim is 1.87x the geometric one** — 0.0458 m measured
   against 0.0245 from both the STL and the imported mesh bbox. A driven wheel cannot
   propel a body faster than pure rolling, so this points at an angular-unit or

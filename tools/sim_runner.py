@@ -66,7 +66,29 @@ WHEEL_R_GEOMETRIC = 0.0245
 # robot's import; it is a property of the Isaac joint-velocity pathway itself.
 # Evidence: rasptank-ros2/tools/build_rasptank_arena.py forward gate;
 # fleet docs/research-log.md session-5 table.
-WHEEL_R = 0.0458
+# CALIBRATED 2026-08-12 from 0.0458 -> 0.0489. Measured, not tuned: thirteen
+# recorded robot1 corridor transits, distance accumulated in 1 s windows against
+# /sim/ground_truth, restricted to windows with under 5 deg/s of heading change
+# so that turning slip cannot contaminate the ratio. On straight driving
+# /odom_raw under-reports by 6.3% on all seven bags long enough to have straight
+# windows -- median 0.9366, range 0.852-0.946, none reaching parity, and the
+# spread tightens from 0.296 to 0.094 once turning windows are excluded. Slip
+# would make wheels OVER-report; this under-reports while driving straight, so
+# it is the constant and not the contact.
+#
+# 0.0458 / 0.9366 = 0.0489. It also agrees with this file's own earlier note
+# above -- 0.2 m/s commanded measured 0.210 m/s of ground truth, +5% -- reached
+# independently and by a different method.
+#
+# Two things move together, because one constant does both jobs: the odometry
+# stops under-reporting distance, and the robot stops driving ~7% faster than it
+# is told to.
+#
+# Evidence: corridor-twin docs/evidence/robot-a-gate/NOTES-odometry-scale.md and
+# odometry-scale-20260812.json; tool corridor-twin tools/odometry_scale_audit.py.
+# This does NOT explain the ~2.0 units/convention factor described above; it
+# corrects the number, and the OI owns the why.
+WHEEL_R = 0.0489
 LY = 0.0675            # half-track from the URDF joint origins
 LEFT = ['zq_Joint', 'zh_Joint']
 RIGHT = ['yq_Joint', 'yh_Joint']
