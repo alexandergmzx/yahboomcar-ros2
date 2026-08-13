@@ -130,8 +130,22 @@ if got['odom_raw']:
     xs = [math.hypot(x[1].pose.pose.position.x, x[1].pose.pose.position.y)
           for x in got['odom_raw']]
     print(f'odom: travelled {max(xs) - min(xs):.3f} m during the run')
-    if max(xs) - min(xs) < 0.02:
+    # Only a failure if this run ASKED for motion. A caller that passes
+    # --speed 0 --turn 0 is using this as a rate report and has said so; failing
+    # it for not moving makes a permanently-false failure, and a failure that
+    # can never be fixed is one people learn to scroll past.
+    #
+    # The corridor does exactly that: its scenario cannot afford the 0.4 m arc
+    # this tool drives by default, because the arc happens before SLAM and Nav2
+    # exist and leaves the robot 0.2 m behind its spawn, rotated 107 deg. It
+    # proves /cmd_vel moves the wheels by other means -- an arena-build gate that
+    # measures ground truth against a 0.2 m/s command, and a seven-metre transit.
+    commanded_motion = abs(args.speed) > 0.0 or abs(args.turn) > 0.0
+    if commanded_motion and max(xs) - min(xs) < 0.02:
         fails.append('robot never moved -- /cmd_vel is not reaching the wheels')
+    elif not commanded_motion:
+        print('odom: no motion was commanded (--speed 0 --turn 0), so movement '
+              'is not asserted; this run is a rate report')
 
 if got['battery']:
     v = got['battery'][-1][1].data
