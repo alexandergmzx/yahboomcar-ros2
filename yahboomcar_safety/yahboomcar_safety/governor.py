@@ -93,6 +93,24 @@ class DockingApproach:
 
     `bearing_rad` and `range_m` come from the caller's own confirmed detection
     and must be refreshed as the robot closes. A stale mask is a wide mask.
+
+    **SUPERSEDED by `DockingDisc`. Kept only as a negative control.**
+
+    A fixed angular cone cannot admit a contact. A target of radius R subtends
+    asin(R/r), which for R = 0.12 exceeds 15 deg everywhere inside 0.464 m and
+    reaches 33.5 deg at contact -- so below about 0.41 m the target's own
+    shoulders fall OUTSIDE this cone while lying INSIDE the 0.35 m stop, and the
+    filter brakes on the very object it was told to ignore. Measured on the
+    corridor bench: pins at 0.4176 m, contact never happens. Measured on a real
+    session bag: the governed duty cycle collapses 98% -> 28% -> 12% -> 0% as
+    the target closes from 0.70 to 0.35 m.
+
+    The closing sentence above is wrong in both directions, and `DockingDisc`
+    corrects both. This shape hides MORE than the target: it masks every on-cone
+    return nearer than `range + margin`, i.e. the entire segment between sensor
+    and target, so a foot planted on the approach line is invisible to the
+    filter. And it hides LESS than the target: past 0.41 m the shoulders leak,
+    which is the paragraph above. It is the wrong shape, not a small one.
     """
 
     bearing_rad: float
@@ -106,6 +124,64 @@ class DockingApproach:
                             math.cos(angle - self.bearing_rad))
         return (abs(offset) <= cfg.docking_cone_half_angle
                 and distance <= self.range_m + self.margin_m)
+
+
+@dataclass(frozen=True)
+class DockingDisc:
+    """Permission to close onto one known object, shaped like the OBJECT.
+
+    Mask a return iff its point lies within `target_radius_m + margin_m` of the
+    declared target centre. Not a cone: a disc, sized by the thing being
+    approached, in the place it was last seen.
+
+    WHY THE SHAPE MATTERS, in one line each:
+
+      * **It admits contact at every range.** Returns from the target's surface
+        are within one radius of its centre by definition, at 0.62 m and at
+        0.22 m alike. A cone cannot say that -- see `DockingApproach`.
+      * **It self-sizes.** Far away the disc subtends almost nothing; up close
+        it opens exactly as fast as the target does, and no faster.
+      * **It closes a hole the cone had.** The cone masked every on-cone return
+        nearer than the target, i.e. the whole segment between sensor and
+        target -- a foot planted on the approach line was invisible. A disc
+        masks nothing nearer than `centre - radius`, so that foot stops the
+        robot again.
+
+    WHAT IT STILL DOES NOT TOUCH: the stale-scan and command-timeout stops
+    (evaluated before this is consulted at all), the obstacle stop for
+    everything outside the disc, the empty-sector fail-closed, the yaw gate,
+    and the speed cap -- which docking tightens rather than relaxes.
+
+    `target_radius_m` is the AUTHORED radius of the target, never a fitted one.
+    Measured across 38 runs, the detector's fitted radius spans 0.072-0.168 m --
+    it fills its own acceptance band edge to edge -- so a disc sized from a fit
+    would intermittently be smaller than the object and unmask its own target's
+    nose. The authored number is the only stable one.
+
+    `margin_m` covers declaration staleness, not fit error: one scan period at
+    the creep speed is ~4 mm of translation, and rotation during a pivot adds
+    up to ~34 mm of lateral shift at handoff range. 0.10 m carries both with
+    room. It must stay well under the clearance to the nearest real hazard --
+    in the corridor the east wall sits 0.362 m from the target's centre and the
+    stub 0.568 m, so a 0.22 m disc keeps at least 0.06 m of slack even at worst
+    staleness.
+    """
+
+    bearing_rad: float
+    range_m: float
+    target_radius_m: float
+    margin_m: float = 0.10
+
+    def masks(self, angle: float, distance: float, cfg) -> bool:
+        """Does this return lie on the object we are deliberately driving into?"""
+
+        centre_x = self.range_m * math.cos(self.bearing_rad)
+        centre_y = self.range_m * math.sin(self.bearing_rad)
+        point_x = distance * math.cos(angle)
+        point_y = distance * math.sin(angle)
+        return math.hypot(point_x - centre_x, point_y - centre_y) <= (
+            self.target_radius_m + self.margin_m
+        )
 
 
 @dataclass
@@ -236,10 +312,37 @@ def decide(vx, vy, wz, min_range, scan_age, cmd_age, cfg, docking=None):
                             '; '.join(reasons + [f'obstacle at {min_range:.2f} m']),
                             True, min_range)
         if min_range < cfg.slow_distance:
-            span = cfg.slow_distance - cfg.stop_distance
-            scale = (min_range - cfg.stop_distance) / span if span > 0 else 0.0
-            scale = max(0.0, min(1.0, scale))
-            out_vx *= scale
-            reasons.append(f'slowed to {scale:.2f} at {min_range:.2f} m')
+            # THE SLOW ZONE DOES NOT APPLY TO A COMMAND ALREADY AT CREEP SPEED.
+            #
+            # The zone exists to bleed off speed before a hard stop. A command
+            # already clamped to `docking_creep_max_speed` has nothing to bleed:
+            # stopping distance at 0.05 m/s is millimetres, and the 0.35 m hard
+            # stop above is untouched and still ahead of it.
+            #
+            # Without this the terminal approach is unreachable for a reason
+            # that has nothing to do with the target. In the corridor a wall
+            # stub sits 0.315 m off the approach line, entering the +/-45 deg
+            # sector at 0.4455 m for the WHOLE creep, which scales 0.05 m/s down
+            # to 0.0087 -- 46 s to cover 0.40 m against a 25 s budget. Worse,
+            # 8.7 mm/s is below the docking controller's own 10 mm/s stall
+            # threshold, so a healthy creep reads as a contact and the robot
+            # reports an arrival it never made. Measured on the bench: that
+            # false arrival fires 1.1 s after the creep begins.
+            #
+            # Scoped as narrowly as it can be: only while a declaration is live,
+            # and only for a command at or under the creep clamp. Anything
+            # faster is slowed exactly as before.
+            creeping = (
+                docking is not None
+                and out_vx <= cfg.docking_creep_max_speed + 1e-9
+            )
+            if creeping:
+                reasons.append(f'creep exempt from slow zone at {min_range:.2f} m')
+            else:
+                span = cfg.slow_distance - cfg.stop_distance
+                scale = (min_range - cfg.stop_distance) / span if span > 0 else 0.0
+                scale = max(0.0, min(1.0, scale))
+                out_vx *= scale
+                reasons.append(f'slowed to {scale:.2f} at {min_range:.2f} m')
 
     return Decision(out_vx, out_vy, out_wz, '; '.join(reasons), bool(reasons), min_range)

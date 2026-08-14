@@ -9,7 +9,8 @@ import math
 import pytest
 
 from yahboomcar_safety.governor import (EXPECTED_PUBLISHERS, DockingApproach,
-                                        GovernorConfig, bypassing_nodes, decide,
+                                        DockingDisc, GovernorConfig,
+                                        bypassing_nodes, decide,
                                         forward_min_range)
 
 CFG = GovernorConfig()
@@ -399,3 +400,141 @@ def test_without_the_mode_nothing_changes():
     assert forward_min_range(*scan(r), CFG) == pytest.approx(0.25)
     out = decide(0.20, 0.0, 0.0, 0.25, FRESH, FRESH, CFG)
     assert out.vx == 0.0 and 'obstacle at 0.25 m' in out.reason
+
+
+# --------------------------------------------------- the target is not a beam
+#
+# Every docking test above this line builds B with `_ahead()`: one return, one
+# bearing. A one-beam target cannot leak outside an angular mask, so those tests
+# pass for a reason that has nothing to do with whether the mask works on a real
+# cylinder. On 2026-08-13 that blindness let an in-process proof report 29 of 31
+# ticks moving while the actual robot pinned at 0.35 m and never touched B.
+
+
+def _disc_scan(centre_range, centre_bearing, radius, background=5.0, beams=360):
+    """A 360-beam scan of a CYLINDER of `radius` at (`centre_range`, bearing).
+
+    Exact ray-circle intersection per beam, so the target subtends what it
+    physically subtends -- asin(radius/range), which is 33.5 degrees at contact
+    for a 0.12 m target. This is the fixture the cone tests never had.
+    """
+
+    cx = centre_range * math.cos(centre_bearing)
+    cy = centre_range * math.sin(centre_bearing)
+    ranges = [background] * beams
+    for i in range(beams):
+        angle = -math.pi + i * (2 * math.pi / beams)
+        dx, dy = math.cos(angle), math.sin(angle)
+        # |t*d - c|^2 = radius^2
+        b = dx * cx + dy * cy
+        c = cx * cx + cy * cy - radius * radius
+        disc = b * b - c
+        if disc < 0:
+            continue
+        t = b - math.sqrt(disc)
+        if 0.0 < t < ranges[i]:
+            ranges[i] = t
+    return ranges
+
+
+def test_the_cone_mask_leaks_on_a_real_cylinder():
+    """**The negative control, and the reason `DockingDisc` exists.**
+
+    B's half-width is asin(0.12/r): wider than the 15 degree cone everywhere
+    inside 0.4636 m. So below that the target's own shoulders fall outside the
+    mask, and once they are also inside the 0.35 m stop the filter brakes on the
+    object it was told to drive into. Contact at 0.2175 m is unreachable.
+    """
+
+    radius = 0.12
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.34)
+    ranges = _disc_scan(0.34, 0.0, radius)
+
+    leaked = forward_min_range(*scan(ranges), CFG, docking=approach)
+
+    assert leaked < CFG.stop_distance, "the cone must leak here -- that is the bug"
+    out = decide(0.05, 0.0, 0.0, leaked, FRESH, FRESH, CFG, docking=approach)
+    assert out.vx == 0.0
+    assert "obstacle at" in out.reason
+
+
+def test_the_disc_mask_admits_the_target_at_every_range():
+    """The same cylinder, the same ranges, masked by its own silhouette.
+
+    From handoff to contact there must be nothing left in the sector but the
+    background -- and at contact the target subtends 33.5 degrees, so no fixed
+    cone could have done this.
+    """
+
+    radius = 0.12
+    for centre in (0.62, 0.46, 0.34, 0.2175):
+        disc = DockingDisc(bearing_rad=0.0, range_m=centre,
+                           target_radius_m=radius, margin_m=0.10)
+        ranges = _disc_scan(centre, 0.0, radius)
+
+        masked = forward_min_range(*scan(ranges), CFG, docking=disc)
+
+        assert masked == pytest.approx(5.0), (
+            f"at {centre} m the target must be fully masked, saw {masked}"
+        )
+        out = decide(0.05, 0.0, 0.0, masked, FRESH, FRESH, CFG, docking=disc)
+        assert out.vx > 0.0, f"the creep must be permitted at {centre} m"
+
+
+def test_the_disc_unmasks_what_the_cone_hid_between_robot_and_target():
+    """**A hole the cone had, and the strongest safety argument for the disc.**
+
+    The cone masked every on-cone return NEARER than the target, i.e. the whole
+    segment between sensor and target -- so a foot planted on the approach line
+    was invisible to the filter. The disc masks nothing nearer than
+    centre - radius - margin, so that foot stops the robot again.
+    """
+
+    intruder_range, radius = 0.22, 0.12
+    ranges = _disc_scan(0.50, 0.0, radius)
+    ranges[180] = intruder_range                       # dead ahead, close in
+
+    cone = DockingApproach(bearing_rad=0.0, range_m=0.50)
+    disc = DockingDisc(bearing_rad=0.0, range_m=0.50,
+                       target_radius_m=radius, margin_m=0.10)
+
+    assert forward_min_range(*scan(ranges), CFG, docking=cone) > CFG.stop_distance, (
+        "the cone hides the intruder -- this is the defect being fixed"
+    )
+    assert forward_min_range(*scan(ranges), CFG, docking=disc) == pytest.approx(
+        intruder_range
+    ), "the disc must leave the intruder visible"
+
+
+def test_the_disc_never_masks_the_wall_behind_the_target():
+    """0.362 m separates the east wall from B's centre; the disc reaches 0.22."""
+
+    disc = DockingDisc(bearing_rad=0.0, range_m=0.30,
+                       target_radius_m=0.12, margin_m=0.10)
+
+    # A wall return on the same bearing, one target-diameter beyond it.
+    assert not disc.masks(0.0, 0.30 + 0.362, CFG)
+    # And the slack is real, not marginal.
+    assert not disc.masks(0.0, 0.30 + 0.23, CFG)
+
+
+def test_the_creep_is_exempt_from_the_slow_zone_but_not_the_stop():
+    """A2. The exemption is scoped to a command already at the creep clamp."""
+
+    disc = DockingDisc(bearing_rad=0.0, range_m=0.30,
+                       target_radius_m=0.12, margin_m=0.10)
+
+    # An unmasked obstacle in the slow zone: the creep passes at full speed.
+    crept = decide(0.05, 0.0, 0.0, 0.4455, FRESH, FRESH, CFG, docking=disc)
+    assert crept.vx == pytest.approx(CFG.docking_creep_max_speed)
+    assert "exempt" in crept.reason
+
+    # The hard stop is untouched.
+    stopped = decide(0.05, 0.0, 0.0, 0.30, FRESH, FRESH, CFG, docking=disc)
+    assert stopped.vx == 0.0
+
+    # And a faster command is slowed exactly as before -- the clamp runs first,
+    # so ask with docking absent to exercise the ordinary path.
+    slowed = decide(0.30, 0.0, 0.0, 0.4455, FRESH, FRESH, CFG)
+    assert 0.0 < slowed.vx < 0.30
+    assert "slowed to" in slowed.reason
