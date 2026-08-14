@@ -37,6 +37,7 @@ from std_msgs.msg import Bool, Float32
 
 from yahboomcar_safety.governor import (DockingApproach, EXPECTED_PUBLISHERS,
                                         GovernorConfig, bypassing_nodes, decide,
+                                        disc_from_declaration,
                                         forward_min_range)
 
 
@@ -61,6 +62,17 @@ class CmdVelGovernor(Node):
         # Matched to `scan_timeout` deliberately: the mask is only ever as
         # trustworthy as the scan that justified it, so it must not outlive one.
         self.declare_parameter('docking_timeout', cfg.scan_timeout)
+        # The slack added around the declared target silhouette. The FILTER's
+        # number, not the caller's: it covers declaration staleness (about 4 mm
+        # of translation per scan period at creep speed, plus up to ~34 mm of
+        # lateral shift during a pivot), and it must stay well under the
+        # clearance to the nearest real hazard.
+        self.declare_parameter('docking_margin', 0.10)
+        # The largest target a caller may declare. The radius is the one number
+        # in a declaration that WIDENS the masked region, so it is bounded here
+        # rather than trusted. 0.25 m comfortably covers the delivery target and
+        # is far short of anything that would hide a wall.
+        self.declare_parameter('docking_max_target_radius', 0.25)
 
         self.cfg = GovernorConfig(
             stop_distance=self.get_parameter('stop_distance').value,
@@ -76,6 +88,9 @@ class CmdVelGovernor(Node):
         )
 
         self.cfg_docking_timeout = self.get_parameter('docking_timeout').value
+        self.cfg_docking_margin = self.get_parameter('docking_margin').value
+        self.cfg_docking_max_radius = self.get_parameter(
+            'docking_max_target_radius').value
 
         self.min_range = math.inf
         self.last_scan = None
@@ -84,6 +99,8 @@ class CmdVelGovernor(Node):
         # expiring on silence -- see `_live_docking`.
         self.docking_request = None
         self.last_docking = None
+        self.docking_disc_request = None
+        self.last_docking_disc = None
         self.req = (0.0, 0.0, 0.0)
         self._last_reason = None
         self._warned_bypass = set()
@@ -96,6 +113,12 @@ class CmdVelGovernor(Node):
         # service or a latched topic: the mask must expire on silence.
         self.create_subscription(Vector3Stamped, '~/docking_approach',
                                  self._on_docking, 10)
+        # And here, in the shape that can actually admit a contact. A SEPARATE
+        # topic rather than a reinterpretation of the old one, because the
+        # third field changes meaning -- margin there, target radius here --
+        # and a stale sender must not have its margin read as a radius.
+        self.create_subscription(Vector3Stamped, '~/docking_disc',
+                                 self._on_docking_disc, 10)
 
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         # Published so an operator can see the governor's view without reading logs.
@@ -135,6 +158,37 @@ class CmdVelGovernor(Node):
         )
         self.last_docking = self.get_clock().now()
 
+    def _on_docking_disc(self, msg: Vector3Stamped):
+        """A terminal approach shaped like the TARGET. `x` bearing, `y` range,
+        `z` the target's authored radius.
+
+        The margin is NOT taken from the sender. It is this node's own
+        `docking_margin` parameter, because the slack on a safety mask belongs
+        to the filter, not to the thing asking to be let through. For the same
+        reason the radius is bounded: it is the one caller-supplied number that
+        WIDENS the masked region, and `docking_max_target_radius` bounds how
+        much of the world a bad declaration can hide.
+
+        The validation itself lives in `governor.disc_from_declaration` so it
+        can be tested without a ROS graph -- see the refusal cases there.
+        """
+
+        disc = disc_from_declaration(
+            float(msg.vector.x), float(msg.vector.y), float(msg.vector.z),
+            margin_m=self.cfg_docking_margin,
+            max_target_radius_m=self.cfg_docking_max_radius,
+        )
+        if disc is None:
+            self.get_logger().warn(
+                f'docking disc REFUSED: bearing {msg.vector.x:.3f} rad, range '
+                f'{msg.vector.y:.3f} m, radius {msg.vector.z:.3f} m (max '
+                f'{self.cfg_docking_max_radius}). A refused declaration is not '
+                f'clamped into something acceptable: it expires on the ordinary '
+                f'timeout and the robot stops.')
+            return
+        self.docking_disc_request = disc
+        self.last_docking_disc = self.get_clock().now()
+
     def _live_docking(self):
         """The approach, but only while it is FRESH.
 
@@ -143,8 +197,16 @@ class CmdVelGovernor(Node):
         its topic is starved, the network drops -- removes the mask by the same
         path. There is no 'exit' message to go missing, which is the failure an
         explicit stop command would have.
+
+        A fresh disc wins over a fresh cone. They expire independently, so a
+        controller that switches to the disc and stops sending the cone loses
+        the cone on the ordinary timeout, and one still sending only the cone
+        keeps the old behaviour.
         """
 
+        age = self._age(self.last_docking_disc)
+        if age is not None and age <= self.cfg_docking_timeout:
+            return self.docking_disc_request
         age = self._age(self.last_docking)
         if age is None or age > self.cfg_docking_timeout:
             return None

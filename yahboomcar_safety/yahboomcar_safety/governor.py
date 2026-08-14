@@ -184,6 +184,38 @@ class DockingDisc:
         )
 
 
+def disc_from_declaration(bearing_rad, range_m, target_radius_m, *,
+                          margin_m, max_target_radius_m):
+    """Validate a caller's disc declaration. Returns the disc, or None to refuse.
+
+    Pure so it can be tested without a ROS graph, which is the only reason the
+    node does not inline it.
+
+    The radius is the one number in a declaration that WIDENS the masked region,
+    so it is bounded rather than trusted. A declaration outside the bound is
+    REFUSED, not clamped: a caller asking to mask a metre of corridor has a bug,
+    and quietly granting it the maximum would hide the bug while still moving
+    the robot. Non-finite values are refused for the same reason -- a NaN
+    bearing would otherwise produce a disc centred nowhere, and `math.hypot`
+    against NaN is False, so every return would read as unmasked. That happens
+    to fail safe, but by accident rather than by decision.
+    """
+
+    values = (bearing_rad, range_m, target_radius_m)
+    if not all(math.isfinite(v) for v in values):
+        return None
+    if not 0.0 < target_radius_m <= max_target_radius_m:
+        return None
+    if range_m <= 0.0:
+        return None
+    return DockingDisc(
+        bearing_rad=bearing_rad,
+        range_m=range_m,
+        target_radius_m=target_radius_m,
+        margin_m=margin_m,
+    )
+
+
 @dataclass
 class Decision:
     vx: float

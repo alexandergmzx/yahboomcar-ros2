@@ -11,6 +11,7 @@ import pytest
 from yahboomcar_safety.governor import (EXPECTED_PUBLISHERS, DockingApproach,
                                         DockingDisc, GovernorConfig,
                                         bypassing_nodes, decide,
+                                        disc_from_declaration,
                                         forward_min_range)
 
 CFG = GovernorConfig()
@@ -538,3 +539,58 @@ def test_the_creep_is_exempt_from_the_slow_zone_but_not_the_stop():
     slowed = decide(0.30, 0.0, 0.0, 0.4455, FRESH, FRESH, CFG)
     assert 0.0 < slowed.vx < 0.30
     assert "slowed to" in slowed.reason
+
+
+# ------------------------------------------- what a caller is allowed to declare
+
+DECL = {"margin_m": 0.10, "max_target_radius_m": 0.25}
+
+
+def test_an_ordinary_declaration_is_accepted():
+    disc = disc_from_declaration(0.0, 0.50, 0.12, **DECL)
+    assert disc == DockingDisc(bearing_rad=0.0, range_m=0.50,
+                               target_radius_m=0.12, margin_m=0.10)
+
+
+def test_an_oversized_target_is_refused_not_clamped():
+    """A caller asking to mask a metre of corridor has a bug.
+
+    Clamping to the maximum would hide that bug and keep the robot moving with
+    a mask it did not ask for. Refusing expires the mask on the ordinary
+    timeout, which stops the robot -- the correct outcome for a caller whose
+    idea of the world is wrong.
+    """
+
+    assert disc_from_declaration(0.0, 0.50, 1.00, **DECL) is None
+    assert disc_from_declaration(0.0, 0.50, 0.2501, **DECL) is None
+    assert disc_from_declaration(0.0, 0.50, 0.25, **DECL) is not None
+
+
+def test_a_degenerate_target_is_refused():
+    assert disc_from_declaration(0.0, 0.50, 0.0, **DECL) is None
+    assert disc_from_declaration(0.0, 0.50, -0.12, **DECL) is None
+    assert disc_from_declaration(0.0, 0.0, 0.12, **DECL) is None
+    assert disc_from_declaration(0.0, -0.50, 0.12, **DECL) is None
+
+
+def test_non_finite_declarations_are_refused_deliberately():
+    """NaN would fail safe by accident; it is refused on purpose.
+
+    `math.hypot(nan, ...) <= x` is False, so a NaN-centred disc masks nothing
+    and every return stops the robot. Correct outcome, wrong reason -- and it
+    would leave the operator with a robot that stops for no visible cause and
+    no log line. The refusal is logged.
+    """
+
+    for bad in (float('nan'), float('inf'), float('-inf')):
+        assert disc_from_declaration(bad, 0.50, 0.12, **DECL) is None
+        assert disc_from_declaration(0.0, bad, 0.12, **DECL) is None
+        assert disc_from_declaration(0.0, 0.50, bad, **DECL) is None
+
+
+def test_the_margin_is_the_filters_number_not_the_callers():
+    """The declaration carries no margin field at all; the filter supplies it."""
+
+    disc = disc_from_declaration(0.0, 0.50, 0.12,
+                                 margin_m=0.04, max_target_radius_m=0.25)
+    assert disc.margin_m == 0.04
