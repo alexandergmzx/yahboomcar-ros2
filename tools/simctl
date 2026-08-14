@@ -378,7 +378,29 @@ def launch_safety(args, dom, log, step):
         extra = f'max_speed:={args.max_speed}'
     sh(f'ros2 launch yahboomcar_safety safety_launch.py {extra}', dom,
        log=os.path.join(log, 'simctl-safety.log'))
-    time.sleep(8)
+    # THE EVENT THE 8 s STOOD FOR: the governor and the deadman discoverable
+    # on the domain (safety_launch.py names them cmd_vel_governor and
+    # cmd_vel_deadman). Poll inside ONE ros_eval child, ceiling 8 s -- the
+    # old fixed pause is the fallback, never exceeded, and a timeout is
+    # loud but not fatal: the stack waits downstream still gate on data.
+    out = ros_eval(
+        'rclpy.init(); n=Node("simctl_safety_wait")\n'
+        'import time as _t; t0=_t.time()\n'
+        'need={"cmd_vel_governor","cmd_vel_deadman"}\n'
+        'while _t.time()-t0<8.0:\n'
+        '    names={x for x,_ in n.get_node_names_and_namespaces()}\n'
+        '    if need<=names:\n'
+        '        print(f"SAFETY_UP {_t.time()-t0:.1f}"); break\n'
+        '    _t.sleep(0.5)\n'
+        'else:\n'
+        '    print("SAFETY_TIMEOUT")\n'
+        'sys.stdout.flush(); os._exit(0)\n', dom, timeout=20)
+    if 'SAFETY_UP' in out:
+        print(f'        governor+deadman discoverable'
+              f' ({out.split("SAFETY_UP")[-1].strip().splitlines()[0]} s)')
+    else:
+        print('        WARNING: governor+deadman not discoverable inside 8 s; '
+              'proceeding (downstream waits gate on data)')
 
 
 def launch_laser_odometry(dom, log, step):
