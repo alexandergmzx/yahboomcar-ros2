@@ -572,8 +572,11 @@ def cmd_start(args):
               'just this.')
 
     # Discovery remains as the SECOND layer, for a car provisioned onto another domain.
-    print('  checking who is on this domain (up to ~15 s)...')
-    target = sim_target(dom)
+    trust_clean = getattr(args, 'trust_clean', False)
+    ceiling = 4.0 if trust_clean else 14.0
+    print(f'  checking who is on this domain (silence budget {ceiling:.0f} s'
+          + (', --trust-clean' if trust_clean else '') + ')...')
+    target = sim_target(dom, nothing_ceiling_s=ceiling)
     if target == 'hardware':
         print(f'REFUSED: the REAL ROBOT is on domain {dom}.')
         print('  Starting a simulator here would put two robots on one graph, and the')
@@ -1019,7 +1022,7 @@ def cmd_patrol(args):
               args.domain, background=False).returncode
 
 
-def sim_target(domain):
+def sim_target(domain, nothing_ceiling_s=14.0):
     """-> 'hardware' | 'simulator' | 'nothing'. Same evidence rules as the shared guard.
 
     A simulator is recognised by POSITIVE evidence, two ways: the `fake_robot` node
@@ -1027,6 +1030,12 @@ def sim_target(domain):
     no ROS nodes at all, which is how the patrol once refused a healthy simulator while
     everything else looked fine. Hardware always wins: if YB_Car_Node is present, this is
     the car's domain no matter what else is on it.
+
+    `nothing_ceiling_s` is the SILENCE budget only: how long an empty answer takes.
+    Evidence exits are untouched -- hardware breaks immediately, simulator evidence
+    always gets its full 6 s confirmation dwell even past the ceiling (the ceiling is
+    extended, never the confirmation cut). 14 s default; --trust-clean passes 4 s,
+    justified against measured convergence (see the flag's help).
     """
     # Same asymmetric exit as tools/_cmd_vel_safety.target_of(): DDS discovery is
     # incremental, so finding a simulator FIRST must not end the search -- the car may
@@ -1035,7 +1044,7 @@ def sim_target(domain):
     # car. A single 2.5 s look here was the fail-open version. Audit finding.
     out = ros_eval(
         'rclpy.init(); n=Node("simctl_target")\n'
-        'real=sim=False; sim_at=None; end=time.time()+14.0\n'
+        f'real=sim=False; sim_at=None; end=time.time()+{float(nothing_ceiling_s)}\n'
         'while time.time()<end:\n'
         '    time.sleep(1.0)\n'
         '    names=[x for x,_ in n.get_node_names_and_namespaces()]\n'
@@ -1050,7 +1059,10 @@ def sim_target(domain):
         '         len(n.get_publishers_info_by_topic("/sim/ground_truth"))>0)\n'
         '    if real: break\n'
         '    if sim:\n'
-        '        if sim_at is None: sim_at=time.time()\n'
+        # The confirmation dwell OUTRANKS the ceiling: evidence found at
+        # t=3.9 under a 4 s ceiling must still get its 6 s watch for the car.
+        '        if sim_at is None:\n'
+        '            sim_at=time.time(); end=max(end,sim_at+6.5)\n'
         '        elif time.time()-sim_at>=6.0: break\n'
         'print("TARGET", "hardware" if real else "simulator" if sim else "nothing")\n'
         'sys.stdout.flush(); os._exit(0)\n', domain, timeout=40)
@@ -1235,6 +1247,18 @@ def main():
     s.add_argument('--no-slam', dest='slam', action='store_false')
     s.add_argument('--no-safety', dest='safety', action='store_false')
     s.add_argument('--no-patrol', dest='patrol', action='store_false')
+    s.add_argument('--trust-clean', action='store_true',
+                   help='the CALLER attests it has already refused on live '
+                        'occupants and resident nodes (corridor runner '
+                        'preflight, exit 2/3). The discovery dwell then runs '
+                        'a 4 s nothing-ceiling instead of 14 s -- 80x the '
+                        'measured p100 convergence of 0.05 s (n=20, under '
+                        'Isaac load; corridor-twin '
+                        'out/evidence/bringup-rework/discovery-convergence'
+                        '.json) and above the 2.5 s form the 2026-08-10 '
+                        'audit rejected. Hardware or simulator EVIDENCE '
+                        'still ends the dwell exactly as before; only the '
+                        'silence budget shrinks.')
     s.set_defaults(func=cmd_start)
 
     t = sub.add_parser('stop', help='stop robots, then tear the simulation down')
