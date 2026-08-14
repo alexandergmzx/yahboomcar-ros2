@@ -244,6 +244,12 @@ def wait_for(condition, probe, seconds, procs, logs, poll_gap=5):
     """
     t0 = time.time()
     detail = 'no probe completed'
+    # CHECK FIRST, then sleep. The sleep used to come first, which charged
+    # every wait a poll_gap it might not owe: a condition already true at
+    # entry (the stack wait, routinely) paid 5 s to learn it, and a condition
+    # turning true mid-cycle waited out the rest of the gap. Same fix the
+    # corridor runner applied to its own teardown poll (corridor-twin
+    # 86e5a01: "teardown measured 42.9 s of a 403 s run").
     while time.time() - t0 < seconds:
         dead = [(name, p.returncode) for name, p in procs.items()
                 if p is not None and p.poll() is not None]
@@ -256,11 +262,11 @@ def wait_for(condition, probe, seconds, procs, logs, poll_gap=5):
                 print(f'    --- {lg} (last lines) ---')
                 print(_tail(lg))
             return False
-        time.sleep(poll_gap)
         ready, detail = probe()
         if ready:
             print(f'        {detail}   ({time.time()-t0:.0f} s)')
             return True
+        time.sleep(poll_gap)
     print(f'  FAILED: {condition}')
     print(f'    unmet after the {seconds:.0f} s budget. Last probe: {detail}')
     for lg in logs:
