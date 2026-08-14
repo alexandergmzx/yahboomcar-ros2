@@ -58,6 +58,54 @@ class GovernorConfig:
     scan_timeout: float = 0.5        # s: no lidar this recent -> stop
     cmd_timeout: float = 0.3         # s: no operator input this recent -> stop
     min_valid_range: float = 0.02    # m: below this the reading is noise, not an object
+    # DOCKING MODE. A terminal-approach concession, and the narrowest one that
+    # works. See `DockingApproach` and rule 7 in `decide`.
+    docking_cone_half_angle: float = 0.2618   # rad (15 deg)
+    docking_creep_max_speed: float = 0.05     # m/s: the governor's own creep clamp
+
+
+@dataclass(frozen=True)
+class DockingApproach:
+    """Permission to close the last few centimetres onto ONE known object.
+
+    A corridor delivery ends in contact: the robot must touch its target, and
+    the touch is the arrival. The proximity floor exists to prevent exactly
+    that, so something has to give -- and the choice is between BYPASSING this
+    filter and INFORMING it. This is the informed version, and it is deliberately
+    the narrowest concession that still permits the contact.
+
+    What it suppresses: the obstacle stop and the slow zone, for returns falling
+    inside a narrow cone toward a bearing the caller has already confirmed, and
+    no farther than a range the caller has already measured, plus a margin.
+
+    What it does NOT suppress, which is the point:
+
+      * the stale-scan stop and the command-timeout stop (rules 1 and 2);
+      * the obstacle stop for everything OUTSIDE the cone, at full strength;
+      * the empty-sector fail-closed;
+      * the yaw gate near an obstacle;
+      * the speed cap -- it TIGHTENS it, to `docking_creep_max_speed`.
+
+    A mask this shape cannot hide a wall the robot is about to strike while
+    turning, a person stepping in from the side, or a lidar that has stopped
+    reporting. It can hide exactly one thing: the object the caller is
+    deliberately driving into.
+
+    `bearing_rad` and `range_m` come from the caller's own confirmed detection
+    and must be refreshed as the robot closes. A stale mask is a wide mask.
+    """
+
+    bearing_rad: float
+    range_m: float
+    margin_m: float = 0.10
+
+    def masks(self, angle: float, distance: float, cfg) -> bool:
+        """Is this return the object we are deliberately driving into?"""
+
+        offset = math.atan2(math.sin(angle - self.bearing_rad),
+                            math.cos(angle - self.bearing_rad))
+        return (abs(offset) <= cfg.docking_cone_half_angle
+                and distance <= self.range_m + self.margin_m)
 
 
 @dataclass
@@ -70,11 +118,16 @@ class Decision:
     min_range: float     # nearest obstacle seen in the forward sector, inf if none
 
 
-def forward_min_range(ranges, angle_min, angle_increment, cfg):
+def forward_min_range(ranges, angle_min, angle_increment, cfg, docking=None):
     """Nearest valid return within +/- sector_half_angle of straight ahead.
 
     Returns inf when the sector holds no valid reading. Callers must treat inf as
     "unknown", not "clear" -- an empty sector can equally mean the lidar is blind.
+
+    With `docking` supplied, returns the approach masks are skipped, so the
+    number handed to `decide` means "the nearest thing I am NOT deliberately
+    driving into". Everything else in the sector still counts, at full strength,
+    and an empty result is still inf and still fails closed.
     """
     if not ranges or angle_increment == 0:
         return math.inf
@@ -88,16 +141,26 @@ def forward_min_range(ranges, angle_min, angle_increment, cfg):
         angle = angle_min + i * angle_increment
         # Normalise to [-pi, pi] so a 0..2pi scan is handled identically.
         angle = math.atan2(math.sin(angle), math.cos(angle))
-        if abs(angle) <= cfg.sector_half_angle:
-            nearest = min(nearest, r)
+        if abs(angle) > cfg.sector_half_angle:
+            continue
+        if docking is not None and docking.masks(angle, r, cfg):
+            continue
+        nearest = min(nearest, r)
     return nearest
 
 
-def decide(vx, vy, wz, min_range, scan_age, cmd_age, cfg):
+def decide(vx, vy, wz, min_range, scan_age, cmd_age, cfg, docking=None):
     """Body twist + lidar state -> the twist that may actually be sent.
 
     Rules, in priority order. Earlier rules win, so a stale scan cannot be overridden
     by a comfortable-looking range.
+
+    `docking` does NOT appear in rules 1-3. A terminal approach is not a reason
+    to accept a stale scan, a dead commander, or a NaN, and the ordering here is
+    what guarantees that: the mode is consulted only after those three have
+    passed. Its effect on `min_range` has already happened in
+    `forward_min_range`, upstream of this function; all `decide` itself does
+    with the mode is tighten the speed cap.
     """
     # 1. No recent lidar means no basis for any forward motion.
     if scan_age is None or scan_age > cfg.scan_timeout:
@@ -113,6 +176,13 @@ def decide(vx, vy, wz, min_range, scan_age, cmd_age, cfg):
 
     reasons = []
     out_vx, out_vy, out_wz = vx, vy, wz
+
+    # 3a. DOCKING CREEP CLAMP. The mode exists to let the robot touch something,
+    #     so it makes the robot SLOWER, never faster -- applied before the
+    #     ordinary caps so it binds regardless of what they would have allowed.
+    if docking is not None and out_vx > cfg.docking_creep_max_speed:
+        out_vx = cfg.docking_creep_max_speed
+        reasons.append(f'docking creep {cfg.docking_creep_max_speed:.2f} m/s')
 
     # 4. Lateral motion. The forward sector cannot vouch for sideways clearance, so
     #    strafing is not something this filter can govern.

@@ -29,14 +29,14 @@ LIMITATIONS, stated plainly:
 import math
 
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Vector3Stamped
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32
 
-from yahboomcar_safety.governor import (EXPECTED_PUBLISHERS, GovernorConfig,
-                                        bypassing_nodes, decide,
+from yahboomcar_safety.governor import (DockingApproach, EXPECTED_PUBLISHERS,
+                                        GovernorConfig, bypassing_nodes, decide,
                                         forward_min_range)
 
 
@@ -57,6 +57,10 @@ class CmdVelGovernor(Node):
         self.declare_parameter('cmd_timeout', cfg.cmd_timeout)
         self.declare_parameter('rate', 20.0)
         self.declare_parameter('expected_publishers', list(EXPECTED_PUBLISHERS))
+        # How long a declared terminal approach stays valid without a refresh.
+        # Matched to `scan_timeout` deliberately: the mask is only ever as
+        # trustworthy as the scan that justified it, so it must not outlive one.
+        self.declare_parameter('docking_timeout', cfg.scan_timeout)
 
         self.cfg = GovernorConfig(
             stop_distance=self.get_parameter('stop_distance').value,
@@ -71,9 +75,15 @@ class CmdVelGovernor(Node):
             cmd_timeout=self.get_parameter('cmd_timeout').value,
         )
 
+        self.cfg_docking_timeout = self.get_parameter('docking_timeout').value
+
         self.min_range = math.inf
         self.last_scan = None
         self.last_cmd = None
+        # Terminal-approach state. Absent until somebody declares one, and
+        # expiring on silence -- see `_live_docking`.
+        self.docking_request = None
+        self.last_docking = None
         self.req = (0.0, 0.0, 0.0)
         self._last_reason = None
         self._warned_bypass = set()
@@ -82,6 +92,10 @@ class CmdVelGovernor(Node):
         self.create_subscription(LaserScan, '/scan', self._on_scan,
                                  qos_profile_sensor_data)
         self.create_subscription(Twist, '/cmd_vel_raw', self._on_cmd, 10)
+        # A docking controller declares its approach here. Deliberately NOT a
+        # service or a latched topic: the mask must expire on silence.
+        self.create_subscription(Vector3Stamped, '~/docking_approach',
+                                 self._on_docking, 10)
 
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         # Published so an operator can see the governor's view without reading logs.
@@ -101,8 +115,40 @@ class CmdVelGovernor(Node):
 
     def _on_scan(self, msg: LaserScan):
         self.min_range = forward_min_range(list(msg.ranges), msg.angle_min,
-                                           msg.angle_increment, self.cfg)
+                                           msg.angle_increment, self.cfg,
+                                           docking=self._live_docking())
         self.last_scan = self.get_clock().now()
+
+    def _on_docking(self, msg: Vector3Stamped):
+        """A terminal approach, declared by whoever is doing the docking.
+
+        `x` is the bearing to the confirmed target in the laser frame, `y` its
+        measured range, `z` the margin. The caller must keep republishing as it
+        closes; see `_live_docking` for why that is a safety property and not an
+        inconvenience.
+        """
+
+        self.docking_request = DockingApproach(
+            bearing_rad=float(msg.vector.x),
+            range_m=float(msg.vector.y),
+            margin_m=float(msg.vector.z) if msg.vector.z > 0.0 else 0.10,
+        )
+        self.last_docking = self.get_clock().now()
+
+    def _live_docking(self):
+        """The approach, but only while it is FRESH.
+
+        The mode expires on silence rather than on an explicit exit message, so
+        every way of losing the docking controller -- it crashes, it is killed,
+        its topic is starved, the network drops -- removes the mask by the same
+        path. There is no 'exit' message to go missing, which is the failure an
+        explicit stop command would have.
+        """
+
+        age = self._age(self.last_docking)
+        if age is None or age > self.cfg_docking_timeout:
+            return None
+        return self.docking_request
 
     def _on_cmd(self, msg: Twist):
         self.req = (msg.linear.x, msg.linear.y, msg.angular.z)
@@ -166,8 +212,10 @@ class CmdVelGovernor(Node):
 
     def _tick(self):
         vx, vy, wz = self.req
+        docking = self._live_docking()
         d = decide(vx, vy, wz, self.min_range,
-                   self._age(self.last_scan), self._age(self.last_cmd), self.cfg)
+                   self._age(self.last_scan), self._age(self.last_cmd), self.cfg,
+                   docking=docking)
 
         out = Twist()
         out.linear.x, out.linear.y, out.angular.z = d.vx, d.vy, d.wz

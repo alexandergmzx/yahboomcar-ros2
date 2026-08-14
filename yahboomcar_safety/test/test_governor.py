@@ -8,8 +8,8 @@ import math
 
 import pytest
 
-from yahboomcar_safety.governor import (EXPECTED_PUBLISHERS, GovernorConfig,
-                                        bypassing_nodes, decide,
+from yahboomcar_safety.governor import (EXPECTED_PUBLISHERS, DockingApproach,
+                                        GovernorConfig, bypassing_nodes, decide,
                                         forward_min_range)
 
 CFG = GovernorConfig()
@@ -261,3 +261,141 @@ def test_expected_list_is_configurable():
 
 def test_default_expected_contains_the_deadman():
     assert 'cmd_vel_deadman' in EXPECTED_PUBLISHERS
+
+
+# ------------------------------------------------------------------ docking mode
+#
+# The concession: a corridor delivery ends in CONTACT, and the proximity floor
+# exists to prevent contact. These tests exist to prove the concession is the
+# narrow one it claims to be. Every one of them states the hazard, because a
+# safety test whose intent is unclear tends to get "fixed" by loosening it.
+
+
+def _ahead(distance, bearing=0.0, background=5.0):
+    """360 beams at `background`, with one return at `distance` on `bearing`.
+
+    Index i maps to angle_min(-pi) + i*(2pi/360), so bearing 0 is index 180.
+    """
+    r = [background] * 360
+    r[180 + int(round(math.degrees(bearing)))] = distance
+    return r
+
+
+def test_docking_masks_only_the_object_it_was_told_about():
+    """The hazard: a mask wide enough to hide a second obstacle.
+
+    B is dead ahead at 0.25 m -- well inside the 0.35 m stop -- and the approach
+    names it. Without the mask the governor stops; with it, forward motion is
+    permitted, because that return is the thing being driven into on purpose.
+    """
+    r = _ahead(0.25, bearing=0.0)
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.25)
+
+    assert forward_min_range(*scan(r), CFG) == pytest.approx(0.25)
+    assert forward_min_range(*scan(r), CFG, docking=approach) == pytest.approx(5.0)
+
+
+def test_an_off_cone_obstacle_still_stops_the_robot_in_docking_mode():
+    """**The negative control R1 requires.** A person stepping in from the side.
+
+    B is masked at 0.25 m dead ahead; a second object sits at 0.30 m thirty
+    degrees off, outside the 15-degree cone. The stop must still fire, and it
+    must name the unmasked object.
+    """
+    r = [5.0] * 360
+    r[180] = 0.25                                   # B, on the cone
+    r[180 + 30] = 0.30                              # intruder, off the cone
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.25)
+
+    rng = forward_min_range(*scan(r), CFG, docking=approach)
+    assert rng == pytest.approx(0.30), 'the off-cone obstacle must survive the mask'
+
+    out = decide(0.05, 0.0, 0.0, rng, FRESH, FRESH, CFG, docking=approach)
+    assert out.vx == 0.0
+    assert 'obstacle at 0.30 m' in out.reason
+
+
+def test_the_mask_is_range_gated_so_a_nearer_surprise_is_not_hidden():
+    """The hazard: something appearing between the robot and its target.
+
+    The approach was confirmed at 0.25 m, so the gate admits returns out to
+    0.35 m. A return at 0.60 m on the same bearing is NOT the object that was
+    measured, and must not inherit its permission.
+    """
+    r = _ahead(0.60, bearing=0.0)
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.25, margin_m=0.10)
+
+    assert forward_min_range(*scan(r), CFG, docking=approach) == pytest.approx(0.60)
+
+
+def test_a_stale_scan_kills_the_creep_even_in_docking_mode():
+    """**The negative control R1 requires.** A lidar that stopped reporting.
+
+    Rule 1 is evaluated before the mode is consulted at all, so a terminal
+    approach cannot buy permission to drive on stale data.
+    """
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.25)
+
+    out = decide(0.05, 0.0, 0.0, math.inf, CFG.scan_timeout + 0.1, FRESH, CFG,
+                 docking=approach)
+
+    assert out.vx == 0.0 and out.reason == 'scan stale or missing'
+
+
+def test_a_dead_commander_kills_the_creep_even_in_docking_mode():
+    """Rule 2, same argument as rule 1: the mode is consulted after, never before."""
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.25)
+
+    out = decide(0.05, 0.0, 0.0, math.inf, FRESH, CFG.cmd_timeout + 0.1, CFG,
+                 docking=approach)
+
+    assert out.vx == 0.0 and out.reason == 'command stale'
+
+
+def test_docking_mode_makes_the_robot_slower_not_faster():
+    """The hazard the `--fun` preset would have introduced.
+
+    A terminal phase wants to go SLOWER. The clamp binds even when the ordinary
+    speed cap would have allowed more, and it is applied before that cap.
+    """
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.25)
+
+    fast = decide(0.35, 0.0, 0.0, 5.0, FRESH, FRESH, CFG, docking=approach)
+
+    assert fast.vx == pytest.approx(CFG.docking_creep_max_speed)
+    assert 'docking creep' in fast.reason
+    # And the clamp is well under the ordinary cap it replaces.
+    assert CFG.docking_creep_max_speed < CFG.max_speed
+
+
+def test_the_empty_sector_still_fails_closed_in_docking_mode():
+    """The hazard: a blind lidar reading as a clear field.
+
+    If the mask consumes every return in the sector, the result is inf -- and
+    inf must still mean "unknown", not "go".
+
+    Note the construction: the returns must all lie INSIDE the 15-degree cone,
+    because that is the only region the mask can reach. A first version of this
+    test filled the whole circle at 0.25 m and passed for the wrong reason --
+    the beams between 15 and 45 degrees were never maskable, so the sector was
+    never actually emptied.
+    """
+    r = [float('nan')] * 360
+    for i in range(180 - 10, 180 + 11):             # +/-10 deg, all inside the cone
+        r[i] = 0.25
+    approach = DockingApproach(bearing_rad=0.0, range_m=0.25, margin_m=5.0)
+
+    rng = forward_min_range(*scan(r), CFG, docking=approach)
+    assert rng == math.inf
+
+    out = decide(0.05, 0.0, 0.0, rng, FRESH, FRESH, CFG, docking=approach)
+    assert out.vx == 0.0 and 'no valid lidar returns' in out.reason
+
+
+def test_without_the_mode_nothing_changes():
+    """The regression guard: `docking=None` must be the behaviour that shipped."""
+    r = _ahead(0.25, bearing=0.0)
+
+    assert forward_min_range(*scan(r), CFG) == pytest.approx(0.25)
+    out = decide(0.20, 0.0, 0.0, 0.25, FRESH, FRESH, CFG)
+    assert out.vx == 0.0 and 'obstacle at 0.25 m' in out.reason
